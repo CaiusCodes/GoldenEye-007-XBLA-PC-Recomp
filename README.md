@@ -84,11 +84,11 @@ neither Setup nor the game contacts Xbox Live.
 - Optional **100% game completion** in Setup: every mission, difficulty,
   007 mode and cheat unlocked
 - **Portable**: saves and settings stay in the game folder
-- **GoldenEye fixes and improvements** carried over from the GoldenEye Recomp
-  community: level and setup bug fixes from the BeanTools Community Edition,
+- **GoldenEye fixes and improvements** bug fixes from the BeanTools Community Edition,
   watch and mission music fixes, tank mouse aiming, Frigate water, extra
-  multiplayer characters, guards' bodies that stay for 60 seconds, and a
-  main menu without the Xbox LIVE-only entries
+  multiplayer characters, refreshed modern main menu background, fixed gun muzzle static
+  flash fix with some weapons, guards' bodies that stay for 60 seconds and a
+  main menu without the Xbox LIVE-only entries as well as other minor fixes.
   ![LAN lobby with two players joined](docs/screenshots/lan-lobby.jpg)
 
 ### Controls
@@ -122,6 +122,7 @@ console.
 - Setup and the game are not digitally signed, so Windows SmartScreen may warn
   the first time; choose *More info* → *Run anyway*. Windows also asks for
   network access the first time you host or join a LAN game.
+- Issues remaining relating to the original build.
 
 **If something goes wrong include the newest files from `Game\logs` when
 reporting it.**
