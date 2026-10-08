@@ -1,0 +1,78 @@
+THIRD-PARTY NOTICES
+===================
+
+GoldenEye 007 XBLA PC Recomp builds on the work below and distributes
+components from it. The full license texts are in this licenses folder.
+
+GoldenEye Recomp and community fixes
+------------------------------------
+GoldenEye Recomp by SunJaycy (https://github.com/SunJaycy/GoldenEye-Recomp)
+  The original ReXGlue recompilation of GoldenEye 007 this port is based on:
+  game hooks, keyboard and mouse, post-processing, online play and the
+  BeanTools Community Edition fixes it ports.
+  License: The Unlicense                LICENSE-GoldenEye-Recomp-Unlicense.txt
+GoldenEye Recomp ReXGlue fork by SunJaycy
+  (https://github.com/SunJaycy/GoldenEye-Recomp-rexglue)
+  Runtime fixes merged into this port's ReXGlue patch.
+  License: BSD 3-Clause (as ReXGlue)    LICENSE-ReXGlue.txt
+GoldenEye Recomp Watch Music Fix by mrfox-1 and contributors
+  (https://github.com/mrfox-1/GoldenEye-Recomp-Watch-Music-Fix)
+  Music, tank aiming, body fading, Frigate water and menu fixes.
+  License: MIT                          LICENSE-GoldenEye-Community-Fixes-MIT.txt
+BeanTools "Community Edition" GoldenEye XBLA fixes
+  Level, setup and multiplayer bug fixes, carried over (by GoldenEye Recomp)
+  as code and as the changed values only.
+
+Runtime and tools
+-----------------
+ReXGlue (recompilation runtime)      BSD 3-Clause, includes Xenia-derived code
+  Files: Game\GoldenEye 007.exe, Game\rexruntime.dll, Game\rexgpu-xenos.dll
+                                     LICENSE-ReXGlue.txt
+Extract-STFS (package extractor)     GNU GPL version 3   LICENSE-Extract-STFS.txt
+  Used by Setup as a separate program (installer\Extract-STFS.ps1 inside
+  Setup); derived from Velocity (https://github.com/hetelek/Velocity) and
+  distributed as source code.
+
+Libraries compiled into rexruntime.dll / rexgpu-xenos.dll / the game
+--------------------------------------------------------------------
+SDL 3                                zlib      LICENSE-SDL3.txt
+Dear ImGui                           MIT       LICENSE-DearImGui.txt
+spdlog                               MIT       LICENSE-spdlog.txt
+{fmt}                                MIT       LICENSE-fmt.txt
+toml++                               MIT       LICENSE-tomlplusplus.txt
+o1heap                               MIT       LICENSE-o1heap.txt
+glslang                              BSD 3-Clause and others (see file)
+                                               LICENSE-glslang.txt
+Vulkan Memory Allocator              MIT       LICENSE-VulkanMemoryAllocator.txt
+Vulkan-Headers                       Apache 2.0 / MIT      LICENSE-Vulkan-Headers.txt
+SIMDe                                MIT       LICENSE-simde.txt
+stb_image                            MIT / public domain   LICENSE-stb.txt
+Snappy                               BSD 3-Clause          LICENSE-snappy.txt
+xxHash                               BSD 2-Clause          LICENSE-xxHash.txt
+utfcpp                               Boost Software License 1.0  LICENSE-utfcpp.txt
+PicoSHA2                             MIT       LICENSE-picosha2.txt
+AES-128                              see       LICENSE-aes_128.txt
+RenderDoc in-application API header  MIT       LICENSE-renderdoc-app.txt
+disruptorplus (Lewis Baker)          MIT (upstream: github.com/lewissbaker/disruptorplus)
+tiny-AES-c                           The Unlicense (public domain)
+DXBC checksum (AMD, MD5-derived)     free-for-all notice in its source
+FFmpeg (audio decoding)              LGPL 2.1 or later     LICENSE-FFmpeg-LGPL-2.1.txt
+libmspack                            LGPL 2.1              LICENSE-libmspack-LGPL-2.1.txt
+
+FFmpeg and libmspack are used under the GNU Lesser General Public License.
+FFmpeg is built without its optional GPL components. Their complete source
+code is available from the upstream projects (ffmpeg.org and
+cabextract.org.uk/libmspack); the exact versions are the ones bundled with
+ReXGlue 0.10.0 (thirdparty\FFmpeg and thirdparty\libmspack in its source).
+
+Microsoft Visual C++ runtime
+----------------------------
+msvcp140.dll, msvcp140_atomic_wait.dll, vcruntime140.dll and vcruntime140_1.dll
+are Microsoft Visual C++ Redistributable files, distributed under the
+Microsoft Visual Studio license terms for redistributable code.
+
+Game content
+------------
+GoldenEye 007, James Bond, Xbox, Xbox 360, and related names and assets belong
+to their respective rights holders. Original GoldenEye 007 game data is not
+included with this release; Setup installs it from the player's own package.

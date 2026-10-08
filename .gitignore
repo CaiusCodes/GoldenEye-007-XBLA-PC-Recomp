@@ -1,0 +1,67 @@
+# --- Original game: never committed ---------------------------------------
+# The player's own extracted GoldenEye 007 package (default.xex + files\)
+# goes in game/ for code generation and local runs. Never committed.
+/game/
+/assets/
+*.xex
+# Xbox 360 package files (named by their 40-character content hash) and dumps.
+/[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]*
+*.bin
+
+# Code translated from default.xex by the ReXGlue code generator (it runs as
+# part of the build). Derived from the game's program, so never committed;
+# only the SDK boilerplate generated/rexglue.cmake is tracked.
+/generated/*
+!/generated/rexglue.cmake
+
+# Level background / portal fixes from the BeanTools Community Edition: whole
+# blocks of level data, kept out of the public source (see README).
+/src/ce_patches/siloicbmview.h
+/src/ce_patches/aztecshuttlearea.h
+/src/ce_patches/frigatebg_fixportals.h
+/src/ce_patches/surfacebg_portaladditions.h
+
+# --- Build output and release archives ------------------------------------
+# Every out/ folder, including the SDK's own (rexglue-sdk/out/).
+out/
+/build/
+/build-*/
+/cmake-build-*/
+*.zip
+*.7z
+*.pdb
+*.exe
+*.ilk
+*.exp
+*.lib
+*.obj
+*.o
+
+# --- Runtime data from running a build in place ---------------------------
+ge.toml
+!/packaging/ge.toml
+/userdata/
+/logs/
+*.log
+*.dmp
+crash_backtrace.txt
+
+# --- Local dev / debug tooling (not part of the source) ---------------------
+/parse_dump.py
+/sample_stack.py
+/walk_thread.py
+/launch_online_2p.bat
+/launch_online_2p.ps1
+/CODEGEN COMMAND.txt
+
+# --- IDE, tooling and OS files ---------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+CMakeUserPresets.json
+compile_commands.json
+Thumbs.db
+desktop.ini
+.DS_Store

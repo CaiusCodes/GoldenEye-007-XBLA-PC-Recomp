@@ -1,0 +1,652 @@
+[functions]
+0x823751B8 = { size = 8 }
+0x830E0200 = { name = "sub_830E0200" }
+0x830E0460 = { name = "sub_830E0460" }
+0x830E04D0 = { name = "sub_830E04D0" }
+0x830E0560 = { name = "sub_830E0560" }
+0x830E0630 = { name = "sub_830E0630" }
+0x830E0670 = { name = "sub_830E0670" }
+0x830E06B0 = { name = "sub_830E06B0" }
+0x830E0750 = { name = "sub_830E0750" }
+0x82367EF0 = { size = 0x14 }
+0x82173860 = { size = 8 }
+0x82177F88 = { size = 8 }
+0x821A6310 = { size = 8 }
+0x821E5C58 = { size = 16 }
+0x821E5E28 = { size = 40 }
+0x821E5E50 = { size = 40 }
+0x821E5E78 = { size = 40 }
+0x821E5EA0 = { size = 40 }
+0x821E62C8 = { size = 32 }
+0x821E62E8 = { size = 4 }
+0x8223C0A0 = { size = 120 }
+0x82313B00 = { size = 80 }
+0x8236D700 = { size = 16 }
+0x8236DA00 = { size = 24 }
+0x82371058 = { size = 72 }
+0x823710A0 = { size = 56 }
+0x82375B08 = { size = 8 }
+0x82375B10 = { size = 8 }
+0x82375B20 = { size = 8 }
+0x82375B60 = { size = 8 }
+0x82375B68 = { size = 8 }
+0x82376AB8 = { size = 8 }
+0x82377C20 = { size = 8 }
+0x82377C28 = { size = 8 }
+0x82377C38 = { size = 8 }
+0x823BEF08 = { size = 28 }
+0x8209F5F4 = { name = "ge_cont_8209F5F4" }  # F3 continuation (sub_8209F5D8)
+# F1 (0x820F7750) and F4 (0x820C4918) are NOT separate continuations: their
+# hooks use jump_address back into the parent so the loop-back branches resolve.
+0x820C7454 = { name = "ge_cont_820C7454" }  # F5 continuation (sub_820C7390)
+0x820C7430 = { name = "ge_cont_820C7430" }  # F6 continuation (sub_820C7390)
+0x820A3E9C = { name = "ge_cont_820A3E9C" }  # F7 continuation (sub_820A3C20)
+0x820F79F0 = { name = "ge_body_820F79F0" }  # F2 loop body (one r26 iteration)
+0x820F7D0C = { name = "ge_epi_820F7D0C" }   # F2 epilogue (post-loop, returns)
+# watch-volume save continuations (CE enters the save routine past its clamp)
+0x82184E18 = { name = "ge_cont_82184E18" }
+0x82184E48 = { name = "ge_cont_82184E48" }
+[[midasm_hook]]
+address = 0x82198C94
+name = "ge_dbg_now"
+registers = ["r9", "r30"]
+after_instruction = true
+
+# Multiplayer menu transition: the original instruction is `bc 20,lt`, whose
+# BO=20 encoding is an unconditional branch. ReXGlue 0.8 leaves this specific
+# form unimplemented, so replace it with an explicit jump to its target.
+[[midasm_hook]]
+address = 0x820F2838
+name = "ge_fix_mp_menu_branch"
+registers = []
+after_instruction = false
+jump_address = 0x820F285C
+
+[[midasm_hook]]
+address = 0x82199944
+name = "ge_diag_vdswap"
+registers = ["r31", "r30"]
+after_instruction = true
+
+# The retail startup routine caches the display dimensions in its stack frame,
+# then calls a long chain of graphics initializers before using those values to
+# create the scene/depth resolve textures. In the recompiled path those two
+# stack slots are clobbered to 0/-1, producing 8192x8191 sentinel fetches whose
+# color and depth allocations overlap. Reload the same canonical display globals
+# immediately before sub_82099B40 consumes r3/r4.
+[[midasm_hook]]
+address = 0x821899E4
+name = "ge_fix_postfx_resolve_dimensions"
+registers = ["r3", "r4"]
+after_instruction = true
+
+# A new save's Look Up/Down setting (option 3) comes from the Xbox profile's
+# Y inversion; start it at Upright instead (profile load at 0x82186784, the
+# rlwinm that builds r5 for the option-3 setter call).
+[[midasm_hook]]
+address = 0x821867BC
+name = "ge_look_default"
+registers = ["r5"]
+after_instruction = true
+
+# Never draw the Nintendo-logo joke boot screen (menu 2, drawn by
+# sub_820ED378); ge_inject_keyboard also skips past it at the first poll.
+[[midasm_hook]]
+address = 0x820ED378
+name = "ge_skip_joke_screen"
+registers = ["r3"]
+after_instruction = false
+return_on_true = true
+
+# Skip the "Saving content. Please don't turn off your console." notice
+# (text 0x9DA0) shown by the save routine sub_821872B0 via sub_8209DBD8.
+[[midasm_hook]]
+address = 0x8209DBD8
+name = "ge_skip_save_notice"
+registers = ["r3"]
+after_instruction = false
+return_on_true = true
+
+# Field of view: widen the normal view (ge_fov_extra).
+[[midasm_hook]]
+address = 0x8210D408
+name = "ge_fov_set"
+registers = ["f2"]
+after_instruction = false
+# LAN lobby: View Layout defaults to "single"
+[[midasm_hook]]
+address = 0x82103400
+name = "ge_lan_default_layout"
+registers = ["r11"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x82103434
+name = "ge_lan_default_layout"
+registers = ["r11"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x82103448
+name = "ge_lan_default_layout"
+registers = ["r11"]
+after_instruction = false
+
+# Watch Options tab: hide Screen Letterbox and Screen Ratio
+[[midasm_hook]]
+address = 0x820C69F8
+name = "ge_watch_hide_ratio_draw"
+registers = ["r27"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820C3840
+name = "ge_watch_hide_ratio_nav"
+registers = ["r11"]
+after_instruction = false
+
+# Other Settings: hide the Screen Ratio row (set from the window shape instead)
+[[midasm_hook]]
+address = 0x820FE748
+name = "ge_other_hide_ratio_draw"
+registers = ["r11", "r26"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x820F1FC0
+name = "ge_other_hide_ratio_update"
+registers = ["r11"]
+after_instruction = true
+
+# LAN join screen: a Refresh row (ge_native_menu.cpp)
+[[midasm_hook]]
+address = 0x82101C50
+name = "ge_lan_draw_refresh"
+registers = ["r3"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x82101D70
+name = "ge_lan_draw_refresh"
+registers = ["r3"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x82101CD4
+name = "ge_lan_skip_create_highlight"
+registers = ["r11"]
+after_instruction = false
+jump_address_on_true = 0x82101D34
+[[midasm_hook]]
+address = 0x820F3310
+name = "ge_lan_refresh_update"
+registers = ["r3"]
+after_instruction = false
+return_on_true = true
+
+# Native PC settings pages (ge_native_menu.cpp)
+[[midasm_hook]]
+address = 0x82136AD8
+name = "ge_str_lookup"
+registers = ["r3"]
+after_instruction = false
+return_on_true = true
+[[midasm_hook]]
+address = 0x820FDD74
+name = "ge_help_draw_table"
+registers = ["r26"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x820FDE88
+name = "ge_help_draw_end"
+registers = ["r11", "r26"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x820F12D8
+name = "ge_help_default_row"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x820F1314
+name = "ge_help_row_loop"
+registers = ["r11"]
+after_instruction = false
+jump_address_on_true = 0x820F12EC
+jump_address_on_false = 0x820F1324
+[[midasm_hook]]
+address = 0x820F1370
+name = "ge_help_route"
+registers = ["r9"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820FE1D4
+name = "ge_other_draw"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x820FE75C
+[[midasm_hook]]
+address = 0x820F1DD4
+name = "ge_other_update"
+registers = ["r25"]
+after_instruction = false
+jump_address_on_true = 0x820F2290
+# Main menu ACHIEVEMENTS (relabelled PC SETTINGS) opens the PC menu.
+[[midasm_hook]]
+address = 0x8235D798
+name = "ge_open_pc_settings"
+registers = ["r3"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x8209F5F0
+name = "ge_hook_830E0670"
+registers = ["r3", "r11", "r28"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820F774C
+name = "ge_hook_830E0630"
+registers = ["r30"]
+after_instruction = false
+jump_address_on_true = 0x820F768C
+jump_address_on_false = 0x820F7760
+[[midasm_hook]]
+address = 0x820C4914
+name = "ge_hook_830E0200"
+registers = ["r31", "r29", "r28", "r11", "r23", "r21"]
+after_instruction = false
+jump_address_on_true = 0x820C485C
+jump_address_on_false = 0x820C4920
+[[midasm_hook]]
+address = 0x820C7450
+name = "ge_hook_830E04D0"
+registers = ["r11", "r10", "r9"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820C742C
+name = "ge_hook_830E0560"
+registers = ["r11", "r10", "r9"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820A3E50
+name = "ge_hook_830E0460"
+registers = ["r11", "r4", "r29", "r7", "r28", "r6", "r31", "r5", "r27", "r3"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820B40E4
+name = "ge_hook_830E0750"
+registers = ["r7", "r8", "r11", "f1"]
+after_instruction = false
+return = true
+[[midasm_hook]]
+address = 0x820F79EC
+name = "ge_f2_driver"
+registers = ["r26"]
+after_instruction = true
+return = true
+[[midasm_hook]]
+address = 0x820F7A2C
+name = "ge_f2_skip"
+registers = ["r3"]
+after_instruction = false
+return_on_true = true
+# Mouse-look is now a once-per-frame port of the xenia-canary mousehook
+# (ge_mouse_camera in ge_hooks.cpp), driven from ge_inject_keyboard below. The
+# old per-site ge_bondview_control look hooks are gone.
+# KEYBOARD: after XamInputGetState fills the slot-0 gamepad buffer (unk_830C8B9C)
+# and before ge_input_poll_controllers dispatches it -> OR keyboard buttons in.
+[[midasm_hook]]
+address = 0x823B25E4
+name = "ge_inject_keyboard"
+registers = ["r11"]
+after_instruction = true
+# Hidden debug menu enable (TCRF: byte 0x82189F2B 0x0F->0x00). Replace the dead
+# `beq` at 0x82189F2C with a live gate so LB toggles the debug menu when the
+# ge_debug_menu cvar is on; off = original retail behaviour. See ge_hooks.cpp.
+[[midasm_hook]]
+address = 0x82189F2C
+name = "ge_debug_gate"
+registers = ["r30"]
+after_instruction = false
+jump_address_on_true = 0x82189F4C
+jump_address_on_false = 0x82189F30
+# --- BeanTools Community Edition CODE fixes (instruction patches; see ge_hooks.cpp) ---
+# fix_water_rendering_for_new_graphics @0x8209ECF4: NOOP the graphics-mode
+# flag load so the restored Frigate water draw is not suppressed in HD mode.
+[[midasm_hook]]
+address = 0x8209ECF4
+name = "ge_ce_water_render"
+registers = []
+after_instruction = false
+jump_address = 0x8209ECF8
+# fix_door_volume_clamp @0x820DD814: li r3,0 -> li r3,1
+[[midasm_hook]]
+address = 0x820DD814
+name = "ge_ce_door_vol"
+registers = ["r3"]
+after_instruction = true
+# remove_beta_string_at_logo @0x820ED678: ori r3,r3,0x9D97 -> ...0x9CE3
+[[midasm_hook]]
+address = 0x820ED678
+name = "ge_ce_beta_str"
+registers = ["r3"]
+after_instruction = true
+# extend_audio_distance: re-store 6500.0f into CurveDistanceScaler (stfs r31+0x5C)
+[[midasm_hook]]
+address = 0x8214438C
+name = "ge_ce_audio_dist"
+registers = ["r31"]
+after_instruction = true
+# hardcode_near_clip_to_2: re-store 2.0f at the per-fog near-clip store site
+[[midasm_hook]]
+address = 0x82117B44
+name = "ge_ce_near_clip"
+registers = ["r11"]
+after_instruction = true
+# The camera projection later reloads the near clip at 0x8210E0DC.  Pin the
+# live f3 argument there too: the fog-global value can return to 5.0 after the
+# earlier CE store, which clips Frigate water close to the low boat camera.
+[[midasm_hook]]
+address = 0x8210E0DC
+name = "ge_ce_near_clip_projection"
+registers = ["f3"]
+after_instruction = true
+# remove_original_graphics_mode_blur @0x82188E70: NOOP `bne cr6,+0x19C`
+[[midasm_hook]]
+address = 0x82188E70
+name = "ge_ce_blur"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x8218900C
+jump_address_on_false = 0x82188E74
+# remove_original_graphics_mode_from_intro @0x8209972C: force `b 0x82099750`
+[[midasm_hook]]
+address = 0x8209972C
+name = "ge_ce_intro_gfx"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x82099750
+jump_address_on_false = 0x82099730
+# --- BeanTools CE MP / network hack-functions (see ge_hooks.cpp) -------------
+# disable_doors_autoclosing_on_mp @0x820E4F1C
+[[midasm_hook]]
+address = 0x820E4F1C
+name = "ge_ce_mp_door"
+registers = ["r11"]
+after_instruction = true
+# disable_player_collisions_for_network_mp @0x820CDFA4 (replaces bl sub_820B3E90)
+[[midasm_hook]]
+address = 0x820CDFA4
+name = "ge_ce_mp_collision"
+registers = []
+after_instruction = false
+return = true
+# fix_golden_gun_respawn_visiblity_flag @0x820CF940 (replaces cmpwi/bne)
+[[midasm_hook]]
+address = 0x820CF940
+name = "ge_ce_golden_gun"
+registers = ["r11"]
+after_instruction = false
+jump_address_on_true = 0x820CF948
+jump_address_on_false = 0x820CF94C
+# make_mp_always_use_p2_fog @0x82117CB0
+[[midasm_hook]]
+address = 0x82117CB0
+name = "ge_ce_p2_fog"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x82117CB8
+jump_address_on_false = 0x82117CB4
+# fix_network_armor_bug @0x8216BC1C (after stw r12,0x64(r30); cal_dam)
+[[midasm_hook]]
+address = 0x8216BC1C
+name = "ge_ce_armor_fix"
+registers = ["r30"]
+after_instruction = true
+# increase_mp_characters: li r11,0x21 -> li r11,0x32 at the two unlock sites
+[[midasm_hook]]
+address = 0x820EF350
+name = "ge_ce_mp_charcount"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x82106C54
+name = "ge_ce_mp_charcount"
+registers = ["r11"]
+after_instruction = true
+# add_sfx_to_remote_player_weapons @0x8216E25C (before `add r11,r10,r11`)
+[[midasm_hook]]
+address = 0x8216E25C
+name = "ge_ce_remote_weapon_sfx"
+registers = ["r11"]
+after_instruction = false
+# set_mp_sfx_to_use_player_location: 4 sfx sites -> play + 3D-position (replaces
+# `bl sub_82144920`; jump_address skips the original bl). gasp / slapper / knife /
+# item-equip.
+[[midasm_hook]]
+address = 0x820BF264
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820BF268
+[[midasm_hook]]
+address = 0x820CDC5C
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820CDC60
+[[midasm_hook]]
+address = 0x820ACF54
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820ACF58
+[[midasm_hook]]
+address = 0x820AC4D0
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820AC4D4
+# gasp/argh for remote players (set_mp_sfx gasp half) @0x820BF408
+[[midasm_hook]]
+address = 0x820BF408
+name = "ge_ce_gasp"
+registers = []
+after_instruction = false
+jump_address = 0x820BF40C
+# only_trigger_mp_death_tune @0x820BFB04 (skip the death-tune bl if flag set)
+[[midasm_hook]]
+address = 0x820BFB04
+name = "ge_ce_death_tune"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x820BFB08
+# The leaked XBLA executable left the two N64 dynamic-music AI opcodes as
+# printf-only stubs. Replace the complete stub blocks and return to the common
+# AI interpreter continuation after advancing its bytecode cursor ourselves.
+[[midasm_hook]]
+address = 0x82135BF0
+name = "ge_music_xtrack_play"
+registers = []
+after_instruction = false
+jump_address = 0x82131ACC
+[[midasm_hook]]
+address = 0x82135C10
+name = "ge_music_xtrack_stop"
+registers = []
+after_instruction = false
+jump_address = 0x82131ACC
+# kill-tune 5.0f relocation @0x8209D88C (read +0x3A8 not +0x3AC)
+[[midasm_hook]]
+address = 0x8209D88C
+name = "ge_ce_killtune_float"
+registers = ["r11", "f1"]
+after_instruction = true
+# fix_watch_volume_sliders_range: read (halve for display) + save (double) sites
+[[midasm_hook]]
+address = 0x820C82C4
+name = "ge_ce_watch_music_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C82C8
+[[midasm_hook]]
+address = 0x820C8324
+name = "ge_ce_watch_music_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C8328
+[[midasm_hook]]
+address = 0x820C8154
+name = "ge_ce_watch_sfx_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C8158
+[[midasm_hook]]
+address = 0x820C81B4
+name = "ge_ce_watch_sfx_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C81B8
+[[midasm_hook]]
+address = 0x820C831C
+name = "ge_ce_watch_music_save"
+registers = []
+after_instruction = false
+jump_address = 0x820C8320
+[[midasm_hook]]
+address = 0x820C81AC
+name = "ge_ce_watch_sfx_save"
+registers = []
+after_instruction = false
+jump_address = 0x820C81B0
+
+# Player card (menu 37): no View Gamercard / Add To Friends List rows. The draw
+# skips from after the Mute row to the end of the list; the pointer hit test
+# leaves nothing selected where those rows were.
+[[midasm_hook]]
+address = 0x820FF754
+name = "ge_card_skip_live_rows"
+registers = []
+after_instruction = false
+jump_address = 0x820FF8D4
+[[midasm_hook]]
+address = 0x82106B7C
+name = "ge_card_no_live_select"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x82106B9C
+name = "ge_card_no_live_select"
+registers = ["r11"]
+after_instruction = true
+
+# Shotgun and automatic shotgun shots were never sent to the other players:
+# the gun tick (sub_820A9090) calls the shot effect + network fire message
+# (sub_820A2658) through a weapon jump table that skips weapons 15 and 16.
+[[midasm_hook]]
+address = 0x820AA634
+name = "ge_shotgun_fire_message"
+registers = ["r14", "r15", "r31"]
+after_instruction = false
+
+# Front-end menus: a desk-coloured backdrop behind the folder model, so wide
+# windows show no black beside it (ge_native_menu.cpp).
+[[midasm_hook]]
+address = 0x820F5898
+name = "ge_frontend_backdrop"
+registers = []
+after_instruction = false
+
+# Menu crosshair: clamp to the window instead of the 4:3 folder box
+# (sub_820EC448: x clamp 0x820EC608 -> 0x820EC660, y clamp 0x820EC688 -> 0x820EC6E0).
+[[midasm_hook]]
+address = 0x820EC608
+name = "ge_menu_cursor_clamp_x"
+registers = []
+after_instruction = false
+jump_address = 0x820EC660
+[[midasm_hook]]
+address = 0x820EC688
+name = "ge_menu_cursor_clamp_y"
+registers = []
+after_instruction = false
+jump_address = 0x820EC6E0
+
+# In-game pause menu Help & Options: row actions (How to Play removed, Gamepad /
+# Keyboard Controls). sub_820C7390 dispatch, before `cmplwi r11,11`.
+[[midasm_hook]]
+address = 0x820C74A4
+name = "ge_watch_help_dispatch"
+registers = ["r11"]
+after_instruction = false
+
+# Keyboard Controls page: the watch's Controls tab (sub_820C8420) draws the keyboard
+# binds instead of the pad diagram while the Keyboard Controls row opened it.
+[[midasm_hook]]
+address = 0x820C8444
+name = "ge_watch_keyboard_page"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x820C8D48
+
+# ...and its input (sub_820C3650: up/down starts changing the pad options) is off.
+[[midasm_hook]]
+address = 0x820C3650
+name = "ge_watch_keyboard_page_input"
+registers = []
+after_instruction = false
+return_on_true = true
+
+# Multiplayer character select: crosshair drawn at the end of the page's draw.
+[[midasm_hook]]
+address = 0x820FB7B0
+name = "ge_charsel_cursor"
+registers = []
+after_instruction = false
+
+# Single player: dead guards stay about a minute before they fade (sub_82123C20,
+# the dead-body tick; +44 is the fade timer, -1 when the guard has just died).
+[[midasm_hook]]
+address = 0x82123C20
+name = "ge_corpse_linger"
+registers = ["r3"]
+after_instruction = false
+return_on_true = true
+
+# Character select pictures (ge_portraits.cpp): new slots after the game loads its
+# own, and the four users of the picture table at 0x83066B58 switched to ours.
+[[midasm_hook]]
+address = 0x8214A508
+name = "ge_portraits_load"
+registers = ["r30"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820EBD30
+name = "ge_portrait_table_r9"
+registers = ["r9"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x820FEC24
+name = "ge_portrait_table_r10"
+registers = ["r10"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x820CBE68
+name = "ge_portrait_table_r11"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x820F5C50
+name = "ge_portrait_table_r25"
+registers = ["r25"]
+after_instruction = true
+
+# Character names "Scientist 1" / "Scientist 2" (ge_portraits.cpp), before the
+# name lookup in the character select and in the lobby's player card.
+[[midasm_hook]]
+address = 0x820FB4E0
+name = "ge_charname"
+registers = ["r3", "r11"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820FF3B4
+name = "ge_charname"
+registers = ["r3", "r11"]
+after_instruction = false

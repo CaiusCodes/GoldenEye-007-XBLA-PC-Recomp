@@ -1,0 +1,10 @@
+# GoldenEye 007 PC settings. Setup only writes this file when it is missing,
+# so your changes survive reinstalling. Most options are also in the game's
+# Help & Options menu, which saves them here. Edit it while the game is closed.
+fullscreen = false
+gpu_plugin = "xenos"
+# Full game, not the Xbox LIVE Arcade trial.
+license_mask = 1
+# Online play needs a GoldenEye Recomp server; set it up in Help & Options >
+# Online Settings.
+ge_online_enable = false
