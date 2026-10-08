@@ -78,6 +78,7 @@ neither Setup nor the game contacts Xbox Live.
   (display mode, window size, V-Sync, frame limit, field of view,
   anti-aliasing, texture filtering, post-processing filter) and Online
   Settings
+  ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)
 - **Wider field of view** (10 degrees wider by default, adjustable from the
   original up to +30)
 - Optional **100% game completion** in Setup: every mission, difficulty,
