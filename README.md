@@ -60,6 +60,7 @@ neither Setup nor the game contacts Xbox Live.
   your screen's resolution, rendered at twice the original resolution
 - **Widescreen**: 16:9 and 21:9 (Screen Ratio in the game's options), with a
   desk backdrop around the menus on wide screens
+  ![GoldenEye 007 running in 21:9 widescreen](docs/screenshots/gameplay-ultrawide.jpg)
 - **60 FPS by default**, with V-Sync and a frame limit of 30 to 240 FPS or
   uncapped
 - **Original and enhanced graphics**: switch between the two at any time (F,
@@ -71,6 +72,8 @@ neither Setup nor the game contacts Xbox Live.
 - **LAN multiplayer** (Multiplayer → LAN or Virtual LAN), and **online
   multiplayer** through virtual LAN services such as Radmin VPN, ZeroTier,
   Tailscale and Hamachi
+  ![LAN lobby with two players joined](docs/screenshots/lan-lobby.jpg)
+  ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
   (display mode, window size, V-Sync, frame limit, field of view,
   anti-aliasing, texture filtering, post-processing filter) and Online
