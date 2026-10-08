@@ -1,21 +1,23 @@
 # GoldenEye 007 XBLA PC Recomp
 
-A native Windows PC version of **GoldenEye 007**, based on the unreleased
+A native Windows PC version of **GoldenEye 007** based on the unreleased
 Xbox 360/XBLA remaster, created through static recompilation with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs at up to 4K with
 16:9 and 21:9 widescreen, 60 FPS by default with a higher frame limit
-available, and switches between the original and enhanced graphics at the
-press of a key. Keyboard and mouse, Xbox controllers and LAN multiplayer
-(including online play through virtual LAN services) are all supported.
+available and switches between the original and enhanced graphics at the
+press of a key. Keyboard and mouse, Xbox controllers and online multiplayer
+through LAN and virtual LAN services are all supported.
 
 > **You need your own copy of GoldenEye 007 XBLA.** This project contains no
 > original game executable, graphics, sound, music or other game data. Setup
 > reads the Xbox 360 GoldenEye 007 package you provide, checks that it is the
-> supported version and builds the game folder from it on your PC.
+> supported version and builds the game folder from it on your PC. This is different
+> from the Bean build which had a fake build date only adding updated generic skydomes
+> which did not match the level day/night and unlock rows which was common for most
+> XBLA trial games.
 
 If you enjoy the GoldenEye 007 XBLA PC Recomp and would like to support future
 projects, you can tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
-All support is optional and all releases remain free.
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
 
@@ -28,29 +30,28 @@ All support is optional and all releases remain free.
 - Your own GoldenEye 007 Xbox Live Arcade package (the Xbox 360 game file for
   Title ID `584108A9`)
 
-Nothing else needs installing; the Visual C++ runtime is included. An Xbox
-controller is optional.
-
 ## Install and play
 
 1. Download the release ZIP from the
    [Releases](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/releases)
-   page and extract it to a writable folder (not Program Files).
+   page and extract it to your folder of choice (not Program Files).
 2. Run **Setup GoldenEye 007.exe**.
 3. Choose your GoldenEye 007 package with **Select file...**, or drag it onto
    the Setup window. Setup tells you straight away if it is the wrong file or
    an unsupported version.
-4. Choose **Install game**, pick any optional extras (start in fullscreen,
-   100% game completion, desktop shortcut), then **Play now**.
+4. Choose **Install game**.
+5. **Extras** choose any optional extras, start in full screen,
+   100% game completion or desktop shortcut.
+6. **Play now**.
 
 ![Setup window](docs/screenshots/setup.png)
 
-Afterwards, start the game with `Game\GoldenEye 007.exe`. Saves and settings
-stay inside the extracted folder, so it can be moved or backed up as a whole.
+Afterwards start the game with `Game\GoldenEye 007.exe`. Saves and settings
+stay inside the extracted folder so it can be moved or backed up as a whole.
 Run Setup again at any time to reinstall or change the extras; your saves and
 settings are kept.
 
-Setup only reads your package and never changes it. It downloads nothing, and
+Setup only reads your package and never changes it. It downloads nothing and
 neither Setup nor the game contacts Xbox Live.
 
 ## Features
@@ -72,7 +73,6 @@ neither Setup nor the game contacts Xbox Live.
 - **LAN multiplayer** (Multiplayer → LAN or Virtual LAN), and **online
   multiplayer** through virtual LAN services such as Radmin VPN, ZeroTier,
   Tailscale and Hamachi
-  ![LAN lobby with two players joined](docs/screenshots/lan-lobby.jpg)
   ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
   (display mode, window size, V-Sync, frame limit, field of view,
@@ -89,6 +89,7 @@ neither Setup nor the game contacts Xbox Live.
   watch and mission music fixes, tank mouse aiming, Frigate water, extra
   multiplayer characters, guards' bodies that stay for 60 seconds, and a
   main menu without the Xbox LIVE-only entries
+  ![LAN lobby with two players joined](docs/screenshots/lan-lobby.jpg)
 
 ### Controls
 
@@ -118,19 +119,12 @@ console.
 - Only the GoldenEye 007 Xbox Live Arcade package with Title ID `584108A9`
   and the exact game program this port was recompiled from is supported;
   Setup refuses other builds.
-- This is a development preview: not every mission has been played through
-  with this build yet.
-- Local split-screen multiplayer (several controllers on one PC) has not been
-  tested yet.
-- Xbox LIVE features are not available: multiplayer works through LAN or a
-  virtual LAN. Online Settings' server play needs a GoldenEye Recomp online
-  server, which this project does not provide.
 - Setup and the game are not digitally signed, so Windows SmartScreen may warn
   the first time; choose *More info* → *Run anyway*. Windows also asks for
   network access the first time you host or join a LAN game.
 
-If something goes wrong, include the newest files from `Game\logs` when
-reporting it.
+**If something goes wrong include the newest files from `Game\logs` when
+reporting it.**
 
 ## For Developers
 
