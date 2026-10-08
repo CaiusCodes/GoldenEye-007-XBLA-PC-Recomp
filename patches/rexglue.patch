@@ -5669,18 +5669,24 @@ index 7360ed9..074bc86 100644
  #endif  // XE_PLATFORM
  }
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index b94fe9e..1b46cfb 100644
+index b94fe9e..0b88c31 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
-@@ -44,6 +44,7 @@
+@@ -44,8 +44,13 @@
  
  #include <algorithm>
  #include <filesystem>
 +#include <string>
  #include <string_view>
  
++REXCVAR_DEFINE_BOOL(developer_hotkeys, false, "UI",
++                    "Enable the ReXGlue developer hotkeys: F3 debug overlay, backtick console, "
++                    "F4 settings overlay, F7 achievements overlay (off by default)");
++
  REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
-@@ -201,27 +202,39 @@ bool ReXApp::SetupEnvironment() {
+                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
+                       "GPU emulation")
+@@ -201,27 +206,39 @@ bool ReXApp::SetupEnvironment() {
  }
  
  bool ReXApp::ConstructRuntime(const PathConfig& paths) {
@@ -5726,7 +5732,7 @@ index b94fe9e..1b46cfb 100644
                                       paths.update_data_root, paths.cache_root, paths.metadata_root);
    runtime_->set_app_context(&app_context());
  
-@@ -252,6 +265,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -252,6 +269,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
      if (input_sys) {
        input_sys->SetActiveCallback([this]() {
@@ -5738,7 +5744,7 @@ index b94fe9e..1b46cfb 100644
          if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
            return true;
          return !imgui_drawer_->GetIO().WantCaptureMouse;
-@@ -274,7 +292,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -274,7 +296,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      }
      std::string host_tail{tail};
      std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
@@ -5750,7 +5756,7 @@ index b94fe9e..1b46cfb 100644
      if (!std::filesystem::is_regular_file(xex_host)) {
        auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
        REXLOG_ERROR("{}", msg);
-@@ -333,8 +354,14 @@ bool ReXApp::SetupPresentation() {
+@@ -333,8 +358,14 @@ bool ReXApp::SetupPresentation() {
      }
    }
  
@@ -5767,7 +5773,77 @@ index b94fe9e..1b46cfb 100644
    if (!window_) {
      REXLOG_ERROR("Failed to create window");
      return false;
-@@ -613,4 +640,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
+@@ -394,35 +425,40 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
+   // lazily on the first Draw instead).
+   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
+-    if (debug_overlay_) {
+-      debug_overlay_.reset();
+-    } else {
+-      debug_overlay_ =
+-          std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+-    }
+-  });
+-  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
+-    if (console_overlay_) {
+-      console_overlay_.reset();
+-    } else {
+-      console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
+-    }
+-  });
+-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
+-    if (settings_overlay_) {
+-      settings_overlay_.reset();
+-    } else {
+-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
+-    }
+-  });
+-  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+-    if (achievements_overlay_) {
+-      achievements_overlay_.reset();
+-    } else {
+-      achievements_overlay_ = CreateAchievementsOverlay();
+-    }
+-  });
++  // Developer hotkeys (F3 debug overlay, backtick console, F4 settings overlay,
++  // F7 achievements overlay) are off in releases; set developer_hotkeys = true
++  // in the game's .toml to bring them back.
++  if (REXCVAR_GET(developer_hotkeys)) {
++    rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
++      if (debug_overlay_) {
++        debug_overlay_.reset();
++      } else {
++        debug_overlay_ =
++            std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
++      }
++    });
++    rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
++      if (console_overlay_) {
++        console_overlay_.reset();
++      } else {
++        console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
++      }
++    });
++    rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
++      if (settings_overlay_) {
++        settings_overlay_.reset();
++      } else {
++        settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
++      }
++    });
++    rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
++      if (achievements_overlay_) {
++        achievements_overlay_.reset();
++      } else {
++        achievements_overlay_ = CreateAchievementsOverlay();
++      }
++    });
++  }
+ 
+   OnCreateDialogs(imgui_drawer_.get());
+ }
+@@ -613,4 +649,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
    }
  }
  

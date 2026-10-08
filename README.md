@@ -172,6 +172,11 @@ from there, link your extracted package in as its `assets` folder:
 New-Item -ItemType Junction -Path "out\build\win-amd64-release\assets" -Target game
 ```
 
+ReXGlue's developer hotkeys (F3 debug overlay, backtick console, F4 settings
+overlay, F7 achievements overlay) are off. Set `developer_hotkeys = true` in
+`ge.toml` to bring them back; `ge_debug_menu = true` enables the game's hidden
+debug menu (press LB in a mission).
+
 `.\tools\Make-Release.ps1` (or `Make Release.bat`) builds the release ZIP,
 `out\release\GoldenEye-007-XBLA-PC-Recomp-v<version>.zip`, holding Setup,
 README and licences only (never any game data). The version comes from the

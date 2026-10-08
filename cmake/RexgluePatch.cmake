@@ -69,6 +69,14 @@ function(ge_apply_rexglue_patch)
             # An older version of the patch is applied: take it back out first.
             _ge_rexglue_git(_r _out apply --reverse "${_applied}")
             if(NOT _r EQUAL 0)
+                # Not removable: either the tree was reset to pristine upstream
+                # (the old patch applies cleanly again) or it has local edits.
+                _ge_rexglue_git(_r2 _out2 apply --check "${_applied}")
+                if(_r2 EQUAL 0)
+                    set(_r 0)
+                endif()
+            endif()
+            if(NOT _r EQUAL 0)
                 message(FATAL_ERROR
                     "Could not remove the previously applied ReXGlue patch:\n${_out}\n"
                     "Reset the SDK and configure again:\n"
