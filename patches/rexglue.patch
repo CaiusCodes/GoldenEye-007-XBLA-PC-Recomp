@@ -5669,7 +5669,7 @@ index 7360ed9..074bc86 100644
  #endif  // XE_PLATFORM
  }
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index b94fe9e..0b88c31 100644
+index b94fe9e..85a75be 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -44,8 +44,13 @@
@@ -5773,7 +5773,28 @@ index b94fe9e..0b88c31 100644
    if (!window_) {
      REXLOG_ERROR("Failed to create window");
      return false;
-@@ -394,35 +425,40 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+@@ -350,10 +381,17 @@ bool ReXApp::SetupPresentation() {
+   if (REXCVAR_GET(fullscreen)) {
+     window_->SetFullscreen(true);
+   }
++  // Change callbacks run on whichever thread set the cvar (often the game
++  // thread) while the cvar registry is locked. Switching the window there froze
++  // the game: the window change waits on the UI thread, which can be waiting on
++  // that same lock. Apply it on the UI thread instead, between frames.
+   rex::cvar::RegisterChangeCallback("fullscreen", [this](std::string_view, std::string_view value) {
+-    if (window_) {
+-      window_->SetFullscreen(rex::string::from_string<bool>(value, false));
+-    }
++    const bool fullscreen = rex::string::from_string<bool>(value, false);
++    app_context().CallInUIThreadDeferred([this, fullscreen] {
++      if (window_) {
++        window_->SetFullscreen(fullscreen);
++      }
++    });
+   });
+   window_->Open();
+ 
+@@ -394,35 +432,40 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
    // gated eager font upload in SetImmediateDrawer is skipped (font uploads
    // lazily on the first Draw instead).
    imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
@@ -5843,7 +5864,7 @@ index b94fe9e..0b88c31 100644
  
    OnCreateDialogs(imgui_drawer_.get());
  }
-@@ -613,4 +649,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
+@@ -613,4 +656,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
    }
  }
  
