@@ -51,7 +51,7 @@ try {
 '@
 
     $stubs = @(
-        @{ Source = 'installer_stub.cpp'; Output = 'Setup GoldenEye 007.exe'; Description = 'GoldenEye 007 PC Setup'; Icon = $setupIcon }
+        @{ Source = 'installer_stub.cpp'; Output = 'Setup GoldenEye 007.exe'; Description = 'GoldenEye 007 XBLA PC Recomp Setup'; Icon = $setupIcon }
     )
     foreach ($stub in $stubs) {
         $name = [IO.Path]::GetFileNameWithoutExtension($stub.Source)
@@ -72,11 +72,15 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
+      VALUE "CompanyName", "GoldenEye 007 XBLA PC Recomp project"
       VALUE "FileDescription", "$($stub.Description)"
-      VALUE "ProductName", "GoldenEye 007 PC"
+      VALUE "ProductName", "GoldenEye 007 XBLA PC Recomp"
       VALUE "ProductVersion", "$Version"
       VALUE "FileVersion", "$Version"
+      VALUE "InternalName", "$($stub.Output)"
       VALUE "OriginalFilename", "$($stub.Output)"
+      VALUE "LegalCopyright", "Open source: Unlicense and MIT, see licenses folder"
+      VALUE "Comments", "https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp"
     END
   END
   BLOCK "VarFileInfo"

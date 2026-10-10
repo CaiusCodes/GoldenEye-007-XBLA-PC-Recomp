@@ -4,11 +4,12 @@
 // carries everything else inside itself: a ZIP appended to the end of this
 // executable (installer\ scripts and the game\ runtime, see tools/Make-Release.ps1)
 // followed by a 16-byte trailer: "GE7SETUP" and the ZIP's offset (uint64,
-// little endian). Setup copies that ZIP to a temporary folder, has a hidden
-// Windows PowerShell unpack it and run installer\Install-GoldenEye.ps1 with the
-// release folder (where this exe is) and the unpacked payload, forwards its own
-// command line (used for automated testing), removes the temporary folder and
-// returns the script's exit code. Built by packaging/Build-Stubs.ps1.
+// little endian). Setup copies that ZIP to a temporary folder, unpacks it with
+// Windows' own tar.exe, runs installer\Install-GoldenEye.ps1 from it (-File, so
+// no script text is built on the command line) with the release folder (where
+// this exe is) and the unpacked payload, forwards its own command line (used for
+// automated testing), removes the temporary folder and returns the script's exit
+// code. Built by packaging/Build-Stubs.ps1.
 //
 // A GUI-subsystem program, so starting Setup never flashes a console.
 
@@ -16,7 +17,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 static const char kMagic[8] = {'G', 'E', '7', 'S', 'E', 'T', 'U', 'P'};
@@ -77,14 +80,39 @@ static bool ExtractPayload(const std::wstring& exe, const std::wstring& zip_path
   return ok;
 }
 
-// A path for a single-quoted PowerShell string.
-static std::wstring PsQuote(const std::wstring& s) {
-  std::wstring out = L"'";
+// One command-line argument, quoted the way CommandLineToArgvW reads it back.
+static std::wstring Quote(const std::wstring& s) {
+  std::wstring out = L"\"";
+  size_t slashes = 0;
   for (wchar_t c : s) {
-    if (c == L'\'') out += L"''";
-    else out += c;
+    if (c == L'\\') {
+      ++slashes;
+      continue;
+    }
+    out.append(c == L'"' ? slashes * 2 + 1 : slashes, L'\\');
+    slashes = 0;
+    out += c;
   }
-  return out + L"'";
+  out.append(slashes * 2, L'\\');
+  return out + L"\"";
+}
+
+// Runs program with command (its full command line) in dir, without a
+// console window. Returns its exit code, or -1 if it could not start.
+static long Run(const std::wstring& program, std::wstring command, const std::wstring& dir) {
+  STARTUPINFOW startup = {};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process = {};
+  if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                      nullptr, dir.c_str(), &startup, &process)) {
+    return -1;
+  }
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exit_code = 1;
+  GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hProcess);
+  CloseHandle(process.hThread);
+  return static_cast<long>(exit_code);
 }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR args, int) {
@@ -110,51 +138,40 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR args, int) {
     return 1;
   }
 
-  // Full path, so a stray powershell.exe elsewhere on PATH is never picked up.
+  // Full paths, so a stray tar.exe or powershell.exe on PATH is never picked up.
   wchar_t system_dir[MAX_PATH];
   GetSystemDirectoryW(system_dir, MAX_PATH);
+  const std::wstring tar = std::wstring(system_dir) + L"\\tar.exe";
   const std::wstring powershell =
       std::wstring(system_dir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
 
-  // Unpack, run the installer with Setup's own arguments, always clean up.
-  std::wstring script =
-      L"$ErrorActionPreference='Stop'; $code=1; try { "
-      L"Add-Type -AssemblyName System.IO.Compression.FileSystem; "
-      L"[System.IO.Compression.ZipFile]::ExtractToDirectory(" + PsQuote(zip) + L", " +
-      PsQuote(payload) + L"); "
-      L"& " + PsQuote(payload + L"\\installer\\Install-GoldenEye.ps1") +
-      L" -ReleaseRoot " + PsQuote(release_root) + L" -PayloadDir " + PsQuote(payload);
-  if (args && *args) {
-    // Inside the -Command "..." argument a quote must be written \" (testing
-    // passes paths in quotes: -PackagePath "C:\some folder\package").
-    script += L" ";
-    for (const wchar_t* c = args; *c; ++c) {
-      if (*c == L'"') script += L"\\\"";
-      else script += *c;
+  long code = 1;
+  CreateDirectoryW(payload.c_str(), nullptr);
+  const long unpacked =
+      Run(tar, Quote(tar) + L" -xf " + Quote(zip) + L" -C " + Quote(payload), work);
+  if (unpacked != 0) {
+    Fail(unpacked < 0 ? L"Setup could not start Windows' tar.exe to unpack itself.\n\n"
+                        L"Setup needs Windows 10 (version 1803) or later."
+                      : L"Setup could not unpack itself. Check there is free space on the "
+                        L"system drive, then run Setup again.");
+  } else {
+    // Setup's own arguments go straight to the script (testing passes
+    // -PackagePath "C:\some folder\package" -Unattended -Extras a,b).
+    std::wstring command = Quote(powershell) +
+                           L" -NoProfile -STA -ExecutionPolicy RemoteSigned -File " +
+                           Quote(payload + L"\\installer\\Install-GoldenEye.ps1") +
+                           L" -ReleaseRoot " + Quote(release_root) + L" -PayloadDir " +
+                           Quote(payload);
+    if (args && *args) command += L" " + std::wstring(args);
+    // CREATE_NO_WINDOW hides PowerShell's console; the script draws its own window.
+    code = Run(powershell, command, release_root);
+    if (code < 0) {
+      Fail(L"Setup could not start Windows PowerShell.");
+      code = 1;
     }
   }
-  script += L"; $code=$LASTEXITCODE } catch { [Console]::Error.WriteLine($_.Exception.Message) } "
-            L"finally { Remove-Item -LiteralPath " + PsQuote(work) +
-            L" -Recurse -Force -ErrorAction SilentlyContinue }; exit $code";
 
-  std::wstring command = L"\"" + powershell +
-                         L"\" -NoProfile -STA -ExecutionPolicy Bypass -Command \"" + script + L"\"";
-
-  STARTUPINFOW startup = {};
-  startup.cb = sizeof(startup);
-  PROCESS_INFORMATION process = {};
-
-  // CREATE_NO_WINDOW hides PowerShell's console; the script draws its own window.
-  if (!CreateProcessW(powershell.c_str(), command.data(), nullptr, nullptr, FALSE,
-                      CREATE_NO_WINDOW, nullptr, release_root.c_str(), &startup, &process)) {
-    Fail(L"Setup could not start Windows PowerShell.");
-    return 1;
-  }
-
-  WaitForSingleObject(process.hProcess, INFINITE);
-  DWORD exit_code = 1;
-  GetExitCodeProcess(process.hProcess, &exit_code);
-  CloseHandle(process.hProcess);
-  CloseHandle(process.hThread);
-  return static_cast<int>(exit_code);
+  std::error_code ignored;
+  std::filesystem::remove_all(work, ignored);
+  return static_cast<int>(code);
 }
