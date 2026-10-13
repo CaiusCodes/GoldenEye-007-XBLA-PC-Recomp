@@ -26,12 +26,15 @@ BeanTools "Community Edition" GoldenEye XBLA fixes
 Runtime and tools
 -----------------
 ReXGlue (recompilation runtime)      BSD 3-Clause, includes Xenia-derived code
-  Files: Game\GoldenEye 007.exe, Game\rexruntime.dll, Game\rexgpu-xenos.dll
+  Files: resources\runtime\GoldenEye 007.exe, resources\runtime\rexruntime.dll,
+         resources\runtime\rexgpu-xenos.dll
                                      LICENSE-ReXGlue.txt
-Extract-STFS (package extractor)     GNU GPL version 3   LICENSE-Extract-STFS.txt
-  Used by Setup as a separate program (installer\Extract-STFS.ps1 inside
-  Setup); derived from Velocity (https://github.com/hetelek/Velocity) and
-  distributed as source code.
+STFS package reader                  GNU GPL version 3   LICENSE-Extract-STFS.txt
+  Compiled into the launcher, GoldenEye 007.exe in the release root, which is
+  therefore distributed under the GNU GPL version 3. Derived from Velocity
+  (https://github.com/hetelek/Velocity). Its complete source is in the
+  project repository (packaging/launcher). The game in resources\runtime is
+  a separate program and is not covered by the GPL.
 
 Libraries compiled into rexruntime.dll / rexgpu-xenos.dll / the game
 --------------------------------------------------------------------
@@ -75,4 +78,5 @@ Game content
 ------------
 GoldenEye 007, James Bond, Xbox, Xbox 360, and related names and assets belong
 to their respective rights holders. Original GoldenEye 007 game data is not
-included with this release; Setup installs it from the player's own package.
+included with this release; the launcher imports it from the player's own
+package into resources\assets.

@@ -1,24 +1,19 @@
-# Builds the GoldenEye 007 release in out\release. The ZIP holds one folder:
+# Builds the GoldenEye 007 portable release in out\release. The ZIP holds one folder:
 #
-#   GoldenEye 007 XBLA PC Recomp\
-#     Setup GoldenEye 007.exe     Setup, carrying the payload ZIP below inside itself
+#   GoldenEye 007\
+#     GoldenEye 007.exe           the launcher: the only program to open
 #     README.txt
 #     licenses\
+#     resources\
+#       runtime\                  the game (GoldenEye 007.exe, rexruntime.dll,
+#                                 rexgpu-xenos.dll, VC++ runtime DLLs) and the
+#                                 port's own pictures and version.txt
 #
-# Setup creates Game\ beside itself from the payload and the player's package:
-#
-#     Game\
-#       GoldenEye 007.exe         the game
-#       rexruntime.dll, rexgpu-xenos.dll, VC++ runtime DLLs
-#       ge.toml                   settings (only written when missing)
-#       release-manifest.json     bytes + SHA-256 of every file Setup puts here
-#       resources\                the port's own pictures and version.txt
-#       assets\                   unpacked from the player's package
-#       userdata\, logs\          saves, Setup and game logs
-#
-# The payload (staging\payload) is installer\ (Setup scripts) and game\ (the
-# runtime above). The release carries no original game content; the audit below
-# refuses to package anything that looks like game data, debug output or user state.
+# The first time the launcher runs it imports the game data from the player's
+# own Xbox 360 package into resources\assets; saves and settings go to
+# resources\userdata. The release carries no original game content; the audit
+# below refuses to package anything that looks like game data, debug output or
+# user state.
 [CmdletBinding()]
 param(
     [string]$BuildPreset = "win-amd64-release",
@@ -43,17 +38,13 @@ $projectRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -Chi
 $buildRoot = Join-Path $projectRoot "out\build\$BuildPreset"
 $packagingRoot = Join-Path $projectRoot "packaging"
 $releaseRoot = Join-Path $projectRoot "out\release"
-# Staged under out\release\staging so a copy someone installed and plays from
-# out\release (with saves in its Game folder) is never touched.
-$releaseName = "GoldenEye 007 XBLA PC Recomp"
+# Staged under out\release\staging so a copy someone plays from out\release is never touched.
+$releaseName = "GoldenEye 007"
 $stageRoot = Join-Path $releaseRoot "staging\$releaseName"
-$payloadRoot = Join-Path $releaseRoot "staging\payload"
-$payloadZip = Join-Path $releaseRoot "staging\payload.zip"
 $zipPath = Join-Path $releaseRoot "GoldenEye-007-XBLA-PC-Recomp-v$Version.zip"
-$setupName = "Setup GoldenEye 007.exe"
-$gameExeName = "GoldenEye 007.exe"
+$exeName = "GoldenEye 007.exe"
 
-$runtimeFiles = @($gameExeName, "rexruntime.dll", "rexgpu-xenos.dll")
+$runtimeFiles = @($exeName, "rexruntime.dll", "rexgpu-xenos.dll")
 $vcRuntimeFiles = @("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll")
 
 # --- 1. Inputs ---------------------------------------------------------------
@@ -64,11 +55,11 @@ foreach ($file in $runtimeFiles) {
 }
 
 # A release must never ship a binary older than the source it claims to be.
-$exeTime = (Get-Item -LiteralPath (Join-Path $buildRoot $gameExeName)).LastWriteTimeUtc
+$exeTime = (Get-Item -LiteralPath (Join-Path $buildRoot $exeName)).LastWriteTimeUtc
 $newestSource = Get-ChildItem -LiteralPath (Join-Path $projectRoot "src") -File -Recurse |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
 if ($newestSource.LastWriteTimeUtc -gt $exeTime) {
-    throw "$gameExeName is older than src\$($newestSource.Name). Rebuild before packaging."
+    throw "$exeName is older than src\$($newestSource.Name). Rebuild before packaging."
 }
 
 if (-not $VcRedistDir) {
@@ -143,73 +134,77 @@ if ($gpuPluginAbi -ne 1) {
     throw "GPU plugin ABI mismatch: found $gpuPluginAbi, expected 1. Rebuild with GPU_PLUGINS xenos."
 }
 
-# --- 2. Setup program -----------------------------------------------------------
-& (Join-Path $packagingRoot "Build-Stubs.ps1") -Version $Version
-$setupStub = Join-Path $packagingRoot $setupName
-if (-not (Test-Path -LiteralPath $setupStub -PathType Leaf)) {
-    throw "Setup was not built: $setupName"
+# --- 2. Launcher ----------------------------------------------------------------
+& (Join-Path $packagingRoot "Build-Launcher.ps1") -Version $Version
+$launcher = Join-Path $packagingRoot $exeName
+if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+    throw "The launcher was not built: $exeName"
 }
 
 # --- 3. Stage -----------------------------------------------------------------
-if (Test-Path -LiteralPath (Join-Path $stageRoot "Game")) {
-    throw "The staging folder holds an installed Game folder (saves?). Move it away first: $stageRoot"
+foreach ($played in @("resources\assets", "resources\userdata")) {
+    if (Test-Path -LiteralPath (Join-Path $stageRoot $played)) {
+        throw "The staging folder has been played from ($played; saves?). Move it away first: $stageRoot"
+    }
 }
-foreach ($old in @($stageRoot, $payloadRoot, $payloadZip, $zipPath)) {
+foreach ($old in @($stageRoot, $zipPath)) {
     if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+}
+# Staging left by releases before 0.9.1's single launcher.
+foreach ($old in @("staging\GoldenEye 007 XBLA PC Recomp", "staging\payload", "staging\payload.zip")) {
+    $path = Join-Path $releaseRoot $old
+    if ((Test-Path -LiteralPath $path) -and -not (Test-Path -LiteralPath (Join-Path $path "Game"))) {
+        Remove-Item -LiteralPath $path -Recurse -Force
+    }
 }
 
 $licensesStage = Join-Path $stageRoot "licenses"
-$installerStage = Join-Path $payloadRoot "installer"
-$gameStage = Join-Path $payloadRoot "game"
-$resourcesStage = Join-Path $gameStage "resources"
-foreach ($dir in @($stageRoot, $licensesStage, $installerStage, $gameStage, $resourcesStage)) {
+$runtimeStage = Join-Path $stageRoot "resources\runtime"
+foreach ($dir in @($stageRoot, $licensesStage, $runtimeStage)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
 
-# Release root: README and licences (Setup is added once the payload is in it).
+# Release root: the launcher, README and licences.
+Copy-Item -LiteralPath $launcher -Destination $stageRoot
 $readme = [System.IO.File]::ReadAllText((Join-Path $packagingRoot "README.txt")).Replace("@VERSION@", $Version)
 $readme = $readme -replace "`r?`n", "`r`n"  # Notepad-friendly line endings
 [System.IO.File]::WriteAllText((Join-Path $stageRoot "README.txt"), $readme, (New-Object System.Text.UTF8Encoding($false)))
 Get-ChildItem -LiteralPath (Join-Path $packagingRoot "licenses") -File |
     ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $licensesStage }
 
-# Payload: Setup's scripts.
-Get-ChildItem -LiteralPath (Join-Path $packagingRoot "resources\installer") -File |
-    ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $installerStage }
-[System.IO.File]::WriteAllText((Join-Path $installerStage "version.txt"), $Version)
-
-# Payload: the runtime that goes into Game\.
-foreach ($file in $runtimeFiles) { Copy-Item -LiteralPath (Join-Path $buildRoot $file) -Destination $gameStage }
-foreach ($file in $vcRuntimeFiles) { Copy-Item -LiteralPath (Join-Path $VcRedistDir $file) -Destination $gameStage }
-Copy-Item -LiteralPath (Join-Path $packagingRoot "ge.toml") -Destination $gameStage
-# Game\resources: the desk picture behind the front-end folder on wide screens,
-# the re-painted menu folder textures, the character select pictures and the
-# version shown on the main menu.
+# resources\runtime: the game, its DLLs, and the port's own pictures (the desk
+# picture behind the front-end folder on wide screens, re-painted menu folder
+# textures and character select pictures when present) and the version shown on
+# the main menu. The game reads its data from resources\assets and resources\userdata.
+foreach ($file in $runtimeFiles) { Copy-Item -LiteralPath (Join-Path $buildRoot $file) -Destination $runtimeStage }
+foreach ($file in $vcRuntimeFiles) { Copy-Item -LiteralPath (Join-Path $VcRedistDir $file) -Destination $runtimeStage }
 foreach ($shape in @("169", "219")) {
-    Copy-Item -LiteralPath (Join-Path $packagingRoot "menu-backdrop-$shape.png") -Destination $resourcesStage
+    Copy-Item -LiteralPath (Join-Path $packagingRoot "menu-backdrop-$shape.png") -Destination $runtimeStage
 }
 foreach ($folder in @("textures", "portraits")) {
     # Optional: the game falls back to the original pictures without them.
     if (-not (Test-Path -LiteralPath (Join-Path $packagingRoot $folder))) { continue }
-    $target = Join-Path $resourcesStage $folder
+    $target = Join-Path $runtimeStage $folder
     New-Item -ItemType Directory -Path $target -Force | Out-Null
     Get-ChildItem -LiteralPath (Join-Path $packagingRoot $folder) -Filter *.png -File |
         ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $target }
 }
-[System.IO.File]::WriteAllText((Join-Path $resourcesStage "version.txt"), $Version)
+[System.IO.File]::WriteAllText((Join-Path $runtimeStage "version.txt"), $Version)
 
 # --- 4. Audit: nothing from the game package, no debug output, no user state -
-$staged = @(Get-ChildItem -LiteralPath $stageRoot -Recurse -Force) + @(Get-ChildItem -LiteralPath $payloadRoot -Recurse -Force)
-# The release root holds Setup, README and licences only; Setup makes Game\.
+$staged = @(Get-ChildItem -LiteralPath $stageRoot -Recurse -Force)
 foreach ($item in @(Get-ChildItem -LiteralPath $stageRoot -Force)) {
-    if (@("README.txt", "licenses") -notcontains $item.Name) {
+    if (@($exeName, "README.txt", "licenses", "resources") -notcontains $item.Name) {
         throw "Unexpected item in the release root: $($item.Name)"
     }
 }
-$forbiddenNames = @("assets", "assets_import_tmp", "userdata", "logs", "cache",
+foreach ($item in @(Get-ChildItem -LiteralPath (Join-Path $stageRoot "resources") -Force)) {
+    if ($item.Name -ne "runtime") { throw "Unexpected item in resources: $($item.Name)" }
+}
+$forbiddenNames = @("assets", "userdata", "logs", "cache", "Game", "ge.toml",
     "default.xex", "ArcadeInfo.xml", "Bean.xex", "music.xwb", "sfx.xwb", "files",
     "guest_image.bin", "xstr_decompressed.bin")
-$forbiddenPatterns = @("*.pdb", "*.xex", "*.bin", "*.log", "*.ilk", "*.exp", "*.lib",
+$forbiddenPatterns = @("*.pdb", "*.xex", "*.bin", "*.log", "*.ilk", "*.exp", "*.lib", "*.ps1",
     "*.xwb", "*.xsb", "*.xgs", "*.rba", "*.rbh", "*.str")
 foreach ($item in $staged) {
     if ($forbiddenNames -contains $item.Name) {
@@ -246,67 +241,18 @@ if (Test-Path -LiteralPath $assetsRoot) {
     }
 }
 
-# --- 5. Manifest (Game\release-manifest.json, paths relative to Game) ---------
-$gameFiles = @(Get-ChildItem -LiteralPath $gameStage -File -Recurse)
-$entries = New-Object System.Collections.Generic.List[object]
-foreach ($file in $gameFiles) {
-    $entries.Add([pscustomobject]@{
-            Path = $file.FullName.Substring($gameStage.Length + 1)
-            Bytes = $file.Length
-            Sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
-        })
-}
-$entries.Sort([System.Comparison[object]] { param($a, $b) [string]::CompareOrdinal($a.Path, $b.Path) })
-
-$json = New-Object System.Text.StringBuilder
-[void]$json.Append("{`n  `"release`": `"$releaseName`",`n  `"version`": `"$Version`",`n  `"files`": [`n")
-for ($i = 0; $i -lt $entries.Count; $i++) {
-    $entry = $entries[$i]
-    $path = $entry.Path.Replace('\', '\\').Replace('"', '\"')
-    [void]$json.Append("    {`n")
-    [void]$json.Append("      `"bytes`": $($entry.Bytes),`n")
-    [void]$json.Append("      `"path`": `"$path`",`n")
-    [void]$json.Append("      `"sha256`": `"$($entry.Sha256)`"`n")
-    [void]$json.Append("    }")
-    if ($i -lt $entries.Count - 1) { [void]$json.Append(",") }
-    [void]$json.Append("`n")
-}
-[void]$json.Append("  ]`n}`n")
-[System.IO.File]::WriteAllText((Join-Path $gameStage "release-manifest.json"), $json.ToString(),
-    (New-Object System.Text.UTF8Encoding($false)))
-
-# --- 6. Setup with the payload inside, then the release ZIP -------------------
+# --- 5. The release ZIP ---------------------------------------------------------
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::CreateFromDirectory($payloadRoot, $payloadZip,
-    [System.IO.Compression.CompressionLevel]::Optimal, $false)
-# Setup = the stub, the payload ZIP, then "GE7SETUP" + the ZIP's offset (UInt64 LE).
-$setupTarget = Join-Path $stageRoot $setupName
-$stubBytes = [System.IO.File]::ReadAllBytes($setupStub)
-$out = [System.IO.File]::Create($setupTarget)
-try {
-    $out.Write($stubBytes, 0, $stubBytes.Length)
-    $payloadStream = [System.IO.File]::OpenRead($payloadZip)
-    try { $payloadStream.CopyTo($out) } finally { $payloadStream.Dispose() }
-    $magic = [System.Text.Encoding]::ASCII.GetBytes("GE7SETUP")
-    $out.Write($magic, 0, 8)
-    $offset = [System.BitConverter]::GetBytes([uint64]$stubBytes.Length)
-    $out.Write($offset, 0, 8)
-}
-finally {
-    $out.Dispose()
-}
-
 [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zipPath,
     [System.IO.Compression.CompressionLevel]::Optimal, $true)
 
-$stagedFiles = @(Get-ChildItem -LiteralPath $stageRoot -File -Recurse)
 $releaseSize = ($stagedFiles | Measure-Object -Property Length -Sum).Sum
 $zip = Get-Item -LiteralPath $zipPath
 Write-Host "Portable release created."
 Write-Host "Folder:   $stageRoot"
 Write-Host "ZIP:      $zipPath"
 Write-Host "Root:     $(@(Get-ChildItem -LiteralPath $stageRoot | ForEach-Object Name) -join ', ')"
-Write-Host "Game:     $($entries.Count) files + release-manifest.json (inside Setup)"
+Write-Host "Runtime:  $(@(Get-ChildItem -LiteralPath $runtimeStage -File -Recurse).Count) files in resources\runtime"
 Write-Host "GPU ABI:  $gpuPluginAbi"
 Write-Host "VC++ CRT: $VcRedistDir"
 Write-Host "Audit:    no forbidden items; $assetComparisons same-size game files compared, none identical"

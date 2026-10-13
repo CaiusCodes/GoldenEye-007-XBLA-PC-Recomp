@@ -9,9 +9,10 @@ press of a key. Keyboard and mouse, Xbox controllers and online multiplayer
 through LAN and virtual LAN services are all supported.
 
 > **You need your own copy of GoldenEye 007 XBLA.** This project contains no
-> original game executable, graphics, sound, music or other game data. Setup
-> reads the Xbox 360 GoldenEye 007 package you provide, checks that it is the
-> supported version and builds the game folder from it on your PC. This is different
+> original game executable, graphics, sound, music or other game data. The
+> first time you start it, it reads the Xbox 360 GoldenEye 007 package you
+> provide, checks that it is the supported version and imports the game data
+> from it into the game's folder on your PC. This is different
 > from the Bean build which had a fake build date only adding updated generic skydomes
 > which did not match the level day/night and unlock rows which was common for most
 > XBLA trial games.
@@ -34,25 +35,30 @@ projects, you can tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 1. Download the release ZIP from the
    [Releases](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/releases)
-   page and extract it to your folder of choice (not Program Files).
-2. Run **Setup GoldenEye 007.exe**.
-3. Choose your GoldenEye 007 package with **Select file...**, or drag it onto
-   the Setup window. Setup tells you straight away if it is the wrong file or
-   an unsupported version.
-4. Choose **Install game**.
-5. **Extras** choose any optional extras, start in full screen,
-   100% game completion or desktop shortcut.
-6. **Play now**.
+   page and extract it to your folder of choice (not Program Files). You get
+   one folder, **GoldenEye 007**.
+2. Open **GoldenEye 007.exe**. The first time, the setup window opens.
+3. A package beside `GoldenEye 007.exe` or in a `Game Package` folder next to
+   it is found and imported automatically. Otherwise drag the package (or
+   the folder holding it) onto the window, or use **Browse package**. It is
+   checked first, and the import starts as soon as it is accepted.
+4. Tick any optional extras: start in fullscreen, desktop shortcut,
+   100% game completion.
+5. **Play**.
 
 ![Setup window](docs/screenshots/setup.png)
 
-Afterwards start the game with `Game\GoldenEye 007.exe`. Saves and settings
-stay inside the extracted folder so it can be moved or backed up as a whole.
-Run Setup again at any time to reinstall or change the extras; your saves and
-settings are kept.
+From then on, opening `GoldenEye 007.exe` starts the game straight away; the
+package is not needed again. Everything stays inside the extracted folder
+(`resources\assets` for the imported game data, `resources\userdata` for saves
+and settings), so it can be moved or backed up as a whole. Start it with
+`--setup` to change the extras or import again; your saves and settings are
+kept. Coming from an older release with `Setup GoldenEye 007.exe` and a `Game`
+folder? Extract into or next to the old folder and setup imports straight
+from the old install, saves and settings included.
 
 Setup only reads your package and never changes it. It downloads nothing and
-neither Setup nor the game contacts Xbox Live.
+neither setup nor the game contacts Xbox Live.
 
 ## Features
 
@@ -81,9 +87,10 @@ neither Setup nor the game contacts Xbox Live.
   ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)
 - **Wider field of view** (10 degrees wider by default, adjustable from the
   original up to +30)
-- Optional **100% game completion** in Setup: every mission, difficulty,
+- Optional **100% game completion** in setup: every mission, difficulty,
   007 mode and cheat unlocked
-- **Portable**: saves and settings stay in the game folder
+- **Portable**: one program to open, no installer, no administrator rights;
+  saves and settings stay in the game folder
 - **GoldenEye fixes and improvements** bug fixes from the BeanTools Community Edition,
   watch and mission music fixes, tank mouse aiming, Frigate water, extra
   multiplayer characters, refreshed modern main menu background, fixed gun muzzle static
@@ -118,14 +125,14 @@ console.
 - Windows only for now.
 - Only the GoldenEye 007 Xbox Live Arcade package with Title ID `584108A9`
   and the exact game program this port was recompiled from is supported;
-  Setup refuses other builds.
-- Setup and the game are not digitally signed, so Windows SmartScreen may warn
-  the first time; choose *More info* → *Run anyway*. Windows also asks for
-  network access the first time you host or join a LAN game.
+  setup refuses other builds.
+- The game is not digitally signed, so Windows SmartScreen may warn the first
+  time; choose *More info* → *Run anyway*. Windows also asks for network
+  access the first time you host or join a LAN game.
 - Issues remaining relating to the original build.
 
-**If something goes wrong include the newest files from `Game\logs` when
-reporting it.**
+**If something goes wrong include the newest files from
+`resources\runtime\logs` when reporting it.**
 
 ## For Developers
 
@@ -147,7 +154,7 @@ Extract your package into `game/`, generate the recompiled code from your own
 `default.xex`, then build the game:
 
 ```powershell
-.\packaging\resources\installer\Extract-STFS.ps1 -Path <your package> -OutputDir game
+.\tools\Extract-STFS.ps1 -Path <your package> -OutputDir game
 cmake --preset win-amd64-release
 cmake --build --preset win-amd64-release --target ge_codegen
 cmake --preset win-amd64-release
@@ -174,9 +181,11 @@ overlay, F7 achievements overlay) are off. Set `developer_hotkeys = true` in
 debug menu (press LB in a mission).
 
 `.\tools\Make-Release.ps1` (or `Make Release.bat`) builds the release ZIP,
-`out\release\GoldenEye-007-XBLA-PC-Recomp-v<version>.zip`, holding Setup,
-README and licences only (never any game data). The version comes from the
-`VERSION` file.
+`out\release\GoldenEye-007-XBLA-PC-Recomp-v<version>.zip`. It holds one
+`GoldenEye 007` folder with the launcher (`GoldenEye 007.exe`, built from
+`packaging/launcher` by `packaging/Build-Launcher.ps1`), README, licences and
+`resources\runtime` (the game and its DLLs), and never any game data. The
+version comes from the `VERSION` file.
 
 ## Licence and credits
 
@@ -198,8 +207,11 @@ This project is built on the work of others:
 
 This project's own code is released under The Unlicense, like GoldenEye
 Recomp (see [LICENSE](LICENSE), which also lists what it does not cover).
-`packaging/resources/installer/Extract-STFS.ps1` is derived from
-[Velocity](https://github.com/hetelek/Velocity) and is GPL-3.0. ReXGlue and
+The STFS package reader (`packaging/launcher/stfs.cpp` and
+`tools/Extract-STFS.ps1`) is derived from
+[Velocity](https://github.com/hetelek/Velocity) and is GPL-3.0, so the
+launcher it is compiled into (`GoldenEye 007.exe` in the release root) is
+distributed under the GPL-3.0; the game itself is a separate program. ReXGlue and
 its third-party libraries keep their own licences; see
 [packaging/licenses](packaging/licenses).
 

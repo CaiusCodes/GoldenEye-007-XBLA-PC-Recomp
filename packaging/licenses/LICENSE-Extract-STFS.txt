@@ -1,14 +1,17 @@
-Extract-STFS.ps1 (resources\installer\Extract-STFS.ps1 in a release;
-packaging/resources/installer/Extract-STFS.ps1 in the source repository)
+STFS package reader: the launcher, GoldenEye 007.exe in the release root
+(source: packaging/launcher, with the STFS code in packaging/launcher/stfs.cpp;
+the developer script tools/Extract-STFS.ps1 is the same reader in PowerShell)
 =====================================================================
 
 Copyright (C) 2026 the GoldenEye 007 XBLA PC Recomp authors.
 
-The STFS block-offset and hash-table calculations in this script are derived
+The STFS block-offset and hash-table calculations in this code are derived
 from Velocity (https://github.com/hetelek/Velocity), Copyright (C) the
 Velocity authors, which is licensed under the GNU General Public License
-version 3. This script is therefore licensed under the GNU General Public
-License version 3 (SPDX: GPL-3.0-only), reproduced in full below.
+version 3. This code, and the launcher it is compiled into, are therefore
+licensed under the GNU General Public License version 3 (SPDX: GPL-3.0-only),
+reproduced in full below. The game in resources\runtime is a separate program
+and is not covered by it.
 
 Extract-STFS.ps1 is a separate program that Setup runs to read the player's
 Xbox 360 package. It is distributed as source code, so the complete

@@ -16,6 +16,7 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <cctype>
 #include <functional>
 #include <string>
 
@@ -51,6 +52,23 @@ void SetNativeMenuCallbacks(std::function<void(bool)> fullscreen, std::function<
                             std::function<void()> restart);
 }
 
+namespace ge {
+// Release layout: the game program lives in <release>\resources\runtime and its
+// data beside that folder (resources\assets, resources\userdata with ge.toml);
+// the launcher in the release root starts it. Dev builds keep everything
+// beside the exe (assets, userdata, ge.toml).
+inline std::filesystem::path DataRoot() {
+  const auto exe = rex::filesystem::GetExecutableFolder();
+  std::string name = exe.filename().string();
+  for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return name == "runtime" ? exe.parent_path() : exe;
+}
+inline std::filesystem::path ConfigPath() {
+  const auto root = DataRoot();
+  return root == rex::filesystem::GetExecutableFolder() ? root / "ge.toml" : root / "userdata" / "ge.toml";
+}
+}  // namespace ge
+
 class GeApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -64,12 +82,12 @@ class GeApp : public rex::ReXApp {
   // GoldenEye boot defaults. Runs before the config file is loaded, so these
   // are just defaults -- ge.toml (written by the in-game menu) overrides them.
   void OnConfigurePaths(rex::PathConfig& paths) override {
-    // A normal Windows release keeps the assets directory beside GoldenEye.exe.
-    // Retain an explicit --game_data_root override, but make Explorer
+    // The release keeps the game data in resources\assets (dev builds: beside
+    // the exe). Retain an explicit --game_data_root override, but make Explorer
     // double-click launches work without requiring a command-line argument.
+    const auto data_root = ge::DataRoot();
     if (paths.game_data_root.empty()) {
-      const auto local_assets =
-          rex::filesystem::GetExecutableFolder() / "assets";
+      const auto local_assets = data_root / "assets";
       if (std::filesystem::is_directory(local_assets)) {
         paths.game_data_root = local_assets;
       } else {
@@ -77,16 +95,18 @@ class GeApp : public rex::ReXApp {
         // which names a command-line flag the player never typed.
         rex::ShowSimpleMessageBox(
             rex::SimpleMessageBoxType::Error,
-            "GoldenEye 007's game data is not installed yet.\n\n"
-            "Run \"Setup GoldenEye 007.exe\" from the release folder, select your "
-            "Xbox 360 GoldenEye 007 package, then launch the game again.");
+            "GoldenEye 007's game data has not been imported yet.\n\n"
+            "Open \"GoldenEye 007.exe\" in the main GoldenEye 007 folder and select "
+            "your Xbox 360 GoldenEye 007 package.");
       }
     }
-    // Portable install: saves and caches live beside the game (Game\userdata),
-    // like the PD and Hexic ports, instead of in the Windows user profile.
-    const auto user_data = rex::filesystem::GetExecutableFolder() / "userdata";
+    // Portable install: saves, caches and settings live in the release folder
+    // (resources\userdata), like the PD and Hexic ports, instead of in the
+    // Windows user profile.
+    const auto user_data = data_root / "userdata";
     paths.user_data_root = user_data;
     paths.cache_root = user_data / "cache";
+    paths.config_path = ge::ConfigPath();
     // NOTE: vsync is NOT forced here. Its SDK default is false (off), so the
     // in-menu toggle persists: turning it ON differs from default -> written to
     // ge.toml; OFF == default -> not written but still boots off. Forcing it here
@@ -190,7 +210,7 @@ class GeApp : public rex::ReXApp {
 
  private:
   void PersistConfig() {
-    rex::cvar::SaveConfig(rex::filesystem::GetExecutableFolder() / "ge.toml");
+    rex::cvar::SaveConfig(ge::ConfigPath());
   }
 
   // ESC handler: open or close the menu. The game keeps running underneath.

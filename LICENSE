@@ -29,9 +29,12 @@ It does NOT cover, and grants no rights in:
     (LICENSE-community-fixes-MIT.txt).
   - Third-party libraries used by ReXGlue, which remain under their own
     licences (see packaging/licenses/THIRD_PARTY_NOTICES.txt).
-  - packaging/resources/installer/Extract-STFS.ps1, which is derived from
-    Velocity and licensed under the GNU General Public License version 3
-    (packaging/licenses/LICENSE-Extract-STFS.txt).
+  - packaging/launcher/stfs.cpp and tools/Extract-STFS.ps1, which are
+    derived from Velocity and licensed under the GNU General Public License
+    version 3 (packaging/licenses/LICENSE-Extract-STFS.txt). The launcher
+    built from packaging/launcher includes stfs.cpp, so the compiled
+    launcher is distributed under the GPL version 3. The other launcher
+    source files are released under The Unlicense below.
 
 The Unlicense
 -------------

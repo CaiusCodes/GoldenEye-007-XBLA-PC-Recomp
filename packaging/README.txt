@@ -16,8 +16,9 @@ copy of GoldenEye 007 XBLA: the Xbox 360 package for
   GoldenEye 007 (Xbox LIVE Arcade)
   Xbox 360 Title ID: 584108A9
 
-Setup reads the package you provide, checks that it is the supported version
-and builds the game folder from it on your PC.
+The first time you start the game it reads the package you provide, checks
+that it is the supported version and imports the game data from it into this
+folder. After that the package is not needed any more.
 
 Requirements:
   Windows 10 or 11 (64-bit) and a DirectX 12 capable graphics card.
@@ -28,20 +29,24 @@ FIRST-TIME SETUP
 ----------------
 
 1. Extract the release ZIP to a writable folder (not Program Files). You get
-   one folder, "GoldenEye 007 XBLA PC Recomp", holding Setup, this README and
-   licenses.
-2. Run "Setup GoldenEye 007.exe".
-3. Click "Select file..." and choose your GoldenEye 007 package, or drag it
-   onto the Setup window. Setup checks it straight away and tells you if it
-   is the wrong file or an unsupported version.
-4. Click "Install game". Setup creates a Game folder beside itself and
-   unpacks your package into it.
-5. Choose any extras (Start in fullscreen, 100% game completion, Desktop
-   shortcut), or click Skip.
-6. Click "Play now", or later run "Game\GoldenEye 007.exe".
+   one folder, "GoldenEye 007".
+   Tip: put your package file beside "GoldenEye 007.exe", or in a folder
+   called "Game Package" next to it, and it is found automatically.
+2. Open "GoldenEye 007.exe". The first time, the setup window opens.
+3. If your package was found it is checked and imported straight away.
+   Otherwise drag the package (the 30BA9271... file) or the folder holding it
+   onto the window, or click "Browse package". Setup checks it first and
+   tells you if it is the wrong file or an unsupported version; the import
+   starts as soon as it is accepted. You can cancel it at any time.
+4. Tick any extras you want (all optional, all off unless ticked):
+     Start in fullscreen, Create desktop shortcut, 100% game completion.
+5. Click "Play" once it says READY FOR DUTY.
 
-Setup only reads your package; it never changes it. It does not download
-anything and does not contact Xbox LIVE.
+From then on, opening "GoldenEye 007.exe" starts the game straight away.
+Setup only reads your package; it never changes, moves or deletes it, and
+it is not needed again. Nothing is installed outside this folder and no
+administrator rights are needed. It does not download anything and does
+not contact Xbox LIVE.
 
 CONTROLS
 --------
@@ -95,54 +100,57 @@ Tailscale, Hamachi and the like) when every player joins the same virtual
 network. Windows asks the first time you host or join whether GoldenEye 007
 may use the network; allow it on private and public networks (virtual LANs
 often count as public). If the game picks the wrong network adapter, set
-net_address in Game\ge.toml to your virtual LAN address.
+net_address in resources\userdata\ge.toml to your virtual LAN address.
 
 PORTABLE DATA
 -------------
 
-Everything stays inside the extracted "GoldenEye 007 XBLA PC Recomp" folder:
+Everything stays inside the extracted "GoldenEye 007" folder:
 
-  Setup GoldenEye 007.exe     Installs the game, or changes your extras later
+  GoldenEye 007.exe           Open this to play (and to set up the first time)
   README.txt, licenses\       This file and the third-party notices
-  Game\                       Created by Setup:
-    GoldenEye 007.exe         Starts the game
-    assets\                   Game data unpacked from your package
-    resources\                The port's own pictures and version
-    release-manifest.json     The files this release installed
-    userdata\                 Saves
-    ge.toml                   Display, audio and control settings
-    logs\                     Game and Setup logs
+  resources\
+    runtime\                  The game program, its DLLs and the port's
+                              own pictures
+      logs\                   Game and setup logs
+    assets\                   Game data imported from your package
+    userdata\                 Saves, caches and ge.toml (display, audio and
+                              control settings)
 
-To move or back up the installation, copy the entire folder.
+Paths are relative, so the folder can be moved or copied anywhere (a USB
+drive works too). To back up your progress, copy resources\userdata.
 
-REINSTALLING, UPDATING OR CHANGING EXTRAS
------------------------------------------
+SETUP AGAIN, UPDATING AND OLDER RELEASES
+----------------------------------------
 
-Run "Setup GoldenEye 007.exe" again at any time. Installing again replaces
-the game files Setup installed and rebuilds Game\assets from your package,
-but keeps your saves (userdata) and settings (ge.toml). To update, extract a
-new release over the old folder and run Setup. Setup only removes files it
-recognises as its own.
+To change your extras or import your package again, start the game with
+--setup (for example from a shortcut whose target ends in
+"GoldenEye 007.exe" --setup). Importing again replaces resources\assets only;
+saves and settings in resources\userdata are kept. If a needed file goes
+missing, opening GoldenEye 007.exe shows the setup window again by itself.
 
-With the game installed, Setup also offers:
-  Change extras   Turn the extras on or off.
-  Uninstall       Deletes the game and the data unpacked from your package,
-                  and the desktop shortcut. Your saves and settings stay.
+To update, extract a new release over this folder (your resources\assets
+and resources\userdata are kept), or into a new folder: setup finds the old
+copy next to it and imports from it.
+
+Coming from an older release (Setup GoldenEye 007.exe and a Game folder):
+extract this release into the old release folder or next to it. Setup finds
+the old Game folder and offers it alongside any package, so you do not need
+the package again, and your saves and settings come with it. The old folder
+is never changed or deleted; remove it yourself once you are happy.
 
 TROUBLESHOOTING
 ---------------
 
-Extract the ZIP before running Setup. Do not run it from inside the ZIP.
+Extract the ZIP first. Do not run GoldenEye 007.exe from inside the ZIP.
 
-Setup and the game are not digitally signed, so the first time you run Setup
+GoldenEye 007.exe is not digitally signed, so the first time you open it
 Windows may show "Windows protected your PC". Choose More info, then Run
 anyway.
 
-If the game says its data is not installed, run Setup again. If Setup
-rejects your package, the reason is in the newest setup-*.log in Game\logs
-(or, when no Game folder was made yet, in "GoldenEye 007 Setup logs" in your
-temporary folder, %TEMP%). When reporting a problem, include the newest files
-from Game\logs.
+If setup rejects your package, the reason is shown in the window and in
+resources\runtime\logs\setup.log. When reporting a problem, include the
+newest files from resources\runtime\logs.
 
 LEGAL
 -----
@@ -152,4 +160,11 @@ to their respective owners. This is an unofficial fan project, not
 affiliated with or endorsed by them. Third-party notices and license texts
 are in the licenses folder.
 
-The Game folder contains data from your own package. Do not share it.
+After setup, resources\assets contains data from your own package. Do not
+share the folder once you have played from it; share the release ZIP instead.
+
+GoldenEye 007.exe in the main folder (the launcher and setup) includes a
+package reader derived from Velocity and is licensed under the GNU GPL
+version 3 (licenses\LICENSE-Extract-STFS.txt); its source is in the project
+repository. The game in resources\runtime is a separate program under the
+Unlicense and MIT licences.
