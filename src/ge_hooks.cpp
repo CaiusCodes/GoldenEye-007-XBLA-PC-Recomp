@@ -1157,15 +1157,18 @@ bool ge_skip_save_notice(PPCRegister& r3) { return r3.u32 == 0x9DA0u || r3.u32 =
 // exist on PC. The draw jumps past them (0x820FF754 -> 0x820FF8D4) and the
 // pointer hit test stores "nothing selected" (-1) instead of 9 or 10.
 // Shotgun (weapon 15) and automatic shotgun (16): the gun tick sub_820A9090
-// runs the shot effect sub_820A2658(hand) on the frame a gun fires (byte
-// +12 of the hand's gun state set), through a jump table on the weapon that
-// leaves out both shotguns. sub_820A2658 is also what sends the fire message
-// to the other players, so they never saw or heard a shotgun fire (and its
-// muzzle flash was never reset on their screens). Call it for them too, at
-// the join point 0x820AA634 where the table's other cases continue.
+// runs the shot effect sub_820A2658(hand) through a jump table on the weapon
+// that leaves out both shotguns. sub_820A2658 is also what sends the fire
+// message to the other players, so they never saw or heard a shotgun fire.
+// Call it for them too, at the join point 0x820AA634 where the table's other
+// cases continue, but only on the frame the shot is fired: the gun state's
+// flash byte (+13) is set then and cleared the next tick (sub_820AAE00). The
+// table's own test, byte +12, stays set for the shotguns between shots, and a
+// fire message every frame kept the shooter's muzzle flash lit on the other
+// players' screens (the message sets that player's flash, +13 = 2, each time).
 void ge_shotgun_fire_message(PPCRegister& r14, PPCRegister& r15, PPCRegister& r31) {
   PPCContext* ctx; uint8_t* base; getcb(ctx, base);
-  if ((r15.u32 != 15u && r15.u32 != 16u) || base[r31.u32 + 12u] == 0) return;
+  if ((r15.u32 != 15u && r15.u32 != 16u) || base[r31.u32 + 13u] == 0) return;
   ctx->r3.u64 = r14.u64;
   sub_820A2658(*ctx, base);
 }
@@ -3689,3 +3692,19 @@ void ApplyPlayerName(const std::string& requested) {
   REXKRNL_INFO("GENAME player name is now '{}'", name);
 }
 }  // namespace ge
+
+// The remastered automatic shotgun (new\prop\chrautoshot) has a muzzle flash
+// built into the gun model, behind the model's first part switch (bit 0 of the
+// switch bits its rendergraph tests, *(params + 8)). Nothing in the game turns
+// that switch off, so the flash showed all the time on held and dropped
+// automatic shotguns. The game draws its own flash when the gun fires, so the
+// built-in one is kept off: before each draw of that model (sub_8209D250(res),
+// at 0x8209D270 with r31 = res; res + 16 holds its file path) the bit is cleared.
+void ge_autoshot_flash(PPCRegister& r31) {
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
+  if (!std::strstr(path, "\\new\\prop\\chrautoshot\\")) return;
+  const uint32_t params = LD32(base, r31.u32 + 12);
+  const uint32_t bits = params ? LD32(base, params + 8) : 0;
+  if (bits) base[bits] &= 0x7F;
+}

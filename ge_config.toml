@@ -734,3 +734,10 @@ name = "ge_session_start_gate"
 registers = []
 after_instruction = false
 jump_address_on_true = 0x8217FB74
+
+# Remastered automatic shotgun: keep the muzzle flash built into the model off.
+[[midasm_hook]]
+address = 0x8209D270
+name = "ge_autoshot_flash"
+registers = ["r31"]
+after_instruction = false
