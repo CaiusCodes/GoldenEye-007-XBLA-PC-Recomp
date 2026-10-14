@@ -3700,11 +3700,20 @@ void ApplyPlayerName(const std::string& requested) {
 // automatic shotguns. The game draws its own flash when the gun fires, so the
 // built-in one is kept off: before each draw of that model (sub_8209D250(res),
 // at 0x8209D270 with r31 = res; res + 16 holds its file path) the bit is cleared.
-void ge_autoshot_flash(PPCRegister& r31) {
+//
+// Old graphics: the original Bond bodies (boilerbond, suitbond, timberbond,
+// snowbond) have Bond's head built in, but the body table says they have none
+// (byte +25 clear), so the game also attaches Bond's separate head (head 78,
+// headbrosnan) and two faces cut through each other. In the new graphics those
+// bodies are headless and need it, so only the original-graphics draw of that
+// head is skipped (true jumps to the draw's return, 0x8209D3A4).
+bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
-  if (!std::strstr(path, "\\new\\prop\\chrautoshot\\")) return;
+  if (std::strstr(path, "\\original\\head\\headbrosnan\\")) return true;
+  if (!std::strstr(path, "\\new\\prop\\chrautoshot\\")) return false;
   const uint32_t params = LD32(base, r31.u32 + 12);
   const uint32_t bits = params ? LD32(base, params + 8) : 0;
   if (bits) base[bits] &= 0x7F;
+  return false;
 }

@@ -1434,10 +1434,12 @@ void TestEnterText(const std::string& text) {
 //   - The status line says what is being waited for.
 //   - Every machine plays the same music. Most multiplayer levels have no track
 //     of their own, and each machine picked one at random (sub_821453C0). Now
-//     the track comes from what every machine knows alike, the level and the
-//     players' names, worked out when the countdown starts (ge_match_music).
-//     The game only shares the ready flag as on/off, so the host cannot simply
-//     send its pick.
+//     the host picks it when its countdown starts and sends it in a shared
+//     number of its player (player+1804, value at +12, set through
+//     sub_82177480) that nothing uses in the lobby; it is set back to 0 a
+//     second before the match starts. The other machines read it during the
+//     countdown, and every machine plays that track (ge_match_music). A host
+//     that sends nothing (an older version) leaves the pick random.
 namespace {
 constexpr uint32_t kTabHover = 0x82F60FA0u;       // START tab highlighted (set by the page each frame)
 constexpr uint32_t kTextLobbyStatus = 0xF0C0u;    // custom texts (see SetCustomText)
@@ -1451,8 +1453,10 @@ constexpr uint64_t kCountdownMs = 3000;
 bool g_client_ready = false;      // this machine's joining player is ready
 uint64_t g_countdown_ms = 0;      // host: when its countdown began (0 = none)
 uint64_t g_countdown_seen_ms = 0; // joining player: when the countdown bit appeared
-uint32_t g_music_seed = 0;        // the starting match's players, hashed; 0 = pick at random
-constexpr uint32_t kStageMusicId = 0x8306674Cu;     // the level whose music is being picked
+int g_match_track = -1;           // index into the random-music list for the starting match, -1 = random
+bool g_track_sent = false;        // host: the track is in its shared number (cleared before the start)
+constexpr uint32_t kTrackVar = 1804u;               // host player's shared number carrying the track + 1
+constexpr uint32_t kRandomMusicList = 0x82DEEAF0u;  // the multiplayer track ids, ending with 0
 bool g_ready_tab_label = false;   // the START tab draw should say READY
 
 uint32_t CustomTextAddr(uint32_t id) { return g_string_block + (id - kCustomBase) * kCustomChars * 2; }
@@ -1501,27 +1505,21 @@ void SetHostReady(PPCContext& ctx, uint8_t* base, bool ready) {
   sub_8217D900(ctx, base);
 }
 
-// The players' names in the lobby, sorted and hashed (FNV-1a): the same on
-// every machine, whatever order the slots are in there.
-uint32_t MusicSeed(PPCContext& ctx, uint8_t* base) {
-  std::vector<std::string> names;
-  for (uint32_t slot = 0; slot < 4; ++slot) {
-    const uint32_t p = SlotPlayer(ctx, base, slot);
-    if (p) names.emplace_back(reinterpret_cast<const char*>(base + p + 768u), strnlen(reinterpret_cast<const char*>(base + p + 768u), 16));
-  }
-  std::sort(names.begin(), names.end());
-  uint32_t h = 2166136261u;
-  for (const std::string& name : names) {
-    for (const char c : name) h = (h ^ static_cast<uint8_t>(c)) * 16777619u;
-    h = (h ^ 0xFFu) * 16777619u;
-  }
-  return h ? h : 1u;
+// The host's shared number carrying the match's music (track index + 1, 0 = none).
+void SetTrackVar(PPCContext& ctx, uint8_t* base, uint32_t value) {
+  const uint32_t hp = HostPlayer(ctx, base);
+  if (!hp) return;
+  ctx.r3.u64 = hp + kTrackVar;
+  ctx.r4.u64 = value;
+  sub_82177480(ctx, base);
 }
 
 void CancelCountdown(PPCContext& ctx, uint8_t* base, const char* why) {
   REXKRNL_INFO("GELOBBY countdown cancelled ({})", why);
   g_countdown_ms = 0;
   SetHostReady(ctx, base, false);
+  if (g_track_sent) SetTrackVar(ctx, base, 0);
+  g_track_sent = false;
 }
 
 // Seconds left to show, 0 = no countdown on this machine.
@@ -1531,14 +1529,18 @@ int CountdownSeconds(PPCContext& ctx, uint8_t* base, bool host) {
   if (host) {
     began = g_countdown_ms;
     if (!began && hp && PlayerReady(base, hp)) return 1;  // counted down; the match is starting
-    if (!began) g_music_seed = 0;
+    if (!began) g_match_track = -1;
   } else if (hp && PlayerReady(base, hp)) {
     if (!g_countdown_seen_ms) g_countdown_seen_ms = GetTickCount64();
     began = g_countdown_seen_ms;
-    if (!g_music_seed) g_music_seed = MusicSeed(ctx, base);
+    const uint32_t sent = LD32(base, hp + kTrackVar + 12u);
+    if (sent != 0 && sent < 1000u && g_match_track != static_cast<int>(sent) - 1) {
+      g_match_track = static_cast<int>(sent) - 1;  // kept once the host has cleared it
+      REXKRNL_INFO("GELOBBY the host picked music track {}", g_match_track);
+    }
   } else {
     g_countdown_seen_ms = 0;
-    g_music_seed = 0;
+    g_match_track = -1;
   }
   if (!began) return 0;
   const uint64_t elapsed = GetTickCount64() - began;
@@ -1617,6 +1619,9 @@ bool ge_lobby_host_start(PPCRegister& r17) {
       CancelCountdown(*ctx, base, "not enough players");
     } else if (PlayersNotReady(*ctx, base) > 0) {
       CancelCountdown(*ctx, base, "a player is no longer ready");
+    } else if (g_track_sent && GetTickCount64() - g_countdown_ms >= kCountdownMs - 1000) {
+      SetTrackVar(*ctx, base, 0);  // the others have it; the match starts with the number as it was
+      g_track_sent = false;
     } else if (GetTickCount64() - g_countdown_ms >= kCountdownMs) {
       g_countdown_ms = 0;  // the session may start the match now (ge_session_start_gate)
       REXKRNL_INFO("GELOBBY countdown over: starting the match");
@@ -1638,10 +1643,16 @@ bool ge_lobby_start_request() {
     REXKRNL_INFO("GELOBBY START: {} player(s) not ready", waiting);
     return true;
   }
+  int tracks = 0;
+  while (tracks < 250 && LD16(base, kRandomMusicList + tracks * 2u) != 0) ++tracks;
+  g_match_track = tracks > 0 ? static_cast<int>(GetTickCount64() % static_cast<uint64_t>(tracks)) : -1;
   g_countdown_ms = GetTickCount64();
-  g_music_seed = MusicSeed(*ctx, base);
   SetHostReady(*ctx, base, true);
-  REXKRNL_INFO("GELOBBY countdown started");
+  if (g_match_track >= 0) {
+    SetTrackVar(*ctx, base, static_cast<uint32_t>(g_match_track) + 1u);
+    g_track_sent = true;
+  }
+  REXKRNL_INFO("GELOBBY countdown started (music track {})", g_match_track);
   return true;
 }
 
@@ -1753,15 +1764,12 @@ bool ge_session_start_gate() {
 
 // A multiplayer level's music (sub_821453C0, at its random pick 0x82145438:
 // r30 = the track list, r31 = its length): in a match started from the LAN
-// lobby, the same track on every machine, from the players' names and the
-// level. True returns r3 (0x82145468).
+// lobby, the track the host picked, so every machine plays the same one.
+// True returns r3 (0x82145468).
 bool ge_match_music(PPCRegister& r3, PPCRegister& r30, PPCRegister& r31) {
-  if (!g_music_seed || r31.u32 == 0) return false;
+  if (g_match_track < 0 || static_cast<uint32_t>(g_match_track) >= r31.u32) return false;
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
-  uint32_t h = g_music_seed ^ (LD32(base, kStageMusicId) * 2654435761u);
-  h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-  const uint32_t index = h % r31.u32;
-  r3.s64 = static_cast<int16_t>(LD16(base, r30.u32 + index * 2u));
-  REXKRNL_INFO("GELOBBY match music: track {} of {} (id {})", index, r31.u32, r3.s64);
+  r3.s64 = static_cast<int16_t>(LD16(base, r30.u32 + static_cast<uint32_t>(g_match_track) * 2u));
+  REXKRNL_INFO("GELOBBY match music: track {} of {} (id {})", g_match_track, r31.u32, r3.s64);
   return true;
 }

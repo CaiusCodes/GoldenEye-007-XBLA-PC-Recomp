@@ -735,14 +735,16 @@ registers = []
 after_instruction = false
 jump_address_on_true = 0x8217FB74
 
-# Remastered automatic shotgun: keep the muzzle flash built into the model off.
+# Model draws: no built-in muzzle flash on the remastered automatic shotgun, and
+# no second Bond head on the original Bond bodies (see ge_model_draw_fixes).
 [[midasm_hook]]
 address = 0x8209D270
-name = "ge_autoshot_flash"
+name = "ge_model_draw_fixes"
 registers = ["r31"]
 after_instruction = false
+jump_address_on_true = 0x8209D3A4
 
-# LAN match music: every machine picks the same track (from the level and the players' names).
+# LAN match music: every machine plays the track the host picked.
 [[midasm_hook]]
 address = 0x82145438
 name = "ge_match_music"
