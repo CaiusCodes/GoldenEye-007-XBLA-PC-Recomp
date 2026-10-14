@@ -3701,16 +3701,35 @@ void ApplyPlayerName(const std::string& requested) {
 // built-in one is kept off: before each draw of that model (sub_8209D250(res),
 // at 0x8209D270 with r31 = res; res + 16 holds its file path) the bit is cleared.
 //
-// Old graphics: the original Bond bodies (boilerbond, suitbond, timberbond,
-// snowbond) have Bond's head built in, but the body table says they have none
-// (byte +25 clear), so the game also attaches Bond's separate head (head 78,
-// headbrosnan) and two faces cut through each other. In the new graphics those
-// bodies are headless and need it, so only the original-graphics draw of that
-// head is skipped (true jumps to the draw's return, 0x8209D3A4).
+// Old graphics: some original bodies have a head built in although the body
+// table says they have none (byte +25 clear): Bond's four (boilerbond,
+// suitbond, timberbond, snowbond) and the Russian infantry guard (greatguard2).
+// The game attaches a separate head to them too, and two faces cut through
+// each other. In the new graphics those bodies are headless and need it, so
+// only the original-graphics draw of the separate head is skipped: a character
+// draws its body, then its head, so a head drawn right after one of these
+// bodies is left out (true jumps to the draw's return, 0x8209D3A4).
+namespace {
+bool g_body_has_head = false;  // the last original body drawn has its own head
+}
 bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
-  if (std::strstr(path, "\\original\\head\\headbrosnan\\")) return true;
+  if (std::strstr(path, "\\original\\head\\")) {
+    const bool skip = g_body_has_head;
+    g_body_has_head = false;
+    return skip;
+  }
+  static const char* const kHeadedBodies[] = {
+      "\\original\\char\\boilerbond\\", "\\original\\char\\suitbond\\", "\\original\\char\\timberbond\\",
+      "\\original\\char\\snowbond\\", "\\original\\char\\greatguard2\\"};
+  g_body_has_head = false;
+  for (const char* body : kHeadedBodies) {
+    if (std::strstr(path, body)) {
+      g_body_has_head = true;
+      return false;
+    }
+  }
   if (!std::strstr(path, "\\new\\prop\\chrautoshot\\")) return false;
   const uint32_t params = LD32(base, r31.u32 + 12);
   const uint32_t bits = params ? LD32(base, params + 8) : 0;
