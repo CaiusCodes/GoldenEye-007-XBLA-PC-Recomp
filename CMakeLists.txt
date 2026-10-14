@@ -59,6 +59,22 @@ file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated_include/ge_version_
     CONTENT "// Generated from VERSION by CMakeLists.txt.\n#define GE_VERSION_STR \"${GE_VERSION}\"\n#define GE_VERSION_COMMA ${GE_VERSION_COMMA}\n"
     @ONLY)
 
+# The player names the launcher picks one from at first start; the player card's
+# arrows cycle through the same list (ge_native_menu.cpp includes it).
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/player-names.txt" _ge_player_names)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/player-names.txt")
+set(_ge_names_c "")
+foreach(_name IN LISTS _ge_player_names)
+    string(STRIP "${_name}" _name)
+    string(LENGTH "${_name}" _len)
+    if(_len GREATER 0 AND _len LESS 16 AND NOT _name MATCHES "[\"\\\\]")
+        string(APPEND _ge_names_c "    \"${_name}\",\n")
+    endif()
+endforeach()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated_include/ge_player_names.h"
+    CONTENT "// Generated from packaging/player-names.txt by CMakeLists.txt.\nstatic const char* const kGePlayerNames[] = {\n${_ge_names_c}};\n"
+    @ONLY)
+
 if(WIN32)
     # Embed the application icon (GoldenEye.rc -> "MAINICON"). Use LLVM's resource
     # compiler since the toolchain is clang/lld (MSVC rc.exe may not be on PATH).

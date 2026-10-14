@@ -650,3 +650,87 @@ address = 0x820FF3B4
 name = "ge_charname"
 registers = ["r3", "r11"]
 after_instruction = false
+
+# Player name changes go through the game's own rename (sub_82185298), as for
+# an Xbox LIVE profile: renames the player and tells the other machines.
+[[midasm_hook]]
+address = 0x82185300
+name = "ge_rename_as_live"
+registers = ["r11"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x82185364
+name = "ge_rename_as_live"
+registers = ["r11"]
+after_instruction = false
+
+# Player card (menu 37): your own name can be changed there.
+[[midasm_hook]]
+address = 0x82106430
+name = "ge_card_update"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x82106E08
+[[midasm_hook]]
+address = 0x820FECAC
+name = "ge_card_name_draw"
+registers = []
+after_instruction = false
+
+
+# Players marked ready to start (sub_8217D900(1)): the match is about to load.
+[[midasm_hook]]
+address = 0x8217D900
+name = "ge_match_ready"
+registers = ["r3"]
+after_instruction = false
+
+
+# LAN lobby (menu 31; ge_native_menu.cpp): joining players ready up (Start or
+# a READY tab), the host's START works on the whole tab or with Start anywhere,
+# only once everyone is ready, after a 3 second countdown; the status line and
+# the name tabs say who is ready.
+[[midasm_hook]]
+address = 0x821003C8
+name = "ge_client_ready"
+registers = ["r3"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x821070E4
+name = "ge_lobby_host_start"
+registers = ["r17"]
+after_instruction = false
+jump_address_on_true = 0x82107210
+[[midasm_hook]]
+address = 0x821072C0
+name = "ge_lobby_start_request"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x821072C8
+[[midasm_hook]]
+address = 0x821072D8
+name = "ge_lobby_client_ready"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x8210737C
+[[midasm_hook]]
+address = 0x8210777C
+name = "ge_lobby_status_text"
+registers = ["r28"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820EACFC
+name = "ge_lobby_tab_label"
+registers = ["r3"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x821078B0
+name = "ge_lobby_draw_extras"
+registers = []
+after_instruction = false
+[[midasm_hook]]
+address = 0x8217FAF0
+name = "ge_session_start_gate"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x8217FB74

@@ -85,6 +85,7 @@ constexpr uint32_t kSoundArg3 = 0x83064DE0;
 constexpr uint32_t kSoundArg6 = 0x83064DE8;
 constexpr uint32_t kSelectMask = 0xA000;        // "select" as the menus test it
 constexpr uint32_t kBackMask = 0x4000;
+constexpr uint32_t kStartMask = 0x1000;      // Start (Enter on the keyboard)
 
 // -------------------------------------------------------- custom strings ---
 constexpr uint32_t kCustomBase = 0xF000;
@@ -177,6 +178,9 @@ void SetS(const char* cvar, const std::string& v) {
 float GetF(const char* cvar) { return static_cast<float>(std::atof(GetS(cvar).c_str())); }
 
 std::vector<Row> BuildPage(Page page);
+void CycleName(int dir);  // the player card's name list (below)
+int g_name_arrow = 0;     // Online Settings' Player Name arrow pointed at: -1, 1, 0 none
+
 
 // Editing state.
 const char* g_capture_cvar = nullptr;  // key capture or text entry target
@@ -194,6 +198,19 @@ constexpr float kRowY0 = 88.0f;
 constexpr float kRowSpacing = 24.0f;
 constexpr float kSliderW = 100.0f;
 constexpr float kSliderH = 12.0f;
+
+// Online Settings' Player Name row: "<" and ">" either side of the name step
+// through the same name list as the player card. The ">" stays where a
+// 15-character name ends, so it does not move as names change length.
+// Menu units, as the page's rows.
+constexpr float kNameArrowLeftX = kValueX - 18.0f;
+constexpr float kNameArrowRightX = kValueX + 112.0f;
+int NameArrowAt(uint8_t* base) {
+  const float cx = LDF32(base, kCursorX);
+  if (cx >= kNameArrowLeftX - 4.0f && cx < kValueX - 3.0f) return -1;
+  if (cx >= kNameArrowRightX - 4.0f && cx <= kNameArrowRightX + 16.0f) return 1;
+  return 0;
+}
 constexpr float kVersionX = 42.0f;   // main menu version label (menu space 440x330)
 constexpr float kVersionY = 309.0f;
 constexpr uint32_t kVersionAlpha = 105;  // black at this opacity over the paper
@@ -361,9 +378,6 @@ std::vector<Row> BuildPage(Page page) {
       AddAction(rows, "Done", [] { g_page = Page::Video; });
       break;
     case Page::Online: {
-      Row name{RowKind::Text, "Player Name:", "ge_username"};
-      name.max_len = 15;
-      rows.push_back(name);
       rows.push_back(Row{RowKind::Toggle, "Online Server Play:", "ge_online_enable"});
       Row server{RowKind::Text, "Server Address:", "ge_online_server"};
       server.max_len = 40;
@@ -371,6 +385,11 @@ std::vector<Row> BuildPage(Page page) {
       Row port{RowKind::Text, "Server Port:", "ge_online_port"};
       port.max_len = 5;
       rows.push_back(port);
+      // Last before Done: lower down, the "<" ">" either side of the name are
+      // clear of the crest picture at the page's top right.
+      Row name{RowKind::Text, "Player Name:", "ge_username"};
+      name.max_len = 15;
+      rows.push_back(name);
       AddAction(rows, "Done", [] { g_leave_page = true; });
       break;
     }
@@ -627,6 +646,17 @@ void DrawPage(PPCContext& ctx, uint8_t* base) {
       DrawBox(ctx, base, 50, kLabelX - pad, y - pad, kLabelX - pad + w + 4, y - pad + h + 4);
     }
     DrawText(ctx, base, sp, label, kLabelX, y, 255);
+    if (r.cvar && std::strcmp(r.cvar, "ge_username") == 0 && !(g_capture_text && g_capture_cvar == r.cvar)) {
+      SetCustomText(base, kTxtFirstDynamic + 120, "<");
+      SetCustomText(base, kTxtFirstDynamic + 121, ">");
+      const float pad = LDF32(base, kHighlightPad);
+      if (static_cast<int>(i) == g_hover && g_name_arrow) {
+        const float ax = g_name_arrow < 0 ? kNameArrowLeftX : kNameArrowRightX;
+        DrawBox(ctx, base, 50, ax - pad, y - pad, ax - pad + 14.0f, y - pad + 20.0f);
+      }
+      DrawText(ctx, base, sp, LookupText(ctx, base, kTxtFirstDynamic + 120), kNameArrowLeftX, y, 255);
+      DrawText(ctx, base, sp, LookupText(ctx, base, kTxtFirstDynamic + 121), kNameArrowRightX, y, 255);
+    }
     if (r.kind == RowKind::Slider) {
       const float t = std::clamp((GetF(r.cvar) - r.min) / (r.max - r.min), 0.0f, 1.0f);
       DrawBox(ctx, base, 60, kValueX, y + 2, kValueX + kSliderW, y + 2 + kSliderH);
@@ -699,6 +729,19 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
       return false;
     }
     return true;
+  }
+  g_name_arrow = 0;
+  if (g_hover >= 0 && rows[g_hover].cvar && std::strcmp(rows[g_hover].cvar, "ge_username") == 0) {
+    g_name_arrow = NameArrowAt(base);
+    int step = 0;
+    if (g_name_arrow && ButtonPressed(ctx, base, kSelectMask)) step = g_name_arrow;
+    if (ButtonPressed(ctx, base, 0x0202)) step = -1;  // left / right on the row
+    if (ButtonPressed(ctx, base, 0x0101)) step = 1;
+    if (step) {
+      PlaySelectSound(ctx, base);
+      CycleName(step);
+      return false;
+    }
   }
   if (g_hover >= 0 && ButtonPressed(ctx, base, kSelectMask)) {
     Row& r = rows[g_hover];
@@ -1181,4 +1224,497 @@ bool ge_lan_refresh_update(PPCRegister& /*r3*/) {
 bool ge_lan_skip_create_highlight(PPCRegister& /*r11*/) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   return LD32(base, kLanState) == 2 && LanRefreshHover(base, 175.0f, g_lan_refresh_w);
+}
+
+// --- Player card (menu 37): the local player's name can be changed ---------
+// In the LAN lobby, selecting your own name opens your player card (draw
+// sub_820FE9E8, update sub_82106358), which shows the name in large letters
+// above Character, Control Style, Look Up/Down and Autoaim. Pointing at the
+// name highlights it like a row; selecting it types a new one there (Enter
+// keeps it, Esc cancels), the same Player Name the Online Settings page edits.
+// Arrows either side of the name (or left / right while on it) step through
+// the names the launcher picks a first name from (packaging/player-names.txt),
+// so a controller can change it too. Saving goes through ge_username, so the
+// profile, ge.toml and (through the game's own rename message) the other
+// players all get it.
+#include "ge_player_names.h"
+namespace {
+constexpr uint32_t kCardPlayer = 0x82F610CCu;  // the player the card shows
+constexpr uint32_t kCardState = 0x8272C5DCu;   // row / sub-page: 4 handicap, 6 and 7 character list
+constexpr uint32_t kCardNameX = 0x8272C608u;   // where the name is drawn (ints, menu units)
+constexpr uint32_t kCardNameY = 0x8272C60Cu;
+bool g_card_capture = false;   // typing a name on the card
+int g_card_release = 0;        // capture over: frames left before the card takes input again
+bool g_card_hover = false;
+bool g_card_local = false;
+int g_card_name_w = 100;       // measured when the name is drawn
+int g_card_name_h = 16;
+int g_card_arrow = 0;          // arrow pointed at: -1 left, 1 right, 0 none
+int g_card_arrow_w = 10;       // measured "<" width
+constexpr uint32_t kTextArrowLeft = 0xF0C5u;
+constexpr uint32_t kTextArrowRight = 0xF0C6u;
+constexpr uint32_t kLeftMask = 0x0202;   // the card's own left / right tests
+constexpr uint32_t kRightMask = 0x0101;
+constexpr float kArrowGap = 8.0f;        // between the name and an arrow
+
+// Arrow boxes (menu units) for the name at (x, y).
+float ArrowLeftX(float x) { return x - kArrowGap - static_cast<float>(g_card_arrow_w); }
+// The right arrow stays put while names change length (a click on it must not
+// land on the next, shorter name): far enough right for a 15-character name.
+constexpr float kNameRoom = 105.0f;
+float ArrowRightX(float x) { return x + std::max(kNameRoom, static_cast<float>(g_card_name_w) + kArrowGap); }
+
+// The next (dir 1) or previous (-1) name in the list after the current one.
+void CycleName(int dir) {
+  constexpr int count = static_cast<int>(sizeof(kGePlayerNames) / sizeof(kGePlayerNames[0]));
+  if (count == 0) return;
+  const std::string current = GetS("ge_username");
+  int index = dir > 0 ? -1 : 0;
+  for (int i = 0; i < count; ++i)
+    if (current == kGePlayerNames[i]) index = i;
+  index = (index + dir + count) % count;
+  SetS("ge_username", kGePlayerNames[index]);
+  REXKRNL_INFO("GENAME picked '{}' from the name list", kGePlayerNames[index]);
+}
+
+// A player is this machine's own when byte +12 of the object at +12 is set (sub_8216C140).
+bool LocalPlayer(uint8_t* base, uint32_t player) {
+  const uint32_t info = LD32(base, player + 12u);
+  return info && base[info + 12u] != 0;
+}
+}  // namespace
+
+// Update, hooked at 0x82106430 (before the card's row handling); true skips the
+// rest of the update (jumps to its epilogue).
+bool ge_card_update() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (g_card_capture) {
+    UpdateCapture();
+    if (!g_capture_cvar) {
+      // Enter or Esc ended it; keep the pad input swallowed for a moment and
+      // until the key is up, so it does not also press Start, A or Back on the card.
+      g_card_capture = false;
+      g_card_release = 20;  // about a third of a second, and until the keys are up
+      ge::SetRebindCapturing(true);
+    }
+    return true;
+  }
+  if (g_card_release > 0) {
+    if (--g_card_release > 0 || AnyKeyDown()) {
+      g_card_release = std::max(g_card_release, 1);
+      return true;
+    }
+    ge::SetRebindCapturing(false);
+  }
+  g_card_hover = false;
+  g_card_arrow = 0;
+  const uint32_t player = LD32(base, kCardPlayer);
+  g_card_local = player && LocalPlayer(base, player);
+  if (!g_card_local || g_capture_cvar) return false;
+  const int32_t state = static_cast<int32_t>(LD32(base, kCardState));
+  if (state == 4 || state == 6 || state == 7) return false;  // a sub-page is open
+  const float x = static_cast<float>(static_cast<int32_t>(LD32(base, kCardNameX)));
+  const float y = static_cast<float>(static_cast<int32_t>(LD32(base, kCardNameY)));
+  const float cx = LDF32(base, kCursorX), cy = LDF32(base, kCursorY);
+  const bool in_row = cy >= y - 6.0f && cy <= y + static_cast<float>(g_card_name_h) + 4.0f;
+  if (in_row && cx >= ArrowLeftX(x) - 4.0f && cx < x - 2.0f) g_card_arrow = -1;
+  if (in_row && cx > ArrowRightX(x) - 2.0f && cx <= ArrowRightX(x) + g_card_arrow_w + 4.0f) g_card_arrow = 1;
+  g_card_hover = !g_card_arrow && in_row && cx >= x - 2.0f && cx <= x + static_cast<float>(g_card_name_w) + 2.0f;
+  if ((!g_card_hover && !g_card_arrow) || ButtonPressed(*ctx, base, kBackMask)) return false;
+  int step = 0;
+  if (g_card_arrow && ButtonPressed(*ctx, base, kSelectMask)) step = g_card_arrow;
+  if (ButtonPressed(*ctx, base, kLeftMask)) step = -1;
+  if (ButtonPressed(*ctx, base, kRightMask)) step = 1;
+  if (step) {
+    PlaySelectSound(*ctx, base);
+    CycleName(step);
+    return true;
+  }
+  if (g_card_arrow || !ButtonPressed(*ctx, base, kSelectMask)) {
+    // On the name: no card row is highlighted (the card would otherwise pick
+    // Character), and only the crosshair moves.
+    ST32(base, kCardState, 0xFFFFFFFFu);
+    ctx->r3.u64 = 0;
+    sub_820EC448(*ctx, base);  // the card's crosshair update (its update's tail)
+    return true;
+  }
+  PlaySelectSound(*ctx, base);
+  Row r{RowKind::Text, "Player Name:", "ge_username"};
+  r.max_len = 15;
+  BeginCapture(r);
+  g_card_capture = true;
+  REXKRNL_INFO("GENAME typing a new name on the player card");
+  return true;
+}
+
+// Draw, hooked at 0x820FECAC: the card has just turned the player's name
+// (player+768) into the wide string it draws, at r1+240 (17 characters).
+// While typing, that string shows the name being typed; the name gets the row
+// highlight when pointed at or being typed.
+void ge_card_name_draw() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (!g_card_local) return;
+  const uint32_t text = ctx->r1.u32 + 240u;
+  if (g_card_capture) {
+    const std::string shown = g_text_buffer.substr(0, 15) + "_";
+    for (size_t i = 0; i < shown.size(); ++i) {
+      base[text + i * 2] = 0;
+      base[text + i * 2 + 1] = static_cast<uint8_t>(shown[i]);
+    }
+    base[text + shown.size() * 2] = 0;
+    base[text + shown.size() * 2 + 1] = 0;
+  }
+  const PPCContext saved = *ctx;
+  {
+    GuestFrame frame(*ctx);
+    int w = 0, h = 0;
+    MeasureText(*ctx, base, frame.sp, text, w, h);
+    if (w > 0) g_card_name_w = w;
+    if (h > 0) g_card_name_h = h;
+    const float x = static_cast<float>(static_cast<int32_t>(LD32(base, kCardNameX)));
+    const float y = static_cast<float>(static_cast<int32_t>(LD32(base, kCardNameY)));
+    const float pad = LDF32(base, kHighlightPad);
+    if (g_card_hover || g_card_capture)
+      DrawBox(*ctx, base, 50, x - pad, y - pad, x - pad + g_card_name_w + 4, y - pad + g_card_name_h + 4);
+    if (!g_card_capture && EnsureGuestBlocks(base)) {
+      SetCustomText(base, kTextArrowLeft, "<");
+      SetCustomText(base, kTextArrowRight, ">");
+      const uint32_t left = LookupText(*ctx, base, kTextArrowLeft);
+      const uint32_t right = LookupText(*ctx, base, kTextArrowRight);
+      int aw = 0, ah = 0;
+      MeasureText(*ctx, base, frame.sp, left, aw, ah);
+      if (aw > 0) g_card_arrow_w = aw;
+      const float lx = ArrowLeftX(x), rx = ArrowRightX(x);
+      if (g_card_arrow)
+        DrawBox(*ctx, base, 50, (g_card_arrow < 0 ? lx : rx) - pad, y - pad,
+                (g_card_arrow < 0 ? lx : rx) - pad + g_card_arrow_w + 4, y - pad + g_card_name_h + 4);
+      DrawText(*ctx, base, frame.sp, left, lx, y, 255);
+      DrawText(*ctx, base, frame.sp, right, rx, y, 255);
+    }
+  }
+  *ctx = saved;
+}
+
+// Test pipe (ge_debug_input_file): "TEXT=name" types into the text field being
+// edited and presses Enter, without touching the real keyboard.
+namespace ge {
+void TestEnterText(const std::string& text) {
+  if (!g_capture_cvar || !g_capture_text) return;
+  g_text_buffer = text.substr(0, static_cast<size_t>(g_capture_max));
+  SetS(g_capture_cvar, g_text_buffer);
+  EndCapture();
+  g_capture_armed = false;
+}
+}  // namespace ge
+
+
+// ===================================================== LAN lobby (menu 31) ===
+// The page after a match's settings (update sub_82106F50, draw sub_82107690):
+// the players' name tabs, the red status line, and on the host a START tab.
+//
+// What the original game does: a joining player is marked ready to start every
+// lobby frame (sub_8217D900(1) at 0x821003C8), and the host's START marks the
+// host ready, after which the session starts the match at once. The START tab
+// was hard to press (most of it lies under the name tabs' hit area) and there
+// was no sign of anything until the level had loaded.
+//
+// What it does now:
+//   - Joining players start not ready. Start (Enter), or the READY tab drawn
+//     where the host has START, toggles it. A player's ready flag is the
+//     player's synced byte (player+1232, value at +12), so every machine sees it.
+//   - Each name tab shows READY, NOT READY or HOST beside the name.
+//   - The host's START works anywhere on the tab, or with Start anywhere on the
+//     page, but only once every joining player is ready. It marks the host
+//     ready as before, but the session's start (sub_8217FAF0) is held back for
+//     3 seconds, so every machine shows "Starting match in 3, 2, 1": the other
+//     machines see the host's player become ready (its synced ready byte).
+//   - The status line says what is being waited for.
+namespace {
+constexpr uint32_t kTabHover = 0x82F60FA0u;       // START tab highlighted (set by the page each frame)
+constexpr uint32_t kTextLobbyStatus = 0xF0C0u;    // custom texts (see SetCustomText)
+constexpr uint32_t kTextReadyTab = 0xF0C1u;
+constexpr uint32_t kTextReadyMark = 0xF0C2u;
+constexpr uint32_t kTextHostMark = 0xF0C3u;
+constexpr uint32_t kTextNotReadyMark = 0xF0C4u;
+constexpr uint32_t kTextMoreWaiting = 0x9D3Fu;    // the game's "Waiting for more players"
+constexpr uint64_t kCountdownMs = 3000;
+
+bool g_client_ready = false;      // this machine's joining player is ready
+uint64_t g_countdown_ms = 0;      // host: when its countdown began (0 = none)
+uint64_t g_countdown_seen_ms = 0; // joining player: when the countdown bit appeared
+bool g_ready_tab_label = false;   // the START tab draw should say READY
+
+uint32_t CustomTextAddr(uint32_t id) { return g_string_block + (id - kCustomBase) * kCustomChars * 2; }
+
+bool IsHost(PPCContext& ctx, uint8_t* base) {
+  sub_8215FCA8(ctx, base);
+  return ctx.r3.u32 != 0;
+}
+bool CanStart(PPCContext& ctx, uint8_t* base) {  // enough players for the scenario
+  sub_82103278(ctx, base);
+  return (ctx.r3.u32 & 0xFF) != 0;
+}
+uint32_t SlotPlayer(PPCContext& ctx, uint8_t* base, uint32_t slot) {
+  ctx.r3.u64 = slot;
+  sub_820CA3E8(ctx, base);
+  return ctx.r3.u32;
+}
+uint32_t HostPlayer(PPCContext& ctx, uint8_t* base) {  // as the "Waiting for %s" line finds it
+  sub_82151C30(ctx, base);
+  return ctx.r3.u32 ? LD32(base, ctx.r3.u32 + 20u) : 0;
+}
+bool PlayerReady(uint8_t* base, uint32_t player) { return base[player + 1232u + 12u] != 0; }
+
+// Joining players (players of the other machines than the host's) not ready yet.
+int PlayersNotReady(PPCContext& ctx, uint8_t* base) {
+  const bool host = IsHost(ctx, base);
+  const uint32_t host_player = HostPlayer(ctx, base);
+  int count = 0;
+  for (uint32_t slot = 0; slot < 4; ++slot) {
+    const uint32_t p = SlotPlayer(ctx, base, slot);
+    if (!p || p == host_player) continue;
+    if (host && LocalPlayer(base, p)) continue;  // a second player on the host's machine
+    if (!PlayerReady(base, p)) ++count;
+  }
+  return count;
+}
+
+bool OnStartTab(uint8_t* base) {  // the tab at the page's right edge (menu units)
+  const float cx = LDF32(base, kCursorX), cy = LDF32(base, kCursorY);
+  return cx >= 383.0f && cy >= 42.0f && cy <= 128.0f;
+}
+
+// The host's players ready or not (sub_8217D900): what the other machines see.
+void SetHostReady(PPCContext& ctx, uint8_t* base, bool ready) {
+  ctx.r3.u64 = ready ? 1 : 0;
+  sub_8217D900(ctx, base);
+}
+
+void CancelCountdown(PPCContext& ctx, uint8_t* base, const char* why) {
+  REXKRNL_INFO("GELOBBY countdown cancelled ({})", why);
+  g_countdown_ms = 0;
+  SetHostReady(ctx, base, false);
+}
+
+// Seconds left to show, 0 = no countdown on this machine.
+int CountdownSeconds(PPCContext& ctx, uint8_t* base, bool host) {
+  uint64_t began = 0;
+  const uint32_t hp = HostPlayer(ctx, base);
+  if (host) {
+    began = g_countdown_ms;
+    if (!began && hp && PlayerReady(base, hp)) return 1;  // counted down; the match is starting
+  } else if (hp && PlayerReady(base, hp)) {
+    if (!g_countdown_seen_ms) g_countdown_seen_ms = GetTickCount64();
+    began = g_countdown_seen_ms;
+  } else {
+    g_countdown_seen_ms = 0;
+  }
+  if (!began) return 0;
+  const uint64_t elapsed = GetTickCount64() - began;
+  return elapsed >= kCountdownMs ? 1 : static_cast<int>((kCountdownMs - elapsed + 999) / 1000);
+}
+
+// Text in a colour (RGBA) and size, as the lobby draws its status line: the
+// text object gets a position, a colour, a size (sub_8209BBB8; the status line
+// is 17) and a wrap width (sub_8209BC18, 400) before it is released, which
+// draws it.
+void DrawSmallText(PPCContext& ctx, uint8_t* base, uint32_t sp, uint32_t str, float x, float y,
+                   uint32_t rgba, float size) {
+  ctx.r3.u64 = sp + 0x120;
+  ctx.r4.u64 = LD32(base, kFontPtr);
+  ctx.r5.u64 = str;
+  sub_8209BCD8(ctx, base);
+  ctx.r4.u64 = ctx.r3.u64;
+  ctx.r3.u64 = sp + 0x130;
+  ctx.f1.f64 = x;
+  ctx.f2.f64 = y;
+  sub_8209BA00(ctx, base);
+  ctx.r4.u64 = ctx.r3.u64;
+  ctx.r3.u64 = sp + 0x140;
+  ctx.r5.u64 = rgba;
+  sub_8209BB58(ctx, base);
+  ctx.r4.u64 = ctx.r3.u64;
+  ctx.r3.u64 = sp + 0x150;
+  ctx.f1.f64 = size;
+  sub_8209BBB8(ctx, base);
+  ctx.r4.u64 = ctx.r3.u64;
+  ctx.r3.u64 = sp + 0x160;
+  ctx.f1.f64 = 400.0;
+  sub_8209BC18(ctx, base);
+  for (uint32_t off : {0x160u, 0x150u, 0x140u, 0x130u, 0x120u}) {
+    ctx.r3.u64 = sp + off;
+    sub_8209B890(ctx, base);
+  }
+}
+
+void ToggleClientReady(PPCContext& ctx, uint8_t* base) {
+  g_client_ready = !g_client_ready;
+  PlaySelectSound(ctx, base);
+  REXKRNL_INFO("GELOBBY this player is {}", g_client_ready ? "ready" : "not ready");
+}
+}  // namespace
+
+namespace ge {
+// Each controller poll: outside the lobby nothing is pending.
+void LobbyPollTick(uint8_t* base, uint32_t menu) {
+  if (menu == 31u || menu == 37u) return;
+  g_client_ready = false;
+  g_countdown_ms = 0;
+  g_countdown_seen_ms = 0;
+  (void)base;
+}
+// Test pipe "READY": toggles this machine's ready, as Start does in the lobby.
+void TestToggleReady() {
+  g_client_ready = !g_client_ready;
+  REXKRNL_INFO("GELOBBY this player is {} (test)", g_client_ready ? "ready" : "not ready");
+}
+}  // namespace ge
+
+// Joining player's every-frame "ready" (0x821003C8, r3 = 1 there): only when the
+// player said so.
+void ge_client_ready(PPCRegister& r3) { r3.u64 = g_client_ready ? 1 : 0; }
+
+// Host page, every frame (0x821070E4, before the name-tab test). Runs the
+// countdown; true jumps to the page's START handling (0x82107210), which
+// highlights the tab and, on select, asks to start (ge_lobby_start_request).
+// Start pressed anywhere counts as select there: Start (0x1000 in the menus'
+// button bits) is added to the select mask it tests (r17, normally 0xA000).
+bool ge_lobby_host_start(PPCRegister& r17) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (g_countdown_ms) {
+    if (!CanStart(*ctx, base)) {
+      CancelCountdown(*ctx, base, "not enough players");
+    } else if (PlayersNotReady(*ctx, base) > 0) {
+      CancelCountdown(*ctx, base, "a player is no longer ready");
+    } else if (GetTickCount64() - g_countdown_ms >= kCountdownMs) {
+      g_countdown_ms = 0;  // the session may start the match now (ge_session_start_gate)
+      REXKRNL_INFO("GELOBBY countdown over: starting the match");
+    }
+  }
+  if (!OnStartTab(base) && !ButtonPressed(*ctx, base, kStartMask)) return false;
+  r17.u64 = r17.u32 | kStartMask;
+  return true;
+}
+
+// The START handling's start (0x821072C0, before `li r3,1; bl 0x8217D900`):
+// enough players and select pressed. True skips the immediate start; the
+// countdown starts instead, once every joining player is ready.
+bool ge_lobby_start_request() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (g_countdown_ms) return true;
+  const int waiting = PlayersNotReady(*ctx, base);
+  if (waiting > 0) {
+    REXKRNL_INFO("GELOBBY START: {} player(s) not ready", waiting);
+    return true;
+  }
+  g_countdown_ms = GetTickCount64();
+  SetHostReady(*ctx, base, true);
+  REXKRNL_INFO("GELOBBY countdown started");
+  return true;
+}
+
+// Joining player's page, every frame (0x821072D8, before the name-tab test).
+// The READY tab (where the host has START) and Start toggle ready; true skips
+// the rest of the page's handling for this frame (jumps to 0x8210737C).
+bool ge_lobby_client_ready() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (OnStartTab(base)) {
+    ST32(base, kTabHover, 1);
+    if (ButtonPressed(*ctx, base, kSelectMask) || ButtonPressed(*ctx, base, kStartMask)) ToggleClientReady(*ctx, base);
+    return true;
+  }
+  if (ButtonPressed(*ctx, base, kStartMask)) {
+    ToggleClientReady(*ctx, base);
+    return true;
+  }
+  return false;
+}
+
+// Status line (draw, 0x8210777C: r28 = the text the page chose). The game's
+// "Waiting for more players" stays; otherwise it says what the page waits for.
+void ge_lobby_status_text(PPCRegister& r28) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (!EnsureGuestBlocks(base)) return;
+  const PPCContext saved = *ctx;
+  std::string text;
+  {
+    GuestFrame frame(*ctx);
+    if (r28.u32 != LookupText(*ctx, base, kTextMoreWaiting)) {
+      const bool host = IsHost(*ctx, base);
+      const int seconds = CountdownSeconds(*ctx, base, host);
+      const int waiting = PlayersNotReady(*ctx, base);
+      if (seconds > 0) {
+        text = "Starting match in " + std::to_string(seconds);
+      } else if (host) {
+        if (waiting > 0)
+          text = "Waiting for " + std::to_string(waiting) + (waiting == 1 ? " player" : " players") + " to get ready";
+      } else if (!g_client_ready) {
+        text = "Waiting for you to ready up";
+      } else {
+        text = waiting > 0 ? "Ready - waiting for the others" : "Ready - waiting for the host to start";
+      }
+    }
+  }
+  *ctx = saved;
+  if (text.empty()) return;
+  SetCustomText(base, kTextLobbyStatus, text);
+  r28.u64 = CustomTextAddr(kTextLobbyStatus);
+}
+
+// The START tab's label (0x820EACFC: r3 = the "START" text just looked up).
+void ge_lobby_tab_label(PPCRegister& r3) {
+  if (g_ready_tab_label && g_string_block) r3.u64 = CustomTextAddr(kTextReadyTab);
+}
+
+// Draw, after the status line (0x821078B0): the joining player's
+// READY tab, and READY / NOT READY / HOST on the name tabs.
+void ge_lobby_draw_extras() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (!EnsureGuestBlocks(base)) return;
+  SetCustomText(base, kTextReadyTab, g_client_ready ? "NOT READY" : "READY");
+  SetCustomText(base, kTextReadyMark, "READY");
+  SetCustomText(base, kTextHostMark, "HOST");
+  SetCustomText(base, kTextNotReadyMark, "NOT READY");
+  const PPCContext saved = *ctx;
+  {
+    GuestFrame frame(*ctx);
+    sub_8215FC88(*ctx, base);
+    const bool lobby = ctx->r3.u32 == 4;
+    const bool host = lobby && IsHost(*ctx, base);
+    if (lobby && !host && CanStart(*ctx, base)) {
+      g_ready_tab_label = true;
+      sub_820EACD8(*ctx, base);  // the START tab, labelled READY
+      g_ready_tab_label = false;
+    }
+    if (lobby) {
+      const uint32_t host_player = HostPlayer(*ctx, base);
+      // Name tabs (menu units): two columns, two rows; the mark sits at the
+      // left end of the tab, in small letters level with the name, leaving room
+      // for long names.
+      static const float kTabX[2] = {64.0f, 218.0f};
+      static const float kTabY[2] = {47.5f, 69.5f};  // centred on the names
+      for (uint32_t slot = 0; slot < 4; ++slot) {
+        const uint32_t p = SlotPlayer(*ctx, base, slot);
+        if (!p) continue;
+        uint32_t id = 0, color = 0;
+        if (p == host_player) {
+          id = kTextHostMark, color = 0x5A4A2AFFu;
+        } else if (PlayerReady(base, p)) {
+          id = kTextReadyMark, color = 0x2E7D32FFu;
+        } else {
+          id = kTextNotReadyMark, color = 0xC83232FFu;  // the status line's red
+        }
+        if (!id) continue;
+        DrawSmallText(*ctx, base, frame.sp, LookupText(*ctx, base, id), kTabX[slot & 1], kTabY[slot >> 1], color,
+                      6.0f);
+      }
+    }
+  }
+  *ctx = saved;
+}
+
+// The session's match start (sub_8217FAF0 entry): held back while the host's
+// countdown runs; true jumps to its return (0x8217FB74).
+bool ge_session_start_gate() {
+  return g_countdown_ms != 0 && GetTickCount64() - g_countdown_ms < kCountdownMs;
 }

@@ -24,6 +24,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -186,9 +187,30 @@ void PostFxOverlay::OnDraw(ImGuiIO& io) {
 BackdropBars::BackdropBars(rex::ui::ImGuiDrawer* drawer) : rex::ui::ImGuiDialog(drawer) {}
 BackdropBars::~BackdropBars() = default;
 
+bool MatchStarting();  // ge_hooks.cpp: the lobby's match is loading
+
+namespace {
+// "STARTING MATCH" across the middle of the screen while a multiplayer match
+// loads (a few seconds of black on every machine, which looked like nothing
+// had happened). Drawn on top of everything.
+void DrawMatchStarting(float W, float H) {
+  if (!ge::MatchStarting()) return;
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  ImFont* font = ImGui::GetFont();
+  const float size = std::max(18.0f, H * 0.06f);
+  const char* text = "STARTING MATCH";
+  const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+  const float band = size * 2.2f;
+  const float y0 = (H - band) * 0.5f;
+  dl->AddRectFilled(ImVec2(0, y0), ImVec2(W, y0 + band), IM_COL32(0, 0, 0, 200));
+  dl->AddText(font, size, ImVec2((W - ts.x) * 0.5f, (H - ts.y) * 0.5f), IM_COL32(236, 222, 180, 255), text);
+}
+}  // namespace
+
 void BackdropBars::OnDraw(ImGuiIO& io) {
   const float W = io.DisplaySize.x, H = io.DisplaySize.y;
   if (W <= 0.0f || H <= 0.0f) return;
+  DrawMatchStarting(W, H);
   const float window = W / H;
   if (std::fabs(window - reported_aspect_) > 0.0005f) {
     reported_aspect_ = window;

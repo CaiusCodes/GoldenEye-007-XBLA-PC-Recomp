@@ -55,6 +55,30 @@ void ge_fix_mp_menu_branch() {
 // The game window (found when it has focus); defined with the mouse code.
 HWND g_game_hwnd_for_resize();
 namespace ge { void ApplyPlayerName(const std::string& requested); }
+namespace ge { void TestEnterText(const std::string& text); }  // ge_native_menu.cpp
+namespace ge { void TestToggleReady(); void LobbyPollTick(uint8_t* base, uint32_t menu); }  // ge_native_menu.cpp
+namespace { void ge_rename_tick(PPCContext& ctx, uint8_t* base); }  // below: a new player name
+namespace {
+// Last controller poll in the multiplayer lobby (GetTickCount64 ms, 0 = not there).
+std::atomic<uint64_t> g_lobby_poll_ms{0};
+// When this machine's players were last marked ready to start (sub_8217D900(1):
+// once by the host's START, every lobby frame on a client), 0 = never.
+std::atomic<uint64_t> g_match_ready_ms{0};
+}  // namespace
+void ge_match_ready(PPCRegister& r3) {
+  if (r3.u32 & 0xFF) g_match_ready_ms.store(GetTickCount64(), std::memory_order_relaxed);
+}
+namespace ge {
+// A multiplayer match is loading: the last poll was in the lobby and polls have
+// stopped (the game loads the level without polling) for a moment.
+bool MatchStarting() {
+  const uint64_t last = g_lobby_poll_ms.load(std::memory_order_relaxed);
+  const uint64_t ready = g_match_ready_ms.load(std::memory_order_relaxed);
+  if (!last || !ready) return false;
+  const uint64_t now = GetTickCount64();
+  return now - last > 500 && now - last < 30000 && now - ready < 30000;
+}
+}  // namespace ge
 namespace ge {
 void SetRebindCapturing(bool v);  // below
 }
@@ -2294,6 +2318,18 @@ void ge_script_read_new_lines() {
         start = end + 1;
         while (!word.empty() && (word.back() == '\r' || word.back() == ' ')) word.pop_back();
         GeScriptPress press;
+        if (word == "READY") {  // test: toggle ready in the LAN lobby
+          ge::TestToggleReady();
+          continue;
+        }
+        if (word.rfind("STALL=", 0) == 0) {  // test: hold the game thread, like a level load
+          Sleep(static_cast<DWORD>(std::atoi(word.c_str() + 6)));
+          continue;
+        }
+        if (word.rfind("TEXT=", 0) == 0) {  // test: type into the text field being edited
+          ge::TestEnterText(word.substr(5));
+          continue;
+        }
         if (word.rfind("NAME=", 0) == 0) {  // test: rename as the Online page does
           rex::cvar::SetFlagByName("ge_username", word.substr(5));
           ge::ApplyPlayerName(word.substr(5));
@@ -3189,6 +3225,14 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // Restore missing XBLA music transitions regardless of whether keyboard or
   // mouse-look support is enabled.
   ge_missing_music_tick(*ctx, base);
+  ge_rename_tick(*ctx, base);  // a player name changed in a menu
+  // Multiplayer lobby (menu 31) or player card (37): remembered so the
+  // "STARTING MATCH" notice can show while the match loads (no polls then).
+  {
+    const uint32_t menu = LD32(base, 0x8272B35Cu);
+    g_lobby_poll_ms.store(menu == 31u || menu == 37u ? GetTickCount64() : 0, std::memory_order_relaxed);
+    ge::LobbyPollTick(base, menu);
+  }
 
   // Rebind capture: the menu is listening for a key to bind. Swallow ALL slot-0
   // controller input (buttons, triggers, both sticks) so the key/button being
@@ -3196,6 +3240,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   ge::WatchKbdCaptureTick();  // pause menu Keyboard Controls: waiting for a key
   if (g_rebind_capturing.load(std::memory_order_relaxed)) {
     ge_script_read_new_lines();   // test pipe: a WHEELUP word can be the key
+    if (g_script_phase > 0) g_script_phase = -8;  // test pipe: the press that began the capture is over
     ST16(base, GE_PAD0 + 0, 0);   // buttons
     base[GE_PAD0 + 2] = 0;        // LT
     base[GE_PAD0 + 3] = 0;        // RT
@@ -3587,30 +3632,60 @@ void ge_ce_watch_sfx_save() {
   ge_cont_82184E48(*ctx, base);
 }
 
+// --- Player name changes ----------------------------------------------------
+// The game handles a signed-in user's gamertag changing in sub_82185298(user):
+// it reads XamUserGetName, compares it with the profile's copy (wide string at
+// profile+1276), and for an Xbox LIVE profile renames the user's player
+// (sub_82157FD8, name at player+768), sends every connected machine a rename
+// message (built by sub_821841E8, handled by sub_82184410) and stores the new
+// name in the profile. For any other profile it treats a different name as a
+// different user signing in instead. The PC profile is not a LIVE one, so a
+// rename runs that function with its two LIVE tests forced true: the XUID test
+// (r11 before `clrlwi r27,r11,24` at 0x82185300) and the profile's online flag
+// (byte +1360, tested at 0x82185364).
+namespace {
+std::atomic<bool> g_rename_pending{false};
+bool g_rename_forced = false;
+constexpr uint32_t kProfileSlots = 0x83088228u;  // 8 profile pointers (sub_821838B0)
+}  // namespace
+
+void ge_rename_as_live(PPCRegister& r11) {
+  if (g_rename_forced) r11.u64 = 1;
+}
+
+namespace {
+// Runs on the game thread (the input poll hook), once per requested rename.
+void ge_rename_tick(PPCContext& ctx, uint8_t* base) {
+  if (!g_rename_pending.exchange(false)) return;
+  // Only with user 0 signed in (as sub_821838B0 finds it); otherwise the
+  // game reads the new name when the user signs in.
+  bool signed_in = false;
+  for (uint32_t i = 0; i < 8 && !signed_in; ++i) {
+    const uint32_t profile = LD32(base, kProfileSlots + i * 4);
+    signed_in = profile && base[profile + 1358u] && LD32(base, profile + 1368u) == 0;
+  }
+  if (!signed_in) return;
+  const PPCContext saved = ctx;
+  ctx.r1.u64 = (ctx.r1.u32 - 0x400) & ~0xFu;
+  ctx.r3.u64 = 0;
+  g_rename_forced = true;
+  sub_82185298(ctx, base);
+  g_rename_forced = false;
+  ctx = saved;
+  REXKRNL_INFO("GENAME the game picked up the new player name");
+}
+}  // namespace
+
 namespace ge {
 // A new player name applies at once: the profile answers XamUserGetName with
-// it, and the game's own copy (read at sign-in into the signed-in profile's
-// wide string at +1276: pointer, length, capacity) is rewritten in place, so
-// lobbies and scoreboards show it without a restart.
+// it, and on the next input poll the game's own rename (above) updates the
+// profile, the player in a lobby or match, and every other player's copy.
 void ApplyPlayerName(const std::string& requested) {
   const std::string name = requested.empty() ? "User" : requested.substr(0, 15);
   auto* ks = rex::system::kernel_state();
   if (!ks) return;
   if (auto* profile = ks->user_profile()) profile->set_name(name);
-  uint8_t* base = ks->memory()->virtual_membase();
-  const uint32_t profile = LD32(base, 0x83088228u);
-  if (!profile) return;
-  const uint32_t buf = LD32(base, profile + 1276u);
-  const uint32_t cap = LD32(base, profile + 1284u);
-  if (!buf || cap < 2) return;
-  const size_t n = std::min<size_t>(name.size(), cap - 1);
-  for (size_t i = 0; i < n; ++i) {
-    base[buf + i * 2] = 0;
-    base[buf + i * 2 + 1] = static_cast<uint8_t>(name[i]);
-  }
-  base[buf + n * 2] = 0;
-  base[buf + n * 2 + 1] = 0;
-  ST32(base, profile + 1280u, static_cast<uint32_t>(n));
-  REXKRNL_INFO("GENAME player name is now '{}'", name.substr(0, n));
+  g_rename_pending = true;
+  REXKRNL_INFO("GENAME player name is now '{}'", name);
 }
 }  // namespace ge
