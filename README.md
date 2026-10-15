@@ -120,6 +120,27 @@ Keys can be changed in Help & Options → Keyboard & Mouse, or on the watch's
 Keyboard Controls page during a mission. An Xbox controller works as on the
 console.
 
+### Fixes implemented so far
+
+- Removed the beta text on the logo screen and the blur in original graphics mode.
+- Dam intro camera fix.
+- Level bug fix, guards spawning without weapons on Runway.
+- Frigate's water now drawn correctly in enhanced graphics, including near the speedboat.
+- Music fixed watch/pause theme, Mission Select music after a mission ends and the Control and Caverns elevator music which now resumes where it left off.
+- Dead guards fade out increased from 1.5 seconds to 1 minute.
+- Tank turret aiming with the mouse.
+- Fixed two different characters both being called "Scientist" on character select.
+- Fixed multiplayer characters icons "?" now show character models in character select.
+- Fixed Bond and the Russian infantry guard showing two heads with old graphics.
+- Removed Xbox-only messages that don't apply on PC.
+- Removed Xbox LIVE-only menu entries and the player card's View Gamercard and Add To Friends List rows which led nowhere.
+- Every player now hears the same music in LAN matches.
+- Fixed the watch volume sliders' range and door sounds that went silent at a distance.
+- Fixed LAN games not finding each other over virtual LAN adapters such as Radmin VPN and Hamachi, or on PCs with several network adapters.
+- Fixed the automatic shotgun's muzzle flash showing all the time on guns held by players and lying on the floor.
+- Fixed shotgun and automatic shotgun shots never reaching other players in multiplayer.
+- Other Misc fixes.
+
 ## Known limitations
 
 - Windows only for now.
