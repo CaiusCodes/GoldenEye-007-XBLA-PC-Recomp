@@ -17,7 +17,7 @@ through LAN and virtual LAN services are all supported.
 > which did not match the level day/night and unlock rows which was common for most
 > XBLA trial games.
 
-If you enjoy the GoldenEye 007 XBLA PC Recomp and would like to support future
+Like the GoldenEye 007 XBLA PC Recomp and to support future
 projects, you can tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
@@ -33,27 +33,22 @@ projects, you can tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 ## Install and play
 
-1. Download the release ZIP from the
+1. Download the latest release ZIP from the
    [Releases](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/releases)
-   page and extract it to your folder of choice (not Program Files). You get
-   one folder, **GoldenEye 007**.
+   page and extract the **GoldenEye 007** folder to a location of your choice (not Program Files).
 2. Open **GoldenEye 007.exe**. The first time, the setup window opens.
-3. A package beside `GoldenEye 007.exe` or in a `Game Package` folder next to
-   it is found and imported automatically. Otherwise drag the package (or
-   the folder holding it) onto the window, or use **Browse package**. It is
-   checked first, and the import starts as soon as it is accepted.
-4. Tick any optional extras: start in fullscreen, desktop shortcut,
-   100% game completion.
-5. **Play**.
+3. **Browse package** and select your game package or place the package file besides `GoldenEye 007.exe` or in
+   a `Game Package` folder next to it and will be found and imported automatically.
+7. Tick any optional extras: start in fullscreen, desktop shortcut, 100% game completion.
+8. **Play**.
 
 ![Setup window](docs/screenshots/setup.png)
 
-From then on, opening `GoldenEye 007.exe` starts the game straight away; the
+From then on opening `GoldenEye 007.exe` starts the game straight away; the
 package is not needed again. Everything stays inside the extracted folder
-(`resources\assets` for the imported game data, `resources\userdata` for saves
-and settings), so it can be moved or backed up as a whole. Start it with
-`--setup` to change the extras or import again; your saves and settings are
-kept. Coming from an older release with `Setup GoldenEye 007.exe` and a `Game`
+(`resources\assets` for the imported game data, `resources\userdata` for user save data
+and settings), so it can be moved or backed up as a whole.
+Coming from an older release with `Setup GoldenEye 007.exe` and a `Game`
 folder? Extract into or next to the old folder and setup imports straight
 from the old install, saves and settings included.
 
