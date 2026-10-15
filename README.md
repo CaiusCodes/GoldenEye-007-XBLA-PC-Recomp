@@ -74,7 +74,7 @@ neither setup nor the game contacts Xbox Live.
   or RB on a controller)
 - **Keyboard and mouse**: mouse look, rebindable keys, mouse sensitivity,
   separate precise-aim sensitivity, invert look, mouse wheel zoom on the
-  sniper rifle, and the mouse in the menus and the pause watch
+  sniper rifle and the mouse in the menus and the pause watch
 - **Xbox controller** support, working alongside keyboard and mouse
 - **LAN multiplayer** (Multiplayer → LAN or Virtual LAN), and **online
   multiplayer** through virtual LAN services such as Radmin VPN, ZeroTier,
@@ -91,11 +91,6 @@ neither setup nor the game contacts Xbox Live.
   007 mode and cheat unlocked
 - **Portable**: one program to open, no installer, no administrator rights;
   saves and settings stay in the game folder
-- **GoldenEye fixes and improvements** bug fixes from the BeanTools Community Edition,
-  watch and mission music fixes, tank mouse aiming, Frigate water, extra
-  multiplayer characters, refreshed modern main menu background, fixed gun muzzle static
-  flash fix with some weapons, guards' bodies that stay for 60 seconds and a
-  main menu without the Xbox LIVE-only entries as well as other minor fixes.
   ![LAN lobby with two players joined](docs/screenshots/lan-lobby.jpg)
 
 ### Controls
@@ -126,6 +121,9 @@ console.
 - Dam intro camera fix.
 - Level bug fix, guards spawning without weapons on Runway.
 - Frigate's water now drawn correctly in enhanced graphics, including near the speedboat.
+- Frigate, five invisible locked doors that blocked walkways are now normal doors that open both ways (multiplayer).
+- Frigate, both small balconies can be walked onto and players can drop off the large ledge onto the deck below (multiplayer).
+- Bunker: the entrance out to the snow is walled off again, so players can’t leave the map (multiplayer).
 - Music fixed watch/pause theme, Mission Select music after a mission ends and the Control and Caverns elevator music which now resumes where it left off.
 - Dead guards fade out increased from 1.5 seconds to 1 minute.
 - Tank turret aiming with the mouse.
