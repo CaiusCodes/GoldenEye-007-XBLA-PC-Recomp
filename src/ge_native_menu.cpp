@@ -778,8 +778,14 @@ void SetWindowSizeHandler(std::function<void(int, int)> handler) {
 
 // ================================================================ hooks ===
 
+namespace ge { bool SetGameText(uint8_t* base, uint32_t id, const std::string& text); }
+
 // String lookup (sub_82136AD8 entry): our ids come from guest memory.
 bool ge_str_lookup(PPCRegister& r3) {
+  if (r3.u32 == 0x9D8Fu) {  // "View Layout:" on the multiplayer pages
+    uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+    if (ge::SetGameText(base, 0xF0C7u, "Screen Layout:")) r3.u64 = 0xF0C7u;
+  }
   const uint32_t id = r3.u32;
   if (id < kCustomBase || id >= kCustomBase + kCustomCount || !g_string_block) return false;
   r3.u64 = g_string_block + (id - kCustomBase) * kCustomChars * 2;
@@ -1446,6 +1452,9 @@ constexpr uint32_t kTextLobbyStatus = 0xF0C0u;    // custom texts (see SetCustom
 constexpr uint32_t kTextReadyTab = 0xF0C1u;
 constexpr uint32_t kTextReadyMark = 0xF0C2u;
 constexpr uint32_t kTextHostMark = 0xF0C3u;
+constexpr uint32_t kTextLayoutHint = 0xF0C8u;    // (0xF0C7 is "Screen Layout:", see ge_str_lookup)
+// Under the layout buttons (menu units), clear of the CONFIDENTIAL stamp.
+constexpr float kLayoutHintX = 50.0f, kLayoutHintY = 310.0f;
 constexpr uint32_t kTextNotReadyMark = 0xF0C4u;
 constexpr uint32_t kTextMoreWaiting = 0x9D3Fu;    // the game's "Waiting for more players"
 constexpr uint64_t kCountdownMs = 3000;
@@ -1718,6 +1727,7 @@ void ge_lobby_draw_extras() {
   SetCustomText(base, kTextReadyMark, "READY");
   SetCustomText(base, kTextHostMark, "HOST");
   SetCustomText(base, kTextNotReadyMark, "NOT READY");
+  SetCustomText(base, kTextLayoutHint, "Split requires 2 local players.");
   const PPCContext saved = *ctx;
   {
     GuestFrame frame(*ctx);
@@ -1751,6 +1761,10 @@ void ge_lobby_draw_extras() {
         DrawSmallText(*ctx, base, frame.sp, LookupText(*ctx, base, id), kTabX[slot & 1], kTabY[slot >> 1], color,
                       6.0f);
       }
+      // Under "Screen Layout:": the layouts only split the screen between
+      // players at this PC; the other PCs' players are never shown here.
+      DrawSmallText(*ctx, base, frame.sp, LookupText(*ctx, base, kTextLayoutHint), kLayoutHintX, kLayoutHintY,
+                    0x3A3020FFu, 10.0f);
     }
   }
   *ctx = saved;
