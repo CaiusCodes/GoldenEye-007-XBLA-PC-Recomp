@@ -3183,6 +3183,88 @@ static void ge_keyboard_buttons(uint8_t* base) {
   if (ry) ST16(base, GE_PAD0 + 10, static_cast<uint16_t>(ry));
 }
 
+// Multiplayer floor-collision edits. Floors are N64 "stan" tiles in the data
+// segment; each tile point is {s16 x, y, z; u16 link}, where link names the tile
+// across the edge to the next point and 0 makes that edge a wall. Both tiles of
+// an edge carry a link, so a wall needs both set to 0; moving a point's
+// coordinates reshapes every tile that shares it. The edits apply only in
+// a multiplayer match on that stage (players[1] set) and are put back otherwise,
+// so the solo missions keep the stock floors.
+namespace {
+struct StanEdge {
+  uint32_t stage;
+  uint32_t addr;    // guest address of the u16 (a link or a coordinate)
+  uint16_t mp_value;
+  uint16_t stock;   // read at boot
+};
+StanEdge g_stan_edges[] = {
+    // Bunker: the doorway from the interior (room 4) to the snow outside
+    // (room 68), tile 21 <-> tile 1274 of the Bunker II stan at 0x827FE5E0.
+    {0x1Bu, 0x827FE8AEu, 0x0000u, 0},
+    {0x1Bu, 0x82808ADEu, 0x0000u, 0},
+    // Frigate: the two balcony doorways at (+-597, -158) are 31-32 stan units
+    // wide, about the player collision circle, so players caught on the frame.
+    // Move the threshold tiles' side points out 6 units each way (z -54/-55 ->
+    // -48/-49, -86 -> -92) in the Frigate stan at 0x827B6DC8.
+    {0x1Au, 0x827B7FE4u, 0xFFD0u, 0}, {0x1Au, 0x827B7FECu, 0xFFA4u, 0},
+    {0x1Au, 0x827B7FF4u, 0xFFA4u, 0}, {0x1Au, 0x827B8004u, 0xFFD0u, 0},
+    {0x1Au, 0x827B800Cu, 0xFFD0u, 0}, {0x1Au, 0x827B8014u, 0xFFA4u, 0},
+    {0x1Au, 0x827B8034u, 0xFFA4u, 0}, {0x1Au, 0x827B803Cu, 0xFFD0u, 0},
+    {0x1Au, 0x827B8F3Cu, 0xFFA4u, 0}, {0x1Au, 0x827B8F44u, 0xFFCFu, 0},
+    {0x1Au, 0x827B8F4Cu, 0xFFCFu, 0}, {0x1Au, 0x827B8F5Cu, 0xFFA4u, 0},
+    {0x1Au, 0x827B8F64u, 0xFFA4u, 0}, {0x1Au, 0x827B8F6Cu, 0xFFCFu, 0},
+    {0x1Au, 0x827B8FE4u, 0xFFCFu, 0}, {0x1Au, 0x827B8FECu, 0xFFA4u, 0},
+    {0x1Au, 0x827C5824u, 0xFFD0u, 0}, {0x1Au, 0x827C582Cu, 0xFFA4u, 0},
+    {0x1Au, 0x827C5A74u, 0xFFA4u, 0}, {0x1Au, 0x827C5A7Cu, 0xFFCFu, 0},
+    {0x1Au, 0x827C5B0Cu, 0xFFCFu, 0}, {0x1Au, 0x827C5B14u, 0xFFA4u, 0},
+    {0x1Au, 0x827C5B1Cu, 0xFFA4u, 0}, {0x1Au, 0x827C5B2Cu, 0xFFCFu, 0},
+    {0x1Au, 0x827C5B34u, 0xFFCFu, 0}, {0x1Au, 0x827C5B3Cu, 0xFFA4u, 0},
+    {0x1Au, 0x827C5B4Cu, 0xFFCFu, 0}, {0x1Au, 0x827C5B54u, 0xFFA4u, 0},
+    {0x1Au, 0x827C5B5Cu, 0xFFA4u, 0}, {0x1Au, 0x827C5B6Cu, 0xFFCFu, 0},
+    {0x1Au, 0x827C5B74u, 0xFFCFu, 0}, {0x1Au, 0x827C5B7Cu, 0xFFA4u, 0},
+    {0x1Au, 0x827C5B8Cu, 0xFFA4u, 0}, {0x1Au, 0x827C5B94u, 0xFFD0u, 0},
+    {0x1Au, 0x827C5B9Cu, 0xFFD0u, 0}, {0x1Au, 0x827C5BACu, 0xFFA4u, 0},
+    {0x1Au, 0x827C5BB4u, 0xFFA4u, 0}, {0x1Au, 0x827C5BBCu, 0xFFD0u, 0},
+    {0x1Au, 0x827C5BCCu, 0xFFA4u, 0}, {0x1Au, 0x827C5BD4u, 0xFFD0u, 0},
+    {0x1Au, 0x827C5BDCu, 0xFFD0u, 0}, {0x1Au, 0x827C5BECu, 0xFFA4u, 0},
+    {0x1Au, 0x827C5BF4u, 0xFFA4u, 0}, {0x1Au, 0x827C5BFCu, 0xFFD0u, 0},
+    // Frigate: let players drop off the upper deck's ledge at z -2126 (stan) onto
+    // the deck below. The ledge tiles 904/917 link down to tile 842 and 842's
+    // edge links back up to 904; the drop is too high to climb, so it stays
+    // one-way.
+    {0x1Au, 0x827BE24Eu, 0x0DA4u, 0}, {0x1Au, 0x827BE3DEu, 0x0DA4u, 0},
+    {0x1Au, 0x827BDA86u, 0x0E9Cu, 0},
+};
+void ge_stan_edge_tick(uint8_t* base) {
+  static bool read = false;
+  if (!read) {
+    read = true;
+    for (StanEdge& e : g_stan_edges) e.stock = LD16(base, e.addr);
+  }
+  const uint32_t stage = LD32(base, GE_CURRENT_STAGE);
+  const bool mp = LD32(base, GE_PLAYER_PTR + 4u) != 0u;
+  for (const StanEdge& e : g_stan_edges) {
+    const uint16_t want = (mp && stage == e.stage) ? e.mp_value : e.stock;
+    if (LD16(base, e.addr) != want) ST16(base, e.addr, want);
+  }
+}
+// Frigate multiplayer: five doors, at (+-206, -569), (-206, -2075) and the
+// balconies (+-597, -158), were locked (key 0x80), most of them missing the
+// open-away-from-player flag every other door has, and used door model 0x99,
+// which shows its texture from one side only. They read as invisible walls.
+// Make them ordinary doors like their neighbours: model 0x98, flag 0x08000000,
+// no key. These are the multiplayer setup's own records (stride 0xFC), so solo
+// Frigate is untouched; the level copies them at load.
+void ge_frigate_mp_doors(uint8_t* base) {
+  for (uint32_t door : {0x82DDD21Cu, 0x82DDD60Cu, 0x82DDD708u, 0x82DDE5CCu, 0x82DDE6C8u}) {
+    if (LD16(base, door + 4u) != 0x0099u) continue;  // not the expected record
+    ST16(base, door + 4u, 0x0098u);
+    ST32(base, door + 8u, LD32(base, door + 8u) | 0x08000000u);
+    ST32(base, door + 0x9Cu, 0u);
+  }
+}
+}  // namespace
+
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   PPCContext* ctx; uint8_t* base; getcb(ctx, base);
 
@@ -3206,8 +3288,10 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     ce_patched = true;
     ge_apply_ce_data_patches(base);
     ge::ApplyPortraitTable(base);  // ge_portraits.cpp: picture numbers in that list
+    ge_frigate_mp_doors(base);
     REXKRNL_INFO("GECE community data bug-fixes applied");
   }
+  ge_stan_edge_tick(base);
 
   // Skip the boot screen that jokes about the Nintendo logo (menu 2, drawn by
   // sub_820ED378). The current menu is at 0x8272B35C and a requested change at
@@ -3311,6 +3395,11 @@ void ge_ce_water_render() {}
 // fix_door_volume_clamp @0x820DD814: `li r3,0` -> `li r3,1` (min volume for
 // distant doors; 0 overflows). After-hook forces r3 = 1.
 void ge_ce_door_vol(PPCRegister& r3) { r3.u32 = 1; }
+
+// Intro cast roll (sub_820EF8C8): r25 = the random pose's gun kind (0 none,
+// 1 pistol, 2 rifle), loaded at 0x820EF9E0. Force none: the cast holds no
+// weapons (an automatic shotgun could turn up in a character's hands).
+void ge_intro_no_weapon(PPCRegister& r25) { r25.u64 = 0; }
 
 // remove_beta_string_at_logo @0x820ED678: `ori r3,r3,0x9D97` -> `...0x9CE3`
 // (point the GoldenEye-logo string id at the empty string). Replace low half.

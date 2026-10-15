@@ -751,3 +751,11 @@ name = "ge_match_music"
 registers = ["r3", "r30", "r31"]
 after_instruction = false
 jump_address_on_true = 0x82145468
+
+# Intro cast roll: each pose's table entry (+12) says whether the character
+# gets a gun (0 none, 1 pistol, 2 rifle); give none, so no weapon appears.
+[[midasm_hook]]
+address = 0x820EF9E0
+name = "ge_intro_no_weapon"
+registers = ["r25"]
+after_instruction = true
