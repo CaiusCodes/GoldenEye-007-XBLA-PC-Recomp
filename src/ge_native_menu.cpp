@@ -367,6 +367,10 @@ std::vector<Row> BuildPage(Page page) {
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
           });
+      // Render backend, used from the next start (Auto: NVIDIA -> Direct3D 12,
+      // other GPUs -> Vulkan; D3D12 crashes on AMD for this game).
+      AddChoice(rows, "Graphics API:", "gpu",
+                {{"Auto", "auto"}, {"Direct3D 12", "d3d12"}, {"Vulkan", "vulkan"}});
       AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
       AddAction(rows, "Done", [] { g_leave_page = true; });
       break;

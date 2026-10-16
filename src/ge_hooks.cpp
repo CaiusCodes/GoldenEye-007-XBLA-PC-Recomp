@@ -3396,7 +3396,43 @@ void ge_frigate_mp_doors(uint8_t* base) {
 }
 }  // namespace
 
+// vblank_timing_log: how often the input poll runs and how long this hook takes
+// (it runs on the game thread, so its cost comes out of the frame).
+namespace {
+struct PollTimer {
+  LARGE_INTEGER t0;
+  PollTimer() { QueryPerformanceCounter(&t0); }
+  ~PollTimer() {
+    static uint32_t poll = 0;
+    static bool on = false;
+    if ((poll++ & 0x3F) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+    if (!on) return;
+    static LARGE_INTEGER freq{}, start{};
+    static uint64_t count = 0;
+    static double sum_us = 0.0, max_us = 0.0;
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    if (!start.QuadPart) start = t1;
+    const double us = double(t1.QuadPart - t0.QuadPart) * 1e6 / double(freq.QuadPart);
+    ++count;
+    sum_us += us;
+    max_us = std::max(max_us, us);
+    if (t1.QuadPart - start.QuadPart >= 10 * freq.QuadPart) {
+      const double secs = double(t1.QuadPart - start.QuadPart) / double(freq.QuadPart);
+      REXKRNL_INFO("ge input poll: {:.1f}/s, hook {:.1f} us avg, {:.1f} us max, {:.2f} ms/s total, focus {}",
+                   double(count) / secs, sum_us / double(count), max_us, sum_us / 1000.0 / secs,
+                   ge_game_has_focus());
+      start = t1;
+      count = 0;
+      sum_us = max_us = 0.0;
+    }
+  }
+};
+}  // namespace
+
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
+  PollTimer poll_timer;
   PPCContext* ctx; uint8_t* base; getcb(ctx, base);
 
   // Apply BeanTools community DATA bug-fixes once, before any level loads its

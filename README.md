@@ -76,8 +76,9 @@ neither setup nor the game contacts Xbox Live.
   ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
   (display mode, window size, V-Sync, FPS counter, field of view,
-  anti-aliasing, texture filtering, post-processing filter) and Online
-  Settings
+  anti-aliasing, texture filtering, graphics API, post-processing filter)
+  and Online Settings. Graphics API "Auto" uses Direct3D 12 on NVIDIA and
+  Vulkan on AMD and other GPUs (Direct3D 12 crashes on AMD with this game)
   ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)
 - **Wider field of view** (10 degrees wider by default, adjustable from the
   original up to +30)

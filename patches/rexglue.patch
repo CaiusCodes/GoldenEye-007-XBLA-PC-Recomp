@@ -5826,16 +5826,79 @@ index 7360ed9..074bc86 100644
  #endif  // XE_PLATFORM
  }
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index b94fe9e..85a75be 100644
+index b94fe9e..7e78f14 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
-@@ -44,8 +44,13 @@
+@@ -44,8 +44,76 @@
  
  #include <algorithm>
  #include <filesystem>
 +#include <string>
  #include <string_view>
  
++#if REX_PLATFORM_WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <dxgi.h>
++#endif
++
++// ge: render backend. "auto" uses Direct3D 12 on NVIDIA and Vulkan on every
++// other GPU: D3D12 on this title crashes / black-screens on AMD (as in Xenia)
++// and Intel Arc. Restored from the GoldenEye SDK fork (lost in the 0.10.0
++// merge, where the plugin always took D3D12). Applies on the next start.
++REXCVAR_DEFINE_STRING(gpu, "auto", "GPU",
++                      "Render backend: auto (NVIDIA->D3D12, others->Vulkan), d3d12, or vulkan")
++    .allowed({"auto", "d3d12", "vulkan"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++namespace {
++// PCI vendor id of the first hardware GPU (DXGI loaded at run time), 0 if unknown.
++uint32_t PrimaryGpuVendorId() {
++#if REX_PLATFORM_WIN32
++  HMODULE dxgi = ::LoadLibraryW(L"dxgi.dll");
++  if (!dxgi) return 0u;
++  using CreateFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
++  auto create_factory1 =
++      reinterpret_cast<CreateFactory1Fn>(::GetProcAddress(dxgi, "CreateDXGIFactory1"));
++  uint32_t vendor = 0u;
++  IDXGIFactory1* factory = nullptr;
++  if (create_factory1 && SUCCEEDED(create_factory1(IID_PPV_ARGS(&factory))) && factory) {
++    IDXGIAdapter1* adapter = nullptr;
++    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
++      DXGI_ADAPTER_DESC1 desc;
++      const bool hardware =
++          SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
++      adapter->Release();
++      adapter = nullptr;
++      if (hardware) {
++        vendor = desc.VendorId;  // the first hardware adapter decides
++        break;
++      }
++    }
++    factory->Release();
++  }
++  ::FreeLibrary(dxgi);
++  return vendor;
++#else
++  return 0u;
++#endif
++}
++
++std::string ResolveGpuBackend() {
++  const std::string choice = REXCVAR_GET(gpu);
++  if (choice == "d3d12" || choice == "vulkan") return choice;
++  const uint32_t vendor = PrimaryGpuVendorId();
++  const std::string backend = vendor == 0x10DEu ? "d3d12" : "vulkan";
++  REXLOG_INFO("gpu = auto: GPU vendor {:04X} -> {}", vendor, backend);
++  return backend;
++}
++}  // namespace
++
 +REXCVAR_DEFINE_BOOL(developer_hotkeys, false, "UI",
 +                    "Enable the ReXGlue developer hotkeys: F3 debug overlay, backtick console, "
 +                    "F4 settings overlay, F7 achievements overlay (off by default)");
@@ -5843,7 +5906,7 @@ index b94fe9e..85a75be 100644
  REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                        "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                        "GPU emulation")
-@@ -201,27 +206,39 @@ bool ReXApp::SetupEnvironment() {
+@@ -201,27 +269,39 @@ bool ReXApp::SetupEnvironment() {
  }
  
  bool ReXApp::ConstructRuntime(const PathConfig& paths) {
@@ -5889,7 +5952,7 @@ index b94fe9e..85a75be 100644
                                       paths.update_data_root, paths.cache_root, paths.metadata_root);
    runtime_->set_app_context(&app_context());
  
-@@ -252,6 +269,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -252,6 +332,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
      if (input_sys) {
        input_sys->SetActiveCallback([this]() {
@@ -5901,7 +5964,7 @@ index b94fe9e..85a75be 100644
          if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
            return true;
          return !imgui_drawer_->GetIO().WantCaptureMouse;
-@@ -274,7 +296,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -274,7 +359,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      }
      std::string host_tail{tail};
      std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
@@ -5913,7 +5976,16 @@ index b94fe9e..85a75be 100644
      if (!std::filesystem::is_regular_file(xex_host)) {
        auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
        REXLOG_ERROR("{}", msg);
-@@ -333,8 +358,14 @@ bool ReXApp::SetupPresentation() {
+@@ -314,7 +402,7 @@ bool ReXApp::SetupPresentation() {
+   OnPreSetup(config_);
+ 
+   if (!config_.graphics && !config_.gpu_plugin.empty()) {
+-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
++    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, ResolveGpuBackend());
+     if (!config_.graphics) {
+       // Fatal by design: no silent headless fallback.
+       auto msg =
+@@ -333,8 +421,14 @@ bool ReXApp::SetupPresentation() {
      }
    }
  
@@ -5930,7 +6002,7 @@ index b94fe9e..85a75be 100644
    if (!window_) {
      REXLOG_ERROR("Failed to create window");
      return false;
-@@ -350,10 +381,17 @@ bool ReXApp::SetupPresentation() {
+@@ -350,10 +444,17 @@ bool ReXApp::SetupPresentation() {
    if (REXCVAR_GET(fullscreen)) {
      window_->SetFullscreen(true);
    }
@@ -5951,7 +6023,7 @@ index b94fe9e..85a75be 100644
    });
    window_->Open();
  
-@@ -394,35 +432,40 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+@@ -394,35 +495,40 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
    // gated eager font upload in SetImmediateDrawer is skipped (font uploads
    // lazily on the first Draw instead).
    imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
@@ -6021,7 +6093,7 @@ index b94fe9e..85a75be 100644
  
    OnCreateDialogs(imgui_drawer_.get());
  }
-@@ -613,4 +656,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
+@@ -613,4 +719,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
    }
  }
  
