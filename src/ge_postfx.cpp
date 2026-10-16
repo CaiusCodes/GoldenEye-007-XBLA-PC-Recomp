@@ -205,6 +205,8 @@ void AddOverlayFont(ImFontAtlas* atlas) {
 
 BackdropBars::BackdropBars(rex::ui::ImGuiDrawer* drawer) : rex::ui::ImGuiDialog(drawer) {}
 BackdropBars::~BackdropBars() = default;
+bool MatchStarting();  // ge_hooks.cpp: the lobby's match is loading
+bool BackdropBars::WantsContinuousRedraw() const { return MatchStarting(); }
 
 bool MatchStarting();  // ge_hooks.cpp: the lobby's match is loading
 uint32_t GuestPresentCount();  // ge_hooks.cpp: frames the game has presented

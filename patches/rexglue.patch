@@ -248,6 +248,52 @@ index 4d85a2b..ad525bb 100644
   protected:
    SharedMemory(memory::Memory& memory);
    // Call in implementation-specific initialization.
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..c72d0d7 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -482,6 +482,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+     uint32_t half_pixel_offset;
+   };
+   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
++  // ge: the menu backdrop picture (menu-backdrop-169/219.png), uploaded on
++  // first use inside the swap; as in the D3D12 command processor.
++  bool EnsureBackdropTexture(int kind);
++  void DestroyBackdrop();
+   void DestroySwapFxaaSourceImage();
+ 
+   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
+@@ -666,6 +670,30 @@ class VulkanCommandProcessor : public CommandProcessor {
+   VkPipelineLayout swap_apply_gamma_pipeline_layout_ = VK_NULL_HANDLE;
+   VkPipelineLayout swap_apply_gamma_compute_pipeline_layout_ = VK_NULL_HANDLE;
+   VkPipelineLayout swap_fxaa_pipeline_layout_ = VK_NULL_HANDLE;
++  // ge: menu backdrop compute pass (in place over the guest output, after
++  // gamma / FXAA), same constants as the D3D12 BackdropConstants.
++  struct BackdropConstants {
++    uint32_t size[2];
++    float uv_scale[2];
++    float uv_offset[2];
++    float key[3];
++    float key_tolerance;
++    uint32_t layout_4x3;
++    uint32_t fill_black;
++  };
++  VkPipelineLayout swap_backdrop_pipeline_layout_ = VK_NULL_HANDLE;
++  VkPipeline swap_backdrop_pipeline_ = VK_NULL_HANDLE;
++  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_descriptors_backdrop_source_{};
++  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_descriptors_backdrop_destination_{};
++  VkImage backdrop_image_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  VkDeviceMemory backdrop_image_memory_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  VkImageView backdrop_image_view_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  VkBuffer backdrop_upload_buffer_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  VkDeviceMemory backdrop_upload_memory_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  uint64_t backdrop_upload_submission_[2] = {0, 0};
++  uint32_t backdrop_width_[2] = {0, 0};
++  uint32_t backdrop_height_[2] = {0, 0};
++  bool backdrop_load_tried_[2] = {false, false};
+   // Has no dependencies on specific pipeline stages on both ends to simplify
+   // use in different scenarios with different pipelines - use explicit barriers
+   // for synchronization.
 diff --git a/include/rex/kernel/xam/ge_online_control.h b/include/rex/kernel/xam/ge_online_control.h
 new file mode 100644
 index 0000000..bf78e85
@@ -347,7 +393,7 @@ index e81df52..76c32c9 100644
  
  }  // namespace rex::system
 diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
-index a7ab6b3..15e7241 100644
+index a7ab6b3..703a408 100644
 --- a/include/rex/ui/imgui_dialog.h
 +++ b/include/rex/ui/imgui_dialog.h
 @@ -26,6 +26,8 @@ namespace ui {
@@ -359,6 +405,19 @@ index a7ab6b3..15e7241 100644
    virtual ~ImGuiDialog();
  
    // Shows a simple message box containing a text message.
+@@ -39,6 +41,12 @@ class ImGuiDialog {
+ 
+   void Draw();
+ 
++  // ge: whether the window must keep repainting while this dialog is up. A
++  // passive overlay drawn over the game picture returns false, so the window
++  // repaints only when the game shows a new frame: repainting at the display
++  // rate (240 Hz VRR) dropped the game to 40-50 FPS for players with focus.
++  virtual bool WantsContinuousRedraw() const { return true; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
 diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
 index a570fa0..f87e797 100644
 --- a/include/rex/ui/imgui_drawer.h
@@ -372,6 +431,32 @@ index a570fa0..f87e797 100644
    void SetPresenterAndImmediateDrawer(Presenter* new_presenter,
                                        ImmediateDrawer* new_immediate_drawer) {
      SetPresenter(new_presenter);
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601..1b1df31 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -35,6 +35,12 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
+ 
++  // ge: only while a toast is queued or showing (the dialog lives all game).
++  bool WantsContinuousRedraw() const override {
++    std::lock_guard lock(mutex_);
++    return !queue_.empty();
++  }
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+@@ -47,7 +53,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+     std::optional<std::chrono::steady_clock::time_point> visible_since;
+   };
+ 
+-  std::mutex mutex_;
++  mutable std::mutex mutex_;
+   std::deque<PendingToast> queue_;
+   AchievementIconCache icon_cache_;
+ };
 diff --git a/resources/templates/codegen/init_cpp.inja b/resources/templates/codegen/init_cpp.inja
 index 1be4759..0d3e207 100644
 --- a/resources/templates/codegen/init_cpp.inja
@@ -3950,6 +4035,516 @@ index 0000000..9c3ab08
 +
 +  xe_dest[coord] = float4(saturate(c), 1.0);
 +}
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..b1e22d8 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -21,7 +21,12 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <fstream>
++#include <iterator>
++
+ #include <SPIRV/GlslangToSpv.h>
++#include <rex/filesystem.h>
++#include <rex/ui/image_decode.h>
+ #include <glslang/Public/ShaderLang.h>
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+@@ -182,6 +187,120 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+     },
+ };
+ 
++// ge: menu backdrop compute shader, the GLSL twin of ge_backdrop.cs.hlsl (see
++// there for the full story): pixels still holding the key colour the game
++// paints behind its front-end folder become the desk picture, and the folder is
++// trimmed to a finished shape with a soft shadow.
++const char* GetSwapBackdropComputeSource() {
++  return R"(#version 450
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++layout(push_constant) uniform BackdropConstants {
++  uvec2 xe_backdrop_size;
++  float xe_uv_scale_x;
++  float xe_uv_scale_y;
++  float xe_uv_offset_x;
++  float xe_uv_offset_y;
++  float xe_key_r;
++  float xe_key_g;
++  float xe_key_b;
++  float xe_key_tolerance;
++  uint xe_layout_4x3;
++  uint xe_fill_black;
++};
++layout(set = 0, binding = 0) uniform sampler2D xe_image;
++layout(set = 1, binding = 0, rgb10_a2) uniform image2D xe_dest;
++
++const float kCoverLeft = 28.0;
++const float kCoverTop = 22.0;
++const float kSpineEnd = 148.0;
++const float kBoardTop = 28.0;
++const float kBoardRight = 1065.0;
++const float kChamferX = 1016.0;
++const float kFolderBottom = 100000.0;
++const float kCorner = 22.0;
++const vec2 kShadowShift = vec2(5.0, 7.0);
++const float kShadowReach = 22.0;
++const float kShadowStrength = 0.55;
++const float kFar = 100000.0;
++
++float sd_round_box(vec2 p, vec2 lo, vec2 hi, float r) {
++  vec2 centre = 0.5 * (lo + hi);
++  vec2 half_size = 0.5 * (hi - lo) - r;
++  vec2 q = abs(p - centre) - half_size;
++  return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
++}
++
++void main() {
++  uvec2 id = gl_GlobalInvocationID.xy;
++  if (id.x >= xe_backdrop_size.x || id.y >= xe_backdrop_size.y) {
++    return;
++  }
++  ivec2 coord = ivec2(id);
++  if (xe_fill_black != 0u) {
++    imageStore(xe_dest, coord, vec4(0.0, 0.0, 0.0, 1.0));
++    return;
++  }
++  vec3 c = imageLoad(xe_dest, coord).rgb;
++  vec2 pos = (vec2(id) + 0.5) / vec2(xe_backdrop_size);
++  bool key = c.g <= xe_key_tolerance && abs(c.r - c.b) <= xe_key_tolerance &&
++             c.r >= xe_key_r && c.r <= xe_key_b;
++  float hi = max(c.r, max(c.g, c.b));
++  float lo = min(c.r, min(c.g, c.b));
++  bool clip = hi > 0.25 && hi - lo < 0.08;
++  bool crosshair = c.r > 0.6 && c.g < c.r * 0.3 && c.b < c.r * 0.3;
++  vec2 p = pos * vec2(1280.0, 720.0);
++  float px_per_unit = float(xe_backdrop_size.y) / 720.0;
++  bool keep_clip = clip && p.y < 40.0;
++
++  bool left_zone = p.x < kSpineEnd;
++  float edge_d;
++  if (left_zone) {
++    edge_d = sd_round_box(p, vec2(kCoverLeft, kCoverTop), vec2(kFar, kFolderBottom), kCorner);
++  } else {
++    edge_d = sd_round_box(p, vec2(-kFar, -kFar), vec2(kBoardRight, kFolderBottom), kCorner);
++    edge_d = max(edge_d, (p.x - p.y - kChamferX) * 0.7071);
++  }
++  bool soft_edge = !crosshair && !keep_clip && edge_d * px_per_unit > -2.5;
++
++  bool top_left = p.x > kSpineEnd && p.x < 232.0;
++  float top_edge = top_left ? 27.5 : kBoardTop;
++  bool top_cut = !left_zone && p.y < top_edge && !crosshair && !keep_clip;
++  if (xe_layout_4x3 != 0u) {
++    top_cut = false;
++    soft_edge = false;
++  }
++  if (!key && !top_cut && !soft_edge) {
++    return;
++  }
++
++  vec2 q = p - kShadowShift;
++  float dist = min(
++      sd_round_box(q, vec2(kCoverLeft, kCoverTop), vec2(232.0, kFolderBottom), kCorner),
++      sd_round_box(q, vec2(150.0, kBoardTop), vec2(kBoardRight, kFolderBottom), kCorner));
++  float shadow = 1.0 - kShadowStrength * (1.0 - smoothstep(0.0, kShadowReach, dist)) *
++                           (1.0 - smoothstep(704.0, 719.0, p.y));
++
++  float alpha = 1.0;
++  vec3 base = c;
++  if (!key) {
++    if (top_cut) {
++      if (top_left) {
++        float n = dot(c, vec3(0.3, 0.59, 0.11));
++        alpha = p.y < 20.0 ? 1.0 : smoothstep(0.11, 0.16, n);
++      }
++    } else {
++      alpha = clamp(edge_d * px_per_unit + 0.5, 0.0, 1.0);
++      float rim = clamp(1.0 + edge_d * px_per_unit * 0.5, 0.0, 1.0);
++      base = c * (1.0 - 0.3 * rim);
++    }
++  }
++  vec2 uv = pos * vec2(xe_uv_scale_x, xe_uv_scale_y) + vec2(xe_uv_offset_x, xe_uv_offset_y);
++  vec3 desk = textureLod(xe_image, uv, 0.0).rgb * shadow;
++  imageStore(xe_dest, coord, vec4(mix(base, desk, alpha), 1.0));
++}
++)";
++}
++
+ const char* GetSwapFxaaComputeSource(bool extreme_quality) {
+   return extreme_quality ? R"(#version 450
+ layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+@@ -1309,15 +1428,17 @@ bool VulkanCommandProcessor::SetupContext() {
+         swap_descriptor_pool_sizes[swap_descriptor_pool_create_info.poolSizeCount++];
+     swap_descriptor_pool_size_combined_image_sampler.type =
+         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+-    swap_descriptor_pool_size_combined_image_sampler.descriptorCount = kMaxFramesInFlight;
+-    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight;
++    // FXAA source and (ge) the menu backdrop picture.
++    swap_descriptor_pool_size_combined_image_sampler.descriptorCount = kMaxFramesInFlight * 2;
++    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight * 2;
+   }
+   {
+     VkDescriptorPoolSize& swap_descriptor_pool_size_storage_image =
+         swap_descriptor_pool_sizes[swap_descriptor_pool_create_info.poolSizeCount++];
+     swap_descriptor_pool_size_storage_image.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+-    swap_descriptor_pool_size_storage_image.descriptorCount = kMaxFramesInFlight * 2;
+-    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight * 2;
++    // Apply-gamma and FXAA destinations, and (ge) the menu backdrop pass.
++    swap_descriptor_pool_size_storage_image.descriptorCount = kMaxFramesInFlight * 3;
++    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight * 3;
+   }
+   // 256-entry table and PWL gamma ramps. If the gamma ramp buffer is
+   // host-visible, for multiple frames.
+@@ -1388,6 +1509,23 @@ bool VulkanCommandProcessor::SetupContext() {
+       return false;
+     }
+   }
++  // ge: menu backdrop pass descriptors (picture, guest output).
++  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
++    if (dfn.vkAllocateDescriptorSets(device, &swap_descriptor_set_allocate_info,
++                                     &swap_descriptors_backdrop_destination_[i]) != VK_SUCCESS) {
++      REXGPU_ERROR("Failed to allocate the menu backdrop destination descriptor sets");
++      return false;
++    }
++  }
++  swap_descriptor_set_allocate_info.pSetLayouts =
++      &swap_descriptor_set_layout_combined_image_sampler_;
++  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
++    if (dfn.vkAllocateDescriptorSets(device, &swap_descriptor_set_allocate_info,
++                                     &swap_descriptors_backdrop_source_[i]) != VK_SUCCESS) {
++      REXGPU_ERROR("Failed to allocate the menu backdrop source descriptor sets");
++      return false;
++    }
++  }
+ 
+   // Gamma ramp descriptor sets.
+   VkWriteDescriptorSet gamma_ramp_write_descriptor_set;
+@@ -1861,6 +1999,37 @@ bool VulkanCommandProcessor::SetupContext() {
+     }
+   }
+ 
++  // ge: menu backdrop compute pipeline. Optional: without it the game paints
++  // the plain desk colour behind the folder (ge_backdrop_ready stays false).
++  {
++    VkPushConstantRange backdrop_push_constant_range;
++    backdrop_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    backdrop_push_constant_range.offset = 0;
++    backdrop_push_constant_range.size = sizeof(BackdropConstants);
++    VkPipelineLayoutCreateInfo backdrop_layout_create_info = {};
++    backdrop_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    backdrop_layout_create_info.setLayoutCount = uint32_t(swap_fxaa_descriptor_set_layouts.size());
++    backdrop_layout_create_info.pSetLayouts = swap_fxaa_descriptor_set_layouts.data();
++    backdrop_layout_create_info.pushConstantRangeCount = 1;
++    backdrop_layout_create_info.pPushConstantRanges = &backdrop_push_constant_range;
++    std::vector<uint32_t> backdrop_spirv;
++    std::string backdrop_compile_error;
++    if (dfn.vkCreatePipelineLayout(device, &backdrop_layout_create_info, nullptr,
++                                   &swap_backdrop_pipeline_layout_) != VK_SUCCESS) {
++      REXGPU_WARN("ge: menu backdrop disabled (no pipeline layout)");
++    } else if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, GetSwapBackdropComputeSource(),
++                                   backdrop_spirv, backdrop_compile_error)) {
++      REXGPU_WARN("ge: menu backdrop disabled (shader: {})", backdrop_compile_error);
++    } else {
++      swap_backdrop_pipeline_ = ui::vulkan::util::CreateComputePipeline(
++          vulkan_device, swap_backdrop_pipeline_layout_, backdrop_spirv.data(),
++          sizeof(uint32_t) * backdrop_spirv.size());
++      if (swap_backdrop_pipeline_ == VK_NULL_HANDLE) {
++        REXGPU_WARN("ge: menu backdrop disabled (no pipeline)");
++      }
++    }
++  }
++
+   VkPipelineLayoutCreateInfo resolve_downscale_layout_create_info = {};
+   resolve_downscale_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+   VkDescriptorSetLayout resolve_downscale_set_layout =
+@@ -1952,6 +2121,10 @@ void VulkanCommandProcessor::ShutdownContext() {
+                                            swap_framebuffer.framebuffer);
+   }
+   DestroySwapFxaaSourceImage();
++  DestroyBackdrop();
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_backdrop_pipeline_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
++                                         swap_backdrop_pipeline_layout_);
+ 
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                          swap_fxaa_extreme_pipeline_);
+@@ -2430,6 +2603,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
+                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
+ 
++        // ge: the menu backdrop (front end up, picture loaded; the upload is
++        // recorded here) and the boot cover (output painted black while the
++        // game sets the screen ratio), as in the D3D12 command processor.
++        const bool boot_cover = swap_backdrop_pipeline_ != VK_NULL_HANDLE &&
++                                rex::cvar::GetFlagByName("ge_boot_cover") == "true";
++        int backdrop_kind = 0;
++        bool backdrop_enabled =
++            boot_cover || (swap_backdrop_pipeline_ != VK_NULL_HANDLE &&
++                           rex::cvar::GetFlagByName("ge_backdrop_active") == "true");
++        if (backdrop_enabled) {
++          const float window_aspect =
++              float(std::atof(rex::cvar::GetFlagByName("ge_backdrop_window_aspect").c_str()));
++          backdrop_kind = window_aspect >= 2.05f ? 1 : 0;
++          if (!EnsureBackdropTexture(backdrop_kind)) {
++            backdrop_kind = 1 - backdrop_kind;  // the other shape's picture
++            // The boot cover needs no picture, but a valid one is bound.
++            backdrop_enabled = EnsureBackdropTexture(backdrop_kind);
++          }
++        }
++
+         // This is according to D3D::InitializePresentationParameters from a
+         // game executable, which initializes the 256-entry table gamma ramp for
+         // 8_8_8_8 output and the PWL gamma ramp for 2_10_10_10.
+@@ -2752,6 +2945,95 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+           }
+ 
++          // ge: menu backdrop / boot cover, in place over the final output.
++          if (backdrop_enabled) {
++            PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_ACCESS_SHADER_WRITE_BIT,
++                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
++                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
++            SubmitBarriers(true);
++            VkDescriptorImageInfo backdrop_source_info;
++            backdrop_source_info.sampler = swap_sampler_linear_clamp_;
++            backdrop_source_info.imageView = backdrop_image_view_[backdrop_kind];
++            backdrop_source_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++            VkDescriptorImageInfo backdrop_dest_info;
++            backdrop_dest_info.sampler = VK_NULL_HANDLE;
++            backdrop_dest_info.imageView = vulkan_context.image_view();
++            backdrop_dest_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++            std::array<VkWriteDescriptorSet, 2> backdrop_writes{};
++            for (VkWriteDescriptorSet& w : backdrop_writes) {
++              w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++              w.dstBinding = 0;
++              w.descriptorCount = 1;
++            }
++            backdrop_writes[0].dstSet = swap_descriptors_backdrop_source_[swap_frame_index];
++            backdrop_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++            backdrop_writes[0].pImageInfo = &backdrop_source_info;
++            backdrop_writes[1].dstSet = swap_descriptors_backdrop_destination_[swap_frame_index];
++            backdrop_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++            backdrop_writes[1].pImageInfo = &backdrop_dest_info;
++            dfn.vkUpdateDescriptorSets(device, uint32_t(backdrop_writes.size()),
++                                       backdrop_writes.data(), 0, nullptr);
++            std::array<VkDescriptorSet, 2> backdrop_sets = {
++                swap_descriptors_backdrop_source_[swap_frame_index],
++                swap_descriptors_backdrop_destination_[swap_frame_index]};
++            deferred_command_buffer_.CmdVkBindDescriptorSets(
++                VK_PIPELINE_BIND_POINT_COMPUTE, swap_backdrop_pipeline_layout_, 0,
++                uint32_t(backdrop_sets.size()), backdrop_sets.data(), 0, nullptr);
++            BackdropConstants c;
++            c.size[0] = guest_output_width;
++            c.size[1] = guest_output_height;
++            // The picture covers the whole window, keeping its shape and
++            // cropping evenly; the output is shown at present_aspect_x/y when
++            // set, centred in the window (ge_backdrop_window_aspect).
++            float shown = float(guest_output_width) / float(std::max(1u, guest_output_height));
++            const float ax =
++                float(std::atof(rex::cvar::GetFlagByName("present_aspect_x").c_str()));
++            const float ay =
++                float(std::atof(rex::cvar::GetFlagByName("present_aspect_y").c_str()));
++            if (ax > 0.0f && ay > 0.0f) shown = ax / ay;
++            float window =
++                float(std::atof(rex::cvar::GetFlagByName("ge_backdrop_window_aspect").c_str()));
++            if (!(window > 0.1f && window < 10.0f)) window = shown;
++            float out_scale[2] = {1.0f, 1.0f};
++            if (window > shown) {
++              out_scale[0] = shown / window;
++            } else {
++              out_scale[1] = window / shown;
++            }
++            const float image = float(backdrop_width_[backdrop_kind]) /
++                                float(std::max(1u, backdrop_height_[backdrop_kind]));
++            float img_scale[2] = {1.0f, 1.0f};
++            if (window > image) {
++              img_scale[1] = image / window;
++            } else {
++              img_scale[0] = window / image;
++            }
++            for (int i = 0; i < 2; ++i) {
++              const float out_offset = (1.0f - out_scale[i]) * 0.5f;
++              const float img_offset = (1.0f - img_scale[i]) * 0.5f;
++              c.uv_scale[i] = out_scale[i] * img_scale[i];
++              c.uv_offset[i] = out_offset * img_scale[i] + img_offset;
++            }
++            // The game paints RGB (16, 0, 16): after its gamma ramp a dark
++            // (k, 0, k), k in [1, 96] of 1023.
++            c.key[0] = 0.5f / 1023.0f;
++            c.key[1] = 0.0f;
++            c.key[2] = 96.0f / 1023.0f;
++            c.key_tolerance = 0.5f / 1023.0f;
++            c.layout_4x3 = (window > 0.1f && window < 1.55f) ? 1u : 0u;
++            c.fill_black = boot_cover ? 1u : 0u;
++            deferred_command_buffer_.CmdVkPushConstants(swap_backdrop_pipeline_layout_,
++                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(c),
++                                                        &c);
++            BindExternalComputePipeline(swap_backdrop_pipeline_);
++            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 7) / 8,
++                                                   (guest_output_height + 7) / 8, 1);
++          }
++
+           // Insert the release barrier.
+           PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+@@ -5652,6 +5934,153 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
+   swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+ }
+ 
++bool VulkanCommandProcessor::EnsureBackdropTexture(int kind) {
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  // Free the upload buffer once its copy has been completed.
++  if (backdrop_upload_buffer_[kind] != VK_NULL_HANDLE &&
++      submission_completed_ >= backdrop_upload_submission_[kind]) {
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
++                                           backdrop_upload_buffer_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
++                                           backdrop_upload_memory_[kind]);
++  }
++  if (backdrop_image_view_[kind] != VK_NULL_HANDLE) return true;
++  if (backdrop_load_tried_[kind]) return false;
++  backdrop_load_tried_[kind] = true;
++
++  // The port's own pictures: <exe>\resources, then beside the exe.
++  const std::filesystem::path exe_folder = rex::filesystem::GetExecutableFolder();
++  std::filesystem::path path;
++  std::ifstream file;
++  for (const std::filesystem::path& dir : {exe_folder / "resources", exe_folder}) {
++    for (const char* name : {kind ? "menu-backdrop-219.png" : "menu-backdrop-169.png",
++                             "menu-backdrop.png"}) {
++      path = dir / name;
++      file.open(path, std::ios::binary);
++      if (file.is_open()) break;
++      file.clear();  // clear() makes the stream test true again, so test is_open()
++    }
++    if (file.is_open()) break;
++  }
++  if (!file.is_open()) {
++    REXGPU_INFO("ge: no menu backdrop picture for shape {}", kind);
++    return false;
++  }
++  std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),
++                             std::istreambuf_iterator<char>());
++  int width = 0, height = 0;
++  std::vector<uint8_t> pixels = ui::DecodeImageRGBA(bytes.data(), bytes.size(), width, height);
++  if (pixels.empty() || width <= 0 || height <= 0 || width > 8192 || height > 8192) {
++    REXGPU_WARN("ge: could not read the menu backdrop picture {}", path.string());
++    return false;
++  }
++
++  VkImageCreateInfo image_create_info = {};
++  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++  image_create_info.imageType = VK_IMAGE_TYPE_2D;
++  image_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++  image_create_info.extent = {uint32_t(width), uint32_t(height), 1};
++  image_create_info.mipLevels = 1;
++  image_create_info.arrayLayers = 1;
++  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
++          backdrop_image_[kind], backdrop_image_memory_[kind])) {
++    REXGPU_WARN("ge: menu backdrop image could not be created");
++    return false;
++  }
++  const VkDeviceSize upload_size = VkDeviceSize(width) * VkDeviceSize(height) * 4;
++  uint32_t upload_memory_type = 0;
++  VkDeviceSize upload_memory_size = 0;
++  void* mapping = nullptr;
++  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++          vulkan_device, upload_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++          ui::vulkan::util::MemoryPurpose::kUpload, backdrop_upload_buffer_[kind],
++          backdrop_upload_memory_[kind], &upload_memory_type, &upload_memory_size) ||
++      dfn.vkMapMemory(device, backdrop_upload_memory_[kind], 0, VK_WHOLE_SIZE, 0, &mapping) !=
++          VK_SUCCESS) {
++    REXGPU_WARN("ge: menu backdrop upload buffer could not be created");
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
++                                           backdrop_upload_buffer_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
++                                           backdrop_upload_memory_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, backdrop_image_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
++                                           backdrop_image_memory_[kind]);
++    return false;
++  }
++  std::memcpy(mapping, pixels.data(), size_t(upload_size));
++  ui::vulkan::util::FlushMappedMemoryRange(vulkan_device, backdrop_upload_memory_[kind],
++                                           upload_memory_type, 0, upload_memory_size);
++  dfn.vkUnmapMemory(device, backdrop_upload_memory_[kind]);
++
++  VkImageViewCreateInfo view_create_info = {};
++  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++  view_create_info.image = backdrop_image_[kind];
++  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++  view_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++  view_create_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
++                                 VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
++  view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
++  if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &backdrop_image_view_[kind]) !=
++      VK_SUCCESS) {
++    REXGPU_WARN("ge: menu backdrop image view could not be created");
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, backdrop_image_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
++                                           backdrop_image_memory_[kind]);
++    return false;
++  }
++
++  // Record the upload into this submission (the swap has it open).
++  const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
++  PushImageMemoryBarrier(backdrop_image_[kind], range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
++                         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++  SubmitBarriers(true);
++  VkBufferImageCopy region = {};
++  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++  region.imageSubresource.layerCount = 1;
++  region.imageExtent = {uint32_t(width), uint32_t(height), 1};
++  deferred_command_buffer_.CmdVkCopyBufferToImage(backdrop_upload_buffer_[kind],
++                                                  backdrop_image_[kind],
++                                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++  PushImageMemoryBarrier(backdrop_image_[kind], range, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                         VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++  SubmitBarriers(true);
++  backdrop_upload_submission_[kind] = GetCurrentSubmission();
++  backdrop_width_[kind] = uint32_t(width);
++  backdrop_height_[kind] = uint32_t(height);
++  REXGPU_INFO("ge: menu backdrop picture {} ({}x{}, Vulkan)", path.string(), width, height);
++  // The game now paints the key colour (not plain desk brown) behind the folder.
++  rex::cvar::SetFlagByName("ge_backdrop_ready", "true");
++  return true;
++}
++
++void VulkanCommandProcessor::DestroyBackdrop() {
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  for (int kind = 0; kind < 2; ++kind) {
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
++                                           backdrop_image_view_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, backdrop_image_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
++                                           backdrop_image_memory_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
++                                           backdrop_upload_buffer_[kind]);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
++                                           backdrop_upload_memory_[kind]);
++  }
++}
++
+ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
+                                                 bool primitive_polygonal,
+                                                 reg::RB_DEPTHCONTROL normalized_depth_control) {
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
 index 984b97d..146daaf 100644
 --- a/src/kernel/CMakeLists.txt
@@ -5715,6 +6310,32 @@ index 306118e..71d9d02 100644
    // Even if presentation has failed, work might have been enqueued anyway
    // internally before the failure according to Jesse Natalie from the DirectX
    // Discord server.
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..319674e 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <cfloat>
+ #include <cstring>
+ #include <filesystem>
+@@ -439,7 +440,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   if (!dialogs_.empty()) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+-    if (presenter_) {
++    // ge: only for dialogs that need it (passive overlays repaint with the
++    // game's own frames).
++    const bool continuous =
++        std::any_of(dialogs_.begin(), dialogs_.end(),
++                    [](const ImGuiDialog* d) { return d->WantsContinuousRedraw(); });
++    if (presenter_ && continuous) {
+       presenter_->RequestUIPaintFromUIThread();
+     }
+   }
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
 index 7360ed9..074bc86 100644
 --- a/src/ui/presenter.cpp

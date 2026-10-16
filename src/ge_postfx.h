@@ -28,6 +28,8 @@ class PostFxOverlay : public rex::ui::ImGuiDialog {
  public:
   explicit PostFxOverlay(rex::ui::ImGuiDrawer* drawer);
   ~PostFxOverlay();
+  // Passive: drawn with each game frame, no repaints of its own.
+  bool WantsContinuousRedraw() const override { return false; }
 
  protected:
   void OnDraw(ImGuiIO& io) override;
@@ -42,6 +44,8 @@ class BackdropBars : public rex::ui::ImGuiDialog {
  public:
   explicit BackdropBars(rex::ui::ImGuiDrawer* drawer);
   ~BackdropBars();
+  // Passive, except while "STARTING MATCH" shows (the game draws no frames then).
+  bool WantsContinuousRedraw() const override;
 
  protected:
   void OnDraw(ImGuiIO& io) override;
