@@ -318,12 +318,13 @@ name = "ge_inject_keyboard"
 registers = ["r11"]
 after_instruction = true
 # Hidden debug menu enable (TCRF: byte 0x82189F2B 0x0F->0x00). Replace the dead
-# `beq` at 0x82189F2C with a live gate so LB toggles the debug menu when the
-# ge_debug_menu cvar is on; off = original retail behaviour. See ge_hooks.cpp.
+# `beq` at 0x82189F2C with a live gate so ge_debug_menu_key (default F9) toggles
+# the debug menu when the ge_debug_menu cvar is on; off = original retail
+# behaviour. See ge_hooks.cpp.
 [[midasm_hook]]
 address = 0x82189F2C
 name = "ge_debug_gate"
-registers = ["r30"]
+registers = ["r30", "r31"]
 after_instruction = false
 jump_address_on_true = 0x82189F4C
 jump_address_on_false = 0x82189F30

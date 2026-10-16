@@ -733,13 +733,33 @@ bool ge_hook_830E0630(PPCRegister& r30) {
 // taken when LB is UP and the handler runs only when LB is PRESSED == LB toggles
 // the debug menu. The recomp runs generated code (can't patch the byte), so we
 // replace the branch decision here and read it live from a cvar (no restart).
-//   debug ON : take branch (skip handler) iff LB up  -> handler fires on LB
+// LB is Precise Aim (right mouse button) on PC, so the toggle is a keyboard key
+// instead (ge_debug_menu_key, default F9; any key name the key bindings take).
+//   debug ON : take branch (skip handler) unless the key was just pressed
+//              (checked on the first pad's pass, r31 == 0)
 //   debug OFF: never take branch                     -> identical to retail
 // Hooked at 0x82189F2C with jump_on_true=0x82189F4C, jump_on_false=0x82189F30.
 REXCVAR_DEFINE_BOOL(ge_debug_menu, false, "Input",
-                    "Enable the hidden debug menu (press LB in-game to toggle it)");
-bool ge_debug_gate(PPCRegister& r30) {
-  return REXCVAR_GET(ge_debug_menu) && ((r30.u32 & 0x100u) == 0u);
+                    "Enable the hidden debug menu (toggled in-game with ge_debug_menu_key)");
+REXCVAR_DEFINE_STRING(ge_debug_menu_key, "F9", "Input",
+                      "Key that toggles the hidden debug menu when ge_debug_menu is on");
+bool ge_debug_gate(PPCRegister& r30, PPCRegister& r31) {
+  (void)r30;
+  if (!REXCVAR_GET(ge_debug_menu)) return false;
+  if (r31.u32 != 0u) return true;
+  static bool was_down = false;
+  bool down = false;
+  if (HWND fg = GetForegroundWindow()) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    const rex::ui::VirtualKey vk =
+        rex::ui::ParseVirtualKey(rex::cvar::GetFlagByName("ge_debug_menu_key"));
+    down = pid == GetCurrentProcessId() && vk != rex::ui::VirtualKey::kNone &&
+           (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+  }
+  const bool pressed = down && !was_down;
+  was_down = down;
+  return !pressed;
 }
 
 // F2  sub_820F7968: r26 0..8 loop. sub_820F7968 = prologue only (codegen sets
@@ -3256,6 +3276,18 @@ static void ge_keyboard_buttons(uint8_t* base) {
   if (ge_key_down("ge_key_dright")) add |= BTN_DPAD_RIGHT;
   if (ge_key_down("ge_key_start")) add |= BTN_START;
   if (ge_key_down("ge_key_back")) add |= BTN_BACK;
+  // While the hidden debug menu is up (byte 0x82F0CB98, set by its F9 toggle
+  // sub_82091FA0): Enter selects like E (instead of Start), Backspace backs out
+  // like Escape, and the Up/Down arrows move like W/S (below).
+  const bool debug_menu = base[0x82F0CB98u] != 0;
+  if (debug_menu) {
+    if (GetAsyncKeyState(VK_RETURN) & 0x8000) {
+      add |= BTN_A;
+      if (!(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) add &= static_cast<uint16_t>(~BTN_START);
+    }
+    // Exactly what Escape does here: B on the front end, Start in a mission.
+    if (GetAsyncKeyState(VK_BACK) & 0x8000) add |= g_menu_back_keys ? BTN_B : BTN_START;
+  }
   if (add) ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | add);
 
   if (ge_key_down("ge_key_lt")) base[GE_PAD0 + 2] = 0xFF;
@@ -3266,6 +3298,8 @@ static void ge_keyboard_buttons(uint8_t* base) {
   if (ge_key_down("ge_key_mv_right")) lx = 32767;
   if (ge_key_down("ge_key_mv_up")) ly = 32767;
   if (ge_key_down("ge_key_mv_down")) ly = -32767;
+  if (debug_menu && (GetAsyncKeyState(VK_UP) & 0x8000)) ly = 32767;
+  if (debug_menu && (GetAsyncKeyState(VK_DOWN) & 0x8000)) ly = -32767;
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 

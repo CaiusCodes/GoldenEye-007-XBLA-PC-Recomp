@@ -633,7 +633,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       ImGui::TextColored(ImColor(kTitle), "DEBUG");
       ImGui::Spacing();
       // Hidden debug menu (TCRF). Live: the enable gate reads this cvar each
-      // frame, so no restart -- toggle here, then press LB in-game to open it.
+      // frame, so no restart -- toggle here, then press ge_debug_menu_key (F9) in-game.
       bool dbg = GetCvarB("ge_debug_menu");
       if (ImGui::Checkbox("Debug Menu", &dbg)) {
         SetCvarB("ge_debug_menu", dbg);

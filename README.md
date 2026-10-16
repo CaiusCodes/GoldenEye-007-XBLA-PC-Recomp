@@ -191,7 +191,8 @@ New-Item -ItemType Junction -Path "out\build\win-amd64-release\assets" -Target g
 ReXGlue's developer hotkeys (F3 debug overlay, backtick console, F4 settings
 overlay, F7 achievements overlay) are off. Set `developer_hotkeys = true` in
 `ge.toml` to bring them back; `ge_debug_menu = true` enables the game's hidden
-debug menu (press LB in a mission).
+debug menu (press F9 in a mission, or set another key with `ge_debug_menu_key`,
+for example `ge_debug_menu_key = "F10"`).
 
 `.\tools\Make-Release.ps1` (or `Make Release.bat`) builds the release ZIP,
 `out\release\GoldenEye-007-XBLA-PC-Recomp-v<version>.zip`. It holds one
