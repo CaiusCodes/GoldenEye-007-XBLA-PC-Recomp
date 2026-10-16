@@ -79,7 +79,7 @@ Help & Options on the main menu holds the PC settings:
   Keyboard & Mouse   mouse look, sensitivity, precise aim sensitivity,
                      invert look, key bindings
   Video Settings     windowed or fullscreen, window size (up to 3840x2160),
-                     V-Sync, frame limit, field of view, anti-aliasing,
+                     V-Sync, FPS counter, field of view, anti-aliasing,
                      texture filtering, post-processing
   Online Settings    player name and the online server options
 

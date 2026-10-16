@@ -3,8 +3,7 @@
 A native Windows PC version of **GoldenEye 007** based on the unreleased
 Xbox 360/XBLA remaster, created through static recompilation with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs at up to 4K with
-16:9 and 21:9 widescreen, 60 FPS by default with a higher frame limit
-available and switches between the original and enhanced graphics at the
+16:9 and 21:9 widescreen at a steady 60 FPS and switches between the original and enhanced graphics at the
 press of a key. Keyboard and mouse, Xbox controllers and online multiplayer
 through LAN and virtual LAN services are all supported.
 
@@ -63,8 +62,8 @@ neither setup nor the game contacts Xbox Live.
 - **Widescreen**: 16:9 and 21:9 (Screen Ratio in the game's options), with a
   desk backdrop around the menus on wide screens
   ![GoldenEye 007 running in 21:9 widescreen](docs/screenshots/gameplay-ultrawide.jpg)
-- **60 FPS by default**, with V-Sync and a frame limit of 30 to 240 FPS or
-  uncapped
+- **Steady 60 FPS** (the game's own rate), with tear-free V-Sync and an
+  optional FPS / frame-time counter
 - **Original and enhanced graphics**: switch between the two at any time (F,
   or RB on a controller)
 - **Keyboard and mouse**: mouse look, rebindable keys, mouse sensitivity,
@@ -76,7 +75,7 @@ neither setup nor the game contacts Xbox Live.
   Tailscale and Hamachi
   ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
-  (display mode, window size, V-Sync, frame limit, field of view,
+  (display mode, window size, V-Sync, FPS counter, field of view,
   anti-aliasing, texture filtering, post-processing filter) and Online
   Settings
   ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)

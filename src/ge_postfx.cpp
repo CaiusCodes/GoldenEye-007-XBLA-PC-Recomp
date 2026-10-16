@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -54,6 +55,9 @@ REXCVAR_DEFINE_DOUBLE(postfx_gamma, 1.0, "PostFX", "Gamma (1=none)").range(0.3, 
 // width:height, so it places the menu desk picture the same way as below.
 REXCVAR_DEFINE_DOUBLE(ge_backdrop_window_aspect, 0.0, "Transient",
                       "Window width:height, for placing the menu desk picture");
+
+REXCVAR_DEFINE_BOOL(ge_show_fps, false, "Video",
+                    "Show the game's frame rate in the top-left corner");
 
 namespace ge {
 
@@ -184,10 +188,28 @@ void PostFxOverlay::OnDraw(ImGuiIO& io) {
   ImGui::PopStyleVar();
 }
 
+// Smooth font for the FPS counter (the SDK's own is a small pixel font).
+static ImFont* g_overlay_font = nullptr;
+
+void AddOverlayFont(ImFontAtlas* atlas) {
+  if (!atlas) return;
+  static const ImWchar kRanges[] = {0x0020, 0x007E, 0};
+  ImFontConfig config;
+  config.OversampleH = config.OversampleV = 2;
+  for (const char* path : {"C:\\Windows\\Fonts\\segoeuib.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"}) {
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+    g_overlay_font = atlas->AddFontFromFileTTF(path, 48.0f, &config, kRanges);
+    if (g_overlay_font) return;
+  }
+}
+
 BackdropBars::BackdropBars(rex::ui::ImGuiDrawer* drawer) : rex::ui::ImGuiDialog(drawer) {}
 BackdropBars::~BackdropBars() = default;
 
 bool MatchStarting();  // ge_hooks.cpp: the lobby's match is loading
+uint32_t GuestPresentCount();  // ge_hooks.cpp: frames the game has presented
+void GuestFrameTimes(double window_ms, std::vector<double>& out);  // ge_hooks.cpp
+bool CenterDotVisible();  // ge_hooks.cpp: Show Crosshair is on and Bond is in control
 
 namespace {
 // "STARTING MATCH" across the middle of the screen while a multiplayer match
@@ -205,12 +227,56 @@ void DrawMatchStarting(float W, float H) {
   dl->AddRectFilled(ImVec2(0, y0), ImVec2(W, y0 + band), IM_COL32(0, 0, 0, 200));
   dl->AddText(font, size, ImVec2((W - ts.x) * 0.5f, (H - ts.y) * 0.5f), IM_COL32(236, 222, 180, 255), text);
 }
+
+// Show FPS: the game's own frames per second (guest presents, not the window's
+// repaints) over the last second, in the top-right corner, refreshed twice a
+// second. (vblank_timing_log in ge.toml logs the detailed frame times.)
+void DrawFps(float W, float H) {
+  static uint64_t last_ms = 0;
+  static char line[32] = "";
+  if (!REXCVAR_GET(ge_show_fps)) {
+    last_ms = 0;
+    return;
+  }
+  const uint64_t now = GetTickCount64();
+  if (!last_ms || now - last_ms >= 500) {
+    last_ms = now;
+    std::vector<double> ms;
+    ge::GuestFrameTimes(1000.0, ms);
+    double sum = 0.0;
+    for (double v : ms) sum += v;
+    const double mean = ms.empty() ? 0.0 : sum / double(ms.size());
+    std::snprintf(line, sizeof(line), "%.0f FPS", mean > 0.0 ? 1000.0 / mean : 0.0);
+  }
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  ImFont* font = g_overlay_font ? g_overlay_font : ImGui::GetFont();
+  const float size = std::max(16.0f, H * 0.03f);
+  const float margin = size * 0.6f;
+  const float shadow = std::max(1.0f, size * 0.06f);
+  const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, line);
+  const ImVec2 pos(W - ts.x - margin, margin * 0.6f);
+  dl->AddText(font, size, ImVec2(pos.x + shadow, pos.y + shadow), IM_COL32(0, 0, 0, 200), line);
+  dl->AddText(font, size, pos, IM_COL32(236, 222, 180, 255), line);
+}
+
+// Show Crosshair: a small white dot at the centre of the picture (where shots
+// go when not aiming), with a faint dark edge so it shows on snow and sky.
+void DrawCenterDot(float W, float H) {
+  if (!ge::CenterDotVisible()) return;
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const ImVec2 c(std::floor(W * 0.5f) + 0.5f, std::floor(H * 0.5f) + 0.5f);
+  const float r = std::max(2.0f, H * 0.0025f);
+  dl->AddCircleFilled(c, r + 1.0f, IM_COL32(0, 0, 0, 110), 16);
+  dl->AddCircleFilled(c, r, IM_COL32(255, 255, 255, 235), 16);
+}
 }  // namespace
 
 void BackdropBars::OnDraw(ImGuiIO& io) {
   const float W = io.DisplaySize.x, H = io.DisplaySize.y;
   if (W <= 0.0f || H <= 0.0f) return;
   DrawMatchStarting(W, H);
+  DrawFps(W, H);
+  DrawCenterDot(W, H);
   const float window = W / H;
   if (std::fabs(window - reported_aspect_) > 0.0005f) {
     reported_aspect_ = window;
@@ -239,12 +305,12 @@ void BackdropBars::OnDraw(ImGuiIO& io) {
       for (const char* name : {k ? "menu-backdrop-219.png" : "menu-backdrop-169.png",
                                "menu-backdrop.png"}) {
         file.open(folder / name, std::ios::binary);
-        if (file) break;
-        file.clear();
+        if (file.is_open()) break;
+        file.clear();  // clear() makes the stream test true again, so test is_open()
       }
-      if (file) break;
+      if (file.is_open()) break;
     }
-    if (!file) return false;
+    if (!file.is_open()) return false;
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),
                                std::istreambuf_iterator<char>());
     int w = 0, h = 0;

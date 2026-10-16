@@ -381,35 +381,6 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
         if (callbacks_.persist_config) callbacks_.persist_config();
       }
 
-      // --- Frame limit. NOTE: GoldenEye renders internally at 60Hz, so values
-      //     above 60 are clamped to 60 by the vblank worker (driving it faster
-      //     floods the guest interrupt and freezes the picture). Listed anyway
-      //     per request; >60 simply stays 60. ---
-      static const struct { const char* label; const char* value; } kFps[] = {
-          {"30 FPS", "30"},   {"60 FPS", "60"},   {"90 FPS", "90"},
-          {"120 FPS", "120"}, {"144 FPS", "144"}, {"165 FPS", "165"},
-          {"180 FPS", "180"}, {"240 FPS", "240"}, {"300 FPS", "300"},
-          {"Uncapped", "0"}};
-      const std::string cur_fps = rex::cvar::GetFlagByName("max_fps");
-      int fps_idx = 0;
-      for (int i = 0; i < IM_ARRAYSIZE(kFps); ++i)
-        if (cur_fps == kFps[i].value) fps_idx = i;
-      ImGui::BeginDisabled(vsync);
-      ImGui::SetNextWindowSizeConstraints(
-          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
-      if (ImGui::BeginCombo("Frame Limit", vsync ? "V-Synced" : kFps[fps_idx].label)) {
-        for (int i = 0; i < IM_ARRAYSIZE(kFps); ++i) {
-          bool sel = (i == fps_idx);
-          if (ImGui::Selectable(kFps[i].label, sel)) {
-            rex::cvar::SetFlagByName("max_fps", kFps[i].value);
-            if (callbacks_.persist_config) callbacks_.persist_config();
-          }
-          if (sel) ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-      }
-      ImGui::EndDisabled();
-
       // --- GPU throttle. Pauses the emulated GPU command worker after each ring
       //     drain so it can't outrun the render thread -- the cause of the
       //     intermittent picture freeze. Higher = fewer freezes but more input

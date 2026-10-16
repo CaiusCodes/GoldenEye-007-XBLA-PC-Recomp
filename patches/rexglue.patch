@@ -1271,15 +1271,15 @@ index 19874a5..3510be5 100644
 +                             "menu-backdrop.png"}) {
 +      path = dir / name;
 +      file.open(path, std::ios::binary);
-+      if (file) break;
-+      file.clear();
++      if (file.is_open()) break;
++      file.clear();  // clear() makes the stream test true again, so test is_open()
 +    }
-+    if (file) {
++    if (file.is_open()) {
 +      folder = dir;
 +      break;
 +    }
 +  }
-+  if (!file) {
++  if (!file.is_open()) {
 +    REXGPU_INFO("ge: no menu backdrop picture for shape {} in {}", kind, folder.string());
 +    return false;
 +  }
@@ -1372,10 +1372,18 @@ index 19874a5..3510be5 100644
    return IssueCopy_ReadbackResolvePath();
  }
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..592c3c3 100644
+index 8f2fcb0..95579a8 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
-@@ -20,6 +20,7 @@
+@@ -12,6 +12,7 @@
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cctype>
+ #include <cstdint>
+ #include <functional>
+@@ -20,6 +21,7 @@
  #include <utility>
  
  #include <rex/cvar.h>
@@ -1383,8 +1391,20 @@ index 8f2fcb0..592c3c3 100644
  #include <rex/graphics/command_processor.h>
  #include <rex/graphics/flags.h>
  #include <rex/kernel/xboxkrnl/video.h>
-@@ -33,12 +34,16 @@
+@@ -31,14 +33,32 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
  
++#if REX_PLATFORM_WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
  REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
      .allowed({"none", "fxaa", "fxaa_extreme"})
 -    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -1394,57 +1414,122 @@ index 8f2fcb0..592c3c3 100644
                      "Store shaders persistently and load them when loading games to avoid "
                      "runtime spikes and freezes when playing the game not for the first time.");
  
++REXCVAR_DEFINE_BOOL(vblank_timing_log, false, "GPU",
++                    "Log the guest vblank timer's interval jitter every 10 seconds");
++
 +REXCVAR_DEFINE_INT32(max_fps, 60, "GPU",
-+                     "Frame rate cap in Hz when vsync is off (0 = uncapped)")
++                     "Unused by GoldenEye (it always runs at its own 60 FPS); kept so old "
++                     "configs still load")
 +    .range(0, 1000);
 +
  namespace {
  
  rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
-@@ -159,12 +164,39 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
-         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+@@ -156,18 +176,98 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+         uint64_t vsync_interval_ticks =
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+-        uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
          uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // ge: the vblank is the game's clock, so it must tick evenly. Sleeping
++        // 1 ms per loop (the old way) fired it up to ~1-2 ms late, so frames
++        // landed 16/17/18 ms apart (judder). Now: sleep on a high-resolution
++        // timer until just before the deadline, then yield-spin to it.
++#if REX_PLATFORM_WIN32
++        HANDLE wait_timer = CreateWaitableTimerExW(nullptr, nullptr,
++                                                   0x00000002 /* HIGH_RESOLUTION */,
++                                                   TIMER_ALL_ACCESS);
++        if (!wait_timer) {
++          wait_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
++        }
++#endif
++        const uint64_t spin_ticks = guest_tick_frequency / 1000;  // last ~1 ms
++        // vblank_timing_log: interval stats in microseconds.
++        uint64_t log_start = last_frame_time, stat_count = 0;
++        double stat_sum = 0.0, stat_sq = 0.0, stat_min = 1e9, stat_max = 0.0;
++        uint64_t prev_fire = 0;
          while (vsync_worker_running_) {
-+          // Live anti-aliasing: re-apply swap_post_effect each tick so the menu
-+          // toggle takes effect without a restart. SetDesiredSwapPostEffect
-+          // early-returns when unchanged, so this is cheap.
-+          if (command_processor_) {
-+            command_processor_->SetDesiredSwapPostEffect(
-+                ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
-+          }
            uint64_t current_time = chrono::Clock::QueryGuestTickCount();
 -          uint64_t interval_ticks =
 -              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
 -          while (current_time - last_frame_time >= interval_ticks) {
-+          // vsync on  -> lock to the guest video mode refresh rate.
-+          // vsync off -> honor max_fps (Hz), or run uncapped (~1kHz tick) at 0.
-+          uint64_t interval_ticks;
-+          if (REXCVAR_GET(vsync)) {
-+            interval_ticks = vsync_interval_ticks;
-+          } else {
-+            int32_t fps_cap = REXCVAR_GET(max_fps);
-+            interval_ticks =
-+                (fps_cap > 0)
-+                    ? std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / double(fps_cap)))
-+                    : no_vsync_interval_ticks;
-+            // Never drive the guest vblank FASTER than its native refresh. The
-+            // vblank ISR is the game's clock; over-driving it (a high cap or
-+            // "uncapped") floods the interrupt and freezes the guest. So the cap
-+            // can only ever slow the vblank down, never speed it up.
-+            interval_ticks = std::max(interval_ticks, vsync_interval_ticks);
-+          }
++          // ge: the vblank always runs at the guest video mode's own rate
++          // (60 Hz). It is the game's clock: faster still gave 60 fps (tested
++          // 2026-10-16) and slower (a 30 cap) slowed the game itself down, so
++          // max_fps is no longer applied. vsync only decides how the presenter
++          // shows frames.
++          const uint64_t interval_ticks = vsync_interval_ticks;
 +          // Fire at most one vblank per wake; drop the backlog if starved (avoids
 +          // burst-flooding the guest vblank ISR after an off-core stall).
 +          if (current_time - last_frame_time >= interval_ticks) {
              MarkVblank();
++            // Live anti-aliasing: re-apply swap_post_effect each vblank so the
++            // menu toggle takes effect without a restart. SetDesiredSwapPostEffect
++            // early-returns when unchanged, so this is cheap.
++            if (command_processor_) {
++              command_processor_->SetDesiredSwapPostEffect(
++                  ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
++            }
              last_frame_time += interval_ticks;
 +            if (current_time - last_frame_time >= interval_ticks) {
 +              last_frame_time = current_time;
 +            }
++            if (REXCVAR_GET(vblank_timing_log)) {
++              if (prev_fire) {
++                const double us = double(current_time - prev_fire) * 1e6 /
++                                  double(guest_tick_frequency);
++                ++stat_count;
++                stat_sum += us;
++                stat_sq += us * us;
++                stat_min = std::min(stat_min, us);
++                stat_max = std::max(stat_max, us);
++              }
++              prev_fire = current_time;
++              if (current_time - log_start >= guest_tick_frequency * 10 && stat_count) {
++                const double mean = stat_sum / double(stat_count);
++                const double sd = std::sqrt(std::max(0.0, stat_sq / double(stat_count) - mean * mean));
++                REXGPU_INFO("ge vblank: {} ticks, interval mean {:.3f} ms sd {:.3f} min {:.3f} max {:.3f}",
++                            stat_count, mean / 1000.0, sd / 1000.0, stat_min / 1000.0,
++                            stat_max / 1000.0);
++                log_start = current_time;
++                stat_count = 0;
++                stat_sum = stat_sq = 0.0;
++                stat_min = 1e9;
++                stat_max = 0.0;
++              }
++            } else {
++              prev_fire = 0;
++            }
++            continue;
++          }
++          // Wait for the next deadline: coarse sleep, then yield-spin the rest.
++          // Never wait longer than 4 ms per pass so cvar changes apply quickly.
++          const uint64_t remaining = interval_ticks - (current_time - last_frame_time);
++          if (remaining > spin_ticks) {
++            const uint64_t sleep_ticks = std::min(remaining - spin_ticks, spin_ticks * 4);
++#if REX_PLATFORM_WIN32
++            if (wait_timer) {
++              LARGE_INTEGER due;
++              due.QuadPart = -int64_t(sleep_ticks * 10000000ull / guest_tick_frequency);
++              if (due.QuadPart < 0 && SetWaitableTimer(wait_timer, &due, 0, nullptr, nullptr, FALSE)) {
++                WaitForSingleObject(wait_timer, INFINITE);
++                continue;
++              }
++            }
++#endif
++            rex::thread::Sleep(std::chrono::microseconds(sleep_ticks * 1000000ull / guest_tick_frequency));
++          } else {
++            rex::thread::MaybeYield();
            }
-           rex::thread::Sleep(std::chrono::milliseconds(1));
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
          }
-@@ -312,8 +344,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
++#if REX_PLATFORM_WIN32
++        if (wait_timer) CloseHandle(wait_timer);
++#endif
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+@@ -312,8 +412,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
    //          interrupt_callback_, source, cpu);
  
    uint64_t args[] = {source, interrupt_callback_data_};
@@ -5558,6 +5643,63 @@ index 2d13ac8..c06d0b7 100644
  }
  
  bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..71d9d02 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -1155,9 +1155,51 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
++  // ge: V-Sync on drops ALLOW_TEARING, so the flip model shows the newest frame
++  // at the display's next refresh (no tearing) without blocking this thread
++  // (sync interval 1 blocked the UI thread: ~40 fps and input lag). Off keeps
++  // the immediate, tearing present. The cvar lives in the GPU plugin, so read
++  // it by name.
++  const bool vsync = rex::cvar::GetFlagByName("vsync") == "true";
+   HRESULT present_result = paint_context_.swap_chain->Present(
+       0, DXGI_PRESENT_RESTART |
+-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++             (!vsync && paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++  // ge: vblank_timing_log also logs the host present rate and its spacing
++  // (what reaches the screen), every 10 seconds.
++  {
++    static LARGE_INTEGER freq{}, start{}, prev{};
++    static uint64_t count = 0;
++    static double sum = 0.0, sq = 0.0, mx = 0.0;
++    static uint32_t poll = 0;
++    static bool enabled = false;
++    if ((poll++ & 0x3F) == 0) enabled = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
++    if (enabled) {
++      LARGE_INTEGER now;
++      QueryPerformanceCounter(&now);
++      if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
++      if (prev.QuadPart) {
++        const double ms = double(now.QuadPart - prev.QuadPart) * 1000.0 / double(freq.QuadPart);
++        ++count;
++        sum += ms;
++        sq += ms * ms;
++        mx = std::max(mx, ms);
++      } else {
++        start = now;
++      }
++      prev = now;
++      if (double(now.QuadPart - start.QuadPart) >= 10.0 * double(freq.QuadPart) && count) {
++        const double mean = sum / double(count);
++        REXLOG_INFO("ge present: {} presents ({:.1f}/s), interval mean {:.3f} ms sd {:.3f} max {:.3f}, vsync {}",
++                    count, double(count) * double(freq.QuadPart) / double(now.QuadPart - start.QuadPart),
++                    mean, std::sqrt(std::max(0.0, sq / double(count) - mean * mean)), mx, vsync);
++        start = now;
++        count = 0;
++        sum = sq = mx = 0.0;
++      }
++    } else {
++      prev.QuadPart = 0;
++    }
++  }
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
 index 7360ed9..074bc86 100644
 --- a/src/ui/presenter.cpp
@@ -5875,6 +6017,29 @@ index b94fe9e..85a75be 100644
 +}
 +
  }  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..f5dc42e 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1381,7 +1381,17 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   // interfering with GPU command processing, and also to allow tearing so
+   // variable refresh rate may be used where it's available.
+   // Note: If the priorities here are changes, update the cvar descriptions.
+-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
++  // ge: V-Sync on uses mailbox (newest frame at the next refresh, no tearing,
++  // no blocking), else FIFO. Read when the swapchain is made, so a change
++  // applies on the next resize or restart.
++  const bool vsync = rex::cvar::GetFlagByName("vsync") == "true";
++  if (vsync) {
++    swapchain_create_info.presentMode =
++        std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
++                present_modes.cend()
++            ? VK_PRESENT_MODE_MAILBOX_KHR
++            : VK_PRESENT_MODE_FIFO_KHR;
++  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+           present_modes.cend()) {
+     // Allowing tearing to reduce latency, and possibly variable refresh rate
 diff --git a/src/ui/window.cpp b/src/ui/window.cpp
 index b4e045f..d850ca4 100644
 --- a/src/ui/window.cpp

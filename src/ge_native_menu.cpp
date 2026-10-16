@@ -63,6 +63,9 @@ inline uint32_t LD32(uint8_t* b, uint32_t ga) {
 inline uint16_t LD16(uint8_t* b, uint32_t ga) {
   uint16_t v; std::memcpy(&v, b + ga, 2); return __builtin_bswap16(v);
 }
+inline void ST16(uint8_t* b, uint32_t ga, uint16_t val) {
+  uint16_t v = __builtin_bswap16(val); std::memcpy(b + ga, &v, 2);
+}
 inline void ST32(uint8_t* b, uint32_t ga, uint32_t val) {
   uint32_t v = __builtin_bswap32(val); std::memcpy(b + ga, &v, 4);
 }
@@ -324,9 +327,9 @@ std::vector<Row> BuildPage(Page page) {
           },
           [] { return std::string(GetB("fullscreen") ? "Fullscreen" : "Windowed"); });
       rows.push_back(Row{RowKind::Toggle, "V-Sync:", "vsync"});
-      AddChoice(rows, "Frame Limit:", "max_fps",
-                {{"30", "30"}, {"60", "60"}, {"120", "120"}, {"144", "144"}, {"165", "165"},
-                 {"240", "240"}, {"Uncapped", "0"}});
+      // No Frame Limit row: the game always runs at its own 60 FPS (its clock
+      // is the 60 Hz vblank; a lower cap slowed the game itself down).
+      rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
       AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
       AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
                 {{"Off", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
@@ -871,6 +874,223 @@ bool ge_other_update(PPCRegister& r25) {
     ST32(base, 0x82F61014u, 1);
     ST32(base, 0x82F61018u, 7);
   }
+  return true;
+}
+
+// --- Other Settings (the game's own page): Show Crosshair -------------------
+// The game draws rows 0-1 (volume sliders) and rows 2-7 in a loop (sub_820FE1B8
+// from 0x820FE53C): y = 122 + 23 * row, label/value texts from the row table.
+// We draw rows 2-7 instead so a "Show Crosshair" row (white dot at the centre
+// of the screen when not aiming, ge_center_dot) sits third, the game's rows 2-6
+// move down one place and row 7 (Screen Ratio, set from the window shape) is
+// gone. The hovered row (0x8272C4FC) is a screen position; ge_other_row_select
+// maps it back to the game's row when one is chosen.
+REXCVAR_DEFINE_BOOL(ge_center_dot, false, "Controls",
+                    "Show a white dot at the centre of the screen when not aiming");
+namespace {
+constexpr uint32_t kOtherText = 0x8272C500;   // 16 bytes a row: label id, value ids
+constexpr uint32_t kOtherPos = 0x8272C580;    // label x, value x, first y, row spacing
+constexpr uint32_t kOtherHover = 0x8272C4FC;  // hovered row (screen position)
+constexpr int kCenterDotRow = 2;              // screen position of Show Crosshair
+
+// The game's value for its row 2..6 (the getters its own draw calls).
+uint32_t OtherRowValue(PPCContext& ctx, uint8_t* base, int row) {
+  ctx.r3.u64 = LD32(base, 0x82F61070u);
+  sub_820CA240(ctx, base);  // -> profile
+  const uint64_t profile = ctx.r3.u64;
+  ctx.r3.u64 = profile;
+  switch (row) {
+    case 2: sub_820C2E88(ctx, base); break;
+    case 3: sub_820C2F20(ctx, base); break;
+    case 4: sub_820C2FB8(ctx, base); break;
+    case 5: sub_820C3050(ctx, base); break;
+    case 6: ctx.r3.u64 = 0xFFFFFFFFu; sub_820C30E8(ctx, base); break;
+    default: return 0;
+  }
+  return ctx.r3.u32;
+}
+}  // namespace
+
+void ge_other_rows_draw() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (!EnsureGuestBlocks(base)) return;
+  const PPCContext saved = *ctx;
+  {
+    GuestFrame frame(*ctx);
+    const uint32_t sp = frame.sp;
+    const float label_x = LDF32(base, kOtherPos);
+    const float value_x = LDF32(base, kOtherPos + 4);
+    const float y0 = LDF32(base, kOtherPos + 8);
+    const float step = LDF32(base, kOtherPos + 12);
+    const int hover = static_cast<int32_t>(LD32(base, kOtherHover));
+    SetCustomText(base, kTxtFirstDynamic + 122, "Show Crosshair:");
+    for (int pos = 2; pos <= 7; ++pos) {
+      const float y = y0 + step * static_cast<float>(pos);
+      uint32_t label_id, value_id;
+      if (pos == kCenterDotRow) {
+        label_id = kTxtFirstDynamic + 122;
+        // The ON/OFF texts of the game's own toggle rows.
+        value_id = LD32(base, kOtherText + 2 * 16 + 4 + (REXCVAR_GET(ge_center_dot) ? 4 : 0));
+      } else {
+        const int row = pos - 1;  // the game's row shown here
+        const uint32_t entry = kOtherText + static_cast<uint32_t>(row) * 16u;
+        const uint32_t value = std::min<uint32_t>(OtherRowValue(*ctx, base, row), 2u);
+        label_id = LD32(base, entry);
+        value_id = LD32(base, entry + 4 + value * 4);
+      }
+      const uint32_t label = LookupText(*ctx, base, label_id);
+      if (pos == hover) {
+        int w = 0, h = 0;
+        MeasureText(*ctx, base, sp, label, w, h);
+        const float pad = LDF32(base, kHighlightPad);
+        DrawBox(*ctx, base, 50, label_x - pad, y - pad, label_x - pad + w + 4, y - pad + h + 4);
+      }
+      DrawText(*ctx, base, sp, label, label_x, y, 255);
+      DrawText(*ctx, base, sp, LookupText(*ctx, base, value_id), value_x, y, 255);
+    }
+  }
+  *ctx = saved;
+}
+
+// A row was chosen (r11 = hovered screen position): Show Crosshair toggles
+// here; the game's rows below it are passed on as their own row numbers.
+void ge_other_row_select(PPCRegister& r11) {
+  const int pos = r11.s32;
+  if (pos == kCenterDotRow) {
+    PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+    SetS("ge_center_dot", REXCVAR_GET(ge_center_dot) ? "false" : "true");
+    const PPCContext saved = *ctx;
+    {
+      GuestFrame frame(*ctx);
+      PlaySelectSound(*ctx, base);
+    }
+    *ctx = saved;
+    r11.u64 = 0xFFFFFFFFu;  // nothing for the game to do
+  } else if (pos > kCenterDotRow && pos <= 7) {
+    r11.u64 = static_cast<uint32_t>(pos - 1);
+  }
+}
+
+// --- Watch Options tab: Show Crosshair -------------------------------------
+// The tab (draw sub_820C61A8) draws rows 1..9 (selection = draw row + 2) from a
+// table of 8-byte entries {label, value 0, value 1, value 2} (u16 text ids) at
+// 0x824245E8, shows each row's value (sub_820C5B28 getters) and passes the
+// highlighted row to sub_820C5BA0, which reads left/right/A and changes it.
+// Show Crosshair goes in as draw row 3, above Show Aim Crosshair: the game's
+// rows 3..7 move down one place (their table entries, values and input are
+// shifted by one), and rows 8/9 (Screen Letterbox, Screen Ratio) are not drawn.
+namespace {
+constexpr uint32_t kWatchOptTable = 0x824245E8;
+constexpr uint32_t kWatchTab = 0x82F1F970;
+constexpr int kWatchDotRow = 3;   // draw row of Show Crosshair (selection 5)
+constexpr int kWatchLastRow = 8;  // last draw row shown (the game's row 7)
+
+void WatchToggleSound(PPCContext& ctx, uint8_t* base) {
+  // As the game's own option change (sub_820C5BA0's tail).
+  ctx.r3.u64 = LD32(base, kSoundArg3);
+  ctx.r4.u64 = 43;
+  ctx.r5.u64 = 0;
+  ctx.r6.u64 = LD32(base, kSoundArg6);
+  ctx.r7.u64 = 0x82003D48;
+  ctx.r8.u64 = 4219;
+  sub_82144920(ctx, base);
+}
+
+// The value shown on a draw row.
+uint32_t WatchRowValue(int row, uint32_t profile, uint32_t value) {
+  if (row == kWatchDotRow) return REXCVAR_GET(ge_center_dot) ? 1u : 0u;
+  if (row < kWatchDotRow || row > kWatchLastRow) return value;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  const PPCContext saved = *ctx;
+  uint32_t v;
+  {
+    GuestFrame frame(*ctx);
+    ctx->r3.u64 = profile;
+    ctx->r4.u64 = static_cast<uint32_t>(row - 1);  // the game's row shown here
+    sub_820C5B28(*ctx, base);
+    v = ctx->r3.u32;
+  }
+  *ctx = saved;
+  return v;
+}
+}  // namespace
+
+namespace ge {
+// Called as the tab draws row 2: lay out rows 3..8 in the table (from the
+// game's own entries, saved the first time).
+void WatchCenterDotRow(uint8_t* base) {
+  static uint16_t original[10][4];
+  static bool saved = false;
+  if (!saved) {
+    for (uint32_t r = 0; r < 10; ++r)
+      for (uint32_t i = 0; i < 4; ++i)
+        original[r][i] = LD16(base, kWatchOptTable + r * 8u + i * 2u);
+    saved = true;
+  }
+  if (!SetGameText(base, 0xF0F2u, "show crosshair")) return;  // lower case = small caps
+  for (int row = kWatchDotRow; row <= kWatchLastRow; ++row) {
+    uint16_t want[4];
+    if (row == kWatchDotRow) {
+      // Camera Roll's OFF / ON texts (row 7).
+      want[0] = 0xF0F2u;
+      want[1] = original[7][1];
+      want[2] = original[7][2];
+      want[3] = 0;
+    } else {
+      for (int i = 0; i < 4; ++i) want[i] = original[row - 1][i];
+    }
+    const uint32_t entry = kWatchOptTable + static_cast<uint32_t>(row) * 8u;
+    for (uint32_t i = 0; i < 4; ++i)
+      if (LD16(base, entry + i * 2) != want[i]) ST16(base, entry + i * 2, want[i]);
+  }
+}
+}  // namespace ge
+
+// The value a draw row shows: the highlighted row at 0x820C63C4 (in r29), the
+// other rows at 0x820C67A4 (in r3); r17 = profile, r27 = draw row.
+void ge_watch_value_sel(PPCRegister& r29, PPCRegister& r27, PPCRegister& r17) {
+  r29.u64 = WatchRowValue(r27.s32, r17.u32, r29.u32);
+}
+void ge_watch_value_row(PPCRegister& r3, PPCRegister& r27, PPCRegister& r17) {
+  r3.u64 = WatchRowValue(r27.s32, r17.u32, r3.u32);
+}
+
+// Entry of sub_820C5BA0 (r4 = highlighted draw row): Show Crosshair's input is
+// handled here; the game's rows below it are passed on as their own rows.
+bool ge_watch_dot_input(PPCRegister& r4) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (LD32(base, kWatchTab) != 3u) return false;
+  if (r4.s32 > kWatchDotRow && r4.s32 <= kWatchLastRow) {
+    r4.u64 = static_cast<uint32_t>(r4.s32 - 1);
+    return false;
+  }
+  if (r4.s32 != kWatchDotRow) return false;
+  const PPCContext saved = *ctx;
+  {
+    GuestFrame frame(*ctx);
+    sub_820CA110(*ctx, base);  // the controller reading the watch
+    const uint32_t pad = ctx->r3.u32;
+    auto pressed = [&](uint32_t mask) {
+      ctx->r3.u64 = pad;
+      ctx->r4.u64 = mask;
+      sub_820A05B8(*ctx, base);
+      return ctx->r3.u32 != 0;
+    };
+    auto stick = [&](bool right) {
+      if (right) sub_820C3388(*ctx, base); else sub_820C3320(*ctx, base);
+      return ctx->r3.s32 != 0;
+    };
+    const bool on = REXCVAR_GET(ge_center_dot);
+    bool want = on;
+    if (pressed(514) || stick(false)) want = false;     // left: OFF
+    else if (pressed(257) || stick(true)) want = true;  // right: ON
+    else if (pressed(0x8000)) want = !on;               // A: toggle
+    if (want != on) {
+      SetS("ge_center_dot", want ? "true" : "false");
+      WatchToggleSound(*ctx, base);
+    }
+  }
+  *ctx = saved;
   return true;
 }
 

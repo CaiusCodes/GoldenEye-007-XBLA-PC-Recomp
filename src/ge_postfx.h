@@ -14,7 +14,13 @@
 
 #include <memory>
 
+struct ImFontAtlas;
+
 namespace ge {
+
+// Adds the smooth Windows font the FPS counter uses (from the app's
+// OnConfigureFonts); the counter falls back to the SDK font without it.
+void AddOverlayFont(ImFontAtlas* atlas);
 
 // Full-screen filter layer. Created once at startup and kept alive; it renders
 // under the pause menu (added later) but over the guest image. Non-interactive.

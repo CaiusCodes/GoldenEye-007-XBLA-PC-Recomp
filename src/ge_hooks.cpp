@@ -64,6 +64,12 @@ std::atomic<uint64_t> g_lobby_poll_ms{0};
 // When this machine's players were last marked ready to start (sub_8217D900(1):
 // once by the host's START, every lobby frame on a client), 0 = never.
 std::atomic<uint64_t> g_match_ready_ms{0};
+// Guest presents so far (the game's own frames), for the Show FPS counter.
+std::atomic<uint32_t> g_guest_presents{0};
+// Host time (QueryPerformanceCounter) of the last kPresentRing guest presents,
+// slot = present number % kPresentRing, for Show FPS frame times.
+constexpr uint32_t kPresentRing = 1024;
+std::atomic<int64_t> g_present_qpc[kPresentRing];
 }  // namespace
 void ge_match_ready(PPCRegister& r3) {
   if (r3.u32 & 0xFF) g_match_ready_ms.store(GetTickCount64(), std::memory_order_relaxed);
@@ -77,6 +83,27 @@ bool MatchStarting() {
   if (!last || !ready) return false;
   const uint64_t now = GetTickCount64();
   return now - last > 500 && now - last < 30000 && now - ready < 30000;
+}
+// Frames the game has presented since boot (Show FPS divides the change by time).
+uint32_t GuestPresentCount() { return g_guest_presents.load(std::memory_order_relaxed); }
+// Frame times (ms) of the game's frames presented in the last `window_ms`,
+// newest last. Lock-free and approximate: a slot being rewritten is skipped.
+void GuestFrameTimes(double window_ms, std::vector<double>& out) {
+  out.clear();
+  LARGE_INTEGER freq, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&now);
+  const uint32_t n = g_guest_presents.load(std::memory_order_acquire);
+  const int64_t oldest = now.QuadPart - int64_t(window_ms * double(freq.QuadPart) / 1000.0);
+  std::vector<double> rev;
+  for (uint32_t k = 1; k + 1 < kPresentRing && k < n; ++k) {
+    const int64_t t1 = g_present_qpc[(n - k) % kPresentRing].load(std::memory_order_relaxed);
+    const int64_t t0 = g_present_qpc[(n - k - 1) % kPresentRing].load(std::memory_order_relaxed);
+    if (t0 < oldest) break;
+    if (t1 <= t0) continue;
+    rev.push_back(double(t1 - t0) * 1000.0 / double(freq.QuadPart));
+  }
+  out.assign(rev.rbegin(), rev.rend());
 }
 }  // namespace ge
 namespace ge {
@@ -625,6 +652,45 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   uint32_t cpc = cpp ? cpp->counter() : 0;
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
   g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
+  {
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    const uint32_t slot = g_guest_presents.load(std::memory_order_relaxed) % kPresentRing;
+    g_present_qpc[slot].store(qpc.QuadPart, std::memory_order_relaxed);
+    g_guest_presents.fetch_add(1, std::memory_order_release);
+    // vblank_timing_log: the game's own frame times every 10 seconds.
+    static uint32_t poll = 0;
+    static bool log_on = false;
+    static int64_t log_start = 0;
+    if ((poll++ & 0x3F) == 0)
+      log_on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+    if (log_on) {
+      LARGE_INTEGER freq;
+      QueryPerformanceFrequency(&freq);
+      if (!log_start) log_start = qpc.QuadPart;
+      if (qpc.QuadPart - log_start >= 10 * freq.QuadPart) {
+        std::vector<double> ms;
+        ge::GuestFrameTimes(10000.0, ms);
+        if (!ms.empty()) {
+          double sum = 0, sq = 0, mn = 1e9, mx = 0;
+          for (double v : ms) {
+            sum += v; sq += v * v; mn = std::min(mn, v); mx = std::max(mx, v);
+          }
+          const double mean = sum / ms.size();
+          int hitches = 0;  // frames over 1.5x the average: a stutter you can feel
+          for (double v : ms)
+            if (v > mean * 1.5) ++hitches;
+          REXKRNL_INFO("ge frames: {} frames, {:.2f} fps, frame time mean {:.3f} ms sd {:.3f} "
+                       "min {:.3f} max {:.3f}, {} hitches (>1.5x mean)",
+                       ms.size(), 1000.0 / mean, mean,
+                       std::sqrt(std::max(0.0, sq / ms.size() - mean * mean)), mn, mx, hitches);
+        }
+        log_start = qpc.QuadPart;
+      }
+    } else {
+      log_start = 0;
+    }
+  }
 
   static uint32_t n = 0;                       // throttled fps heartbeat
   if ((n++ & 0x3F) == 0)
@@ -2190,27 +2256,58 @@ void ge_screen_ratio_tick(uint8_t* base) {
   REXKRNL_INFO("GERATIO window {}x{} -> screen ratio {}", rc.right, rc.bottom, kName[ratio]);
 }
 
-// Watch Options tab: Screen Letterbox and Screen Ratio (rows 10 and 11) are
-// not drawn (the row loop in sub_820C61A8 stops after row 9, 0x820C69F8) and
-// up/down wraps within rows 0..9 (sub_820C3780, 0x820C3840).
+// Watch Options tab: Show Crosshair is added as draw row 3 (selection 5) and the
+// game's rows from Show Aim Crosshair down move one place (ge_native_menu.cpp);
+// Screen Letterbox and Screen Ratio are not drawn (the row loop in sub_820C61A8,
+// checked at 0x820C69F8, stops after draw row 8) and up/down wraps within
+// selections 0..10 (sub_820C3780, 0x820C3840).
+namespace ge { void WatchCenterDotRow(uint8_t* base); }
 void ge_watch_hide_ratio_draw(PPCRegister& r27) {
-  if (r27.s32 >= 8) r27.u64 = 10;
+  if (r27.s32 == 2) {
+    uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+    ge::WatchCenterDotRow(base);
+  } else if (r27.s32 == 8) {
+    uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+    // Entering the tab from below selects 11 (Screen Ratio): use 10.
+    if (LD32(base, 0x82F1F978u) == 11u) ST32(base, 0x82F1F978u, 10u);
+  } else if (r27.s32 > 8) {
+    r27.u64 = 10;
+  }
 }
 void ge_watch_hide_ratio_nav(PPCRegister& r11) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
-  if (r11.s32 > 9) r11.u64 = 0;
-  else if (r11.s32 < 0) r11.u64 = 9;
+  if (r11.s32 > 10) r11.u64 = 0;
+  else if (r11.s32 < 0) r11.u64 = 10;
   else return;
   ST32(base, 0x82F1F978u, r11.u32);
 }
 
-// Other Settings: the Screen Ratio row (row 7) is not drawn (the row loop in
-// sub_820FE1B8 stops before it, 0x820FE748) and cannot be chosen (the update's
-// row switch at 0x820F1FC0 skips it).
-void ge_other_hide_ratio_draw(PPCRegister& r11, PPCRegister& r26) { r11.u64 = r26.u32 + 112u; }
-void ge_other_hide_ratio_update(PPCRegister& r11) {
-  if (r11.u32 == 7u) r11.u64 = 0xFFFFFFFFu;
+// Other Settings rows: see ge_other_rows_draw / ge_other_row_select in
+// ge_native_menu.cpp (Screen Ratio hidden, Show Crosshair added).
+
+// Show Crosshair (ge_center_dot): the white centre dot is drawn by the overlay
+// (ge_postfx.cpp) only while the local player is in control in a mission:
+// not on the front end, paused (watch), in a cutscene or aiming (the game draws
+// its own crosshair then).
+namespace ge {
+bool CenterDotVisible() {
+  if (rex::cvar::GetFlagByName("ge_center_dot") != "true") return false;
+  auto* ks = rex::system::kernel_state();
+  if (!ks || !ks->memory()) return false;
+  uint8_t* base = ks->memory()->virtual_membase();
+  const uint32_t stage = LD32(base, GE_CURRENT_STAGE);
+  if (stage == GE_TITLE_STAGE || stage >= 0x40u) return false;
+  if (LD32(base, GE_PAUSE_FLAG) != 0u) return false;
+  uint32_t player = 0;
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t p = LD32(base, 0x82F1FA98u + i * 4u);
+    if (p && LD32(base, p + 0x904u) == 0u) { player = p; break; }
+  }
+  if (!player) return false;
+  return LD32(base, player + GE_OFF_DISABLED) == 0u && LD32(base, player + GE_OFF_WATCH) == 0u &&
+         LD32(base, player + GE_OFF_AIM_MODE) == 0u;
 }
+}  // namespace ge
 
 void ge_unlock_all_tick(uint8_t* base) {
   // Checked about once a second: the save is read into the profile after it
@@ -2569,7 +2666,7 @@ WatchBars ge_watch_bars(uint32_t tab) {
 std::vector<float> ge_watch_choices(uint32_t tab, int row) {
   if (tab == 2 && row == 0) return {543.f, 733.f, 937.f, 1103.f};  // control style
   if (tab == 2 && row == 2) return {802.f, 1000.f};                // look up/down
-  if (tab == 3 && row >= 3 && row <= 9) return {803.f, 1002.f};
+  if (tab == 3 && row >= 3 && row <= 10) return {803.f, 1002.f};
   return {};
 }
 
@@ -2609,7 +2706,7 @@ int ge_watch_row(uint8_t* base, uint32_t tab, float x, float y) {
       if (x < 230.f || x > 1160.f) return -1;
       if (y >= 88.f && y <= 136.f) return 0;
       if (y >= 150.f && y <= 200.f) return 1;
-      for (int r = 3; r <= 9; ++r)  // 10/11 (letterbox, ratio) are hidden
+      for (int r = 3; r <= 10; ++r)  // 5 = Show Crosshair; 11 (ratio) is hidden
         if (std::fabs(y - (268.f + 45.f * (r - 3))) <= 22.f) return r;
       return -1;
     default:

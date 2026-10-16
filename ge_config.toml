@@ -130,7 +130,24 @@ name = "ge_lan_default_layout"
 registers = ["r11"]
 after_instruction = false
 
-# Watch Options tab: hide Screen Letterbox and Screen Ratio
+# Watch Options tab: Show Crosshair added above Show Aim Crosshair (rows below
+# shifted), Screen Letterbox and Screen Ratio hidden (ge_native_menu.cpp)
+[[midasm_hook]]
+address = 0x820C63C4
+name = "ge_watch_value_sel"
+registers = ["r29", "r27", "r17"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820C67A4
+name = "ge_watch_value_row"
+registers = ["r3", "r27", "r17"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820C5BA0
+name = "ge_watch_dot_input"
+registers = ["r4"]
+after_instruction = false
+return_on_true = true
 [[midasm_hook]]
 address = 0x820C69F8
 name = "ge_watch_hide_ratio_draw"
@@ -142,15 +159,18 @@ name = "ge_watch_hide_ratio_nav"
 registers = ["r11"]
 after_instruction = false
 
-# Other Settings: hide the Screen Ratio row (set from the window shape instead)
+# Other Settings: rows 2..7 are drawn by ge_other_rows_draw (Screen Ratio hidden,
+# it is set from the window shape; Show Crosshair added as the third row) and
+# a chosen row is remapped by ge_other_row_select (ge_native_menu.cpp).
 [[midasm_hook]]
-address = 0x820FE748
-name = "ge_other_hide_ratio_draw"
-registers = ["r11", "r26"]
-after_instruction = true
+address = 0x820FE53C
+name = "ge_other_rows_draw"
+registers = []
+after_instruction = false
+jump_address = 0x820FE75C
 [[midasm_hook]]
 address = 0x820F1FC0
-name = "ge_other_hide_ratio_update"
+name = "ge_other_row_select"
 registers = ["r11"]
 after_instruction = true
 

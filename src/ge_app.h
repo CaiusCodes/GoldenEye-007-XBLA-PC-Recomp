@@ -107,15 +107,14 @@ class GeApp : public rex::ReXApp {
     paths.user_data_root = user_data;
     paths.cache_root = user_data / "cache";
     paths.config_path = ge::ConfigPath();
-    // NOTE: vsync is NOT forced here. Its SDK default is false (off), so the
-    // in-menu toggle persists: turning it ON differs from default -> written to
-    // ge.toml; OFF == default -> not written but still boots off. Forcing it here
-    // would re-assert off every boot and the "on" choice would never survive a
-    // restart (SaveConfig only writes cvars that differ from their default).
+    // NOTE: vsync is NOT forced here. Its SDK default is true (on: the presenter
+    // waits for the display, no tearing), so the in-menu toggle persists: OFF
+    // differs from default -> written to ge.toml. Forcing it here would re-assert
+    // it every boot and the choice would never survive a restart (SaveConfig
+    // only writes cvars that differ from their default).
     // SDK 0.9+: the Xenos GPU lives in a plugin DLL and is off unless named.
     rex::cvar::SetFlagByName("gpu_plugin", "xenos");
-    // max_fps defaults to 60 in the SDK (forcing it here did not survive the
-    // config load, so new installs ran uncapped).
+    // max_fps is no longer applied: the game always runs at its own 60 FPS.
     // Windowed mode opens at 720p; fullscreen uses the display's own size.
     rex::cvar::SetFlagByName("window_width", "1280");
     rex::cvar::SetFlagByName("window_height", "720");
@@ -128,6 +127,8 @@ class GeApp : public rex::ReXApp {
     // lives in its REXCVAR_DEFINE and it is tuned live from the pause menu, so
     // it is never written here (writing default==default is a no-op anyway).
   }
+
+  void OnConfigureFonts(ImFontAtlas* atlas) override { ge::AddOverlayFont(atlas); }
 
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.
