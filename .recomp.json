@@ -1,0 +1,14 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "GoldenEye 007",
+  "project": "GoldenEye 007 XBLA PC Recomp",
+  "system": "Xbox 360",
+  "type": "recomp",
+  "status": "released",
+  "targets": ["Windows"],
+  "toolchain": "ReXGlue",
+  "original": {
+    "serial": "584108A9"
+  },
+  "notes": "Native Windows PC port of the unreleased GoldenEye 007 XBLA remaster. Supports 4K, widescreen, keyboard and mouse, and LAN multiplayer. Requires your own game package."
+}
