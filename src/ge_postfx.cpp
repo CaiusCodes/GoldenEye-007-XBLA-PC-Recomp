@@ -13,13 +13,7 @@
 #include <rex/filesystem.h>
 #include <rex/ui/image_decode.h>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "ge_win32_compat.h"  // <windows.h>, or its SDL3 stand-in elsewhere
 
 #include <imgui.h>
 
@@ -196,8 +190,15 @@ void AddOverlayFont(ImFontAtlas* atlas) {
   static const ImWchar kRanges[] = {0x0020, 0x007E, 0};
   ImFontConfig config;
   config.OversampleH = config.OversampleV = 2;
+#if defined(_WIN32)
   for (const char* path : {"C:\\Windows\\Fonts\\segoeuib.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"}) {
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+#else
+  for (const char* path : {"/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                           "/System/Library/Fonts/Helvetica.ttc",
+                           "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"}) {
+    if (access(path, R_OK) != 0) continue;
+#endif
     g_overlay_font = atlas->AddFontFromFileTTF(path, 48.0f, &config, kRanges);
     if (g_overlay_font) return;
   }

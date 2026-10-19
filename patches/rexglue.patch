@@ -58,7 +58,7 @@ index 9e5b57e..17b9171 100644
  > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
  
 diff --git a/cmake/rex_version.cmake b/cmake/rex_version.cmake
-index 2c14df1..7bfa3b6 100644
+index 2c14df1..6363a0b 100644
 --- a/cmake/rex_version.cmake
 +++ b/cmake/rex_version.cmake
 @@ -22,7 +22,9 @@ function(rex_compute_version out_var)
@@ -72,6 +72,16 @@ index 2c14df1..7bfa3b6 100644
              set(${out_var} "${CMAKE_MATCH_1}" PARENT_SCOPE)
              return()
          endif()
+@@ -39,7 +41,8 @@ function(rex_compute_version out_var)
+         return()
+     endif()
+ 
+-    if(NOT ARG_GIT_DESCRIBE_LONG MATCHES "^v([0-9]+)\\.([0-9]+)(\\.([0-9]+))?(\\.([0-9]+))?-([0-9]+)-g([0-9a-f]+)$")
++    # ge: the same letter suffix on a tag a few commits behind HEAD (v0.9.5d-1-g...).
++    if(NOT ARG_GIT_DESCRIBE_LONG MATCHES "^v([0-9]+)\\.([0-9]+)(\\.([0-9]+))?(\\.([0-9]+))?[A-Za-z]*-([0-9]+)-g([0-9a-f]+)$")
+         message(FATAL_ERROR "rex_compute_version: unparseable describe output '${ARG_GIT_DESCRIBE_LONG}'")
+     endif()
+     set(tag_major ${CMAKE_MATCH_1})
 diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
 index 41e6dce..8dfbb98 100644
 --- a/cmake/rexglue_helpers.cmake
@@ -209,6 +219,41 @@ index 96d362b..1cdfdbc 100644
    struct FxaaConstants {
      uint32_t size[2];
      float size_inv[2];
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index dce3dbf..56c3652 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -399,6 +399,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
+ 
+     bool demote_to_helper_invocation;
+     bool sample_rate_shading;
++
++    // Apple GPUs (through MoltenVK) return unusable values in the 2x2 quad
++    // lanes the rasterizer did not cover, so texture coordinate derivatives
++    // along triangle edges come out huge and the smallest mips get sampled -
++    // dark dotted lines along every edge. When set, texture LOD derivatives are
++    // taken only from quad lane pairs without helper invocations (needs quad
++    // subgroup operations and helper invocation queries).
++    bool quad_robust_texture_derivatives;
+   };
+ 
+   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
+@@ -700,6 +708,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
+                      spv::Id lerp_first_signed = spv::NoResult);
+   // `texture_parameters` need to be set up except for `sampler`, which will be
+   // set internally.
++  // Horizontal or vertical screen-space derivative of a texture coordinate
++  // value (float or float vector) for LOD calculation in a pixel shader - coarse
++  // normally, robust against uncovered quad lanes with
++  // quad_robust_texture_derivatives.
++  spv::Id TextureCoordinateDerivative(bool vertical, spv::Id type, spv::Id value);
++  // Both derivatives, with additional outlier rejection between the axes with
++  // quad_robust_texture_derivatives.
++  void TextureCoordinateDerivatives(spv::Id type, spv::Id value, spv::Id& horizontal_out,
++                                    spv::Id& vertical_out);
+   spv::Id QueryTextureLod(spv::Builder::TextureParameters& texture_parameters,
+                           spv::Id image_unsigned, spv::Id image_signed, spv::Id sampler,
+                           spv::Id is_all_signed);
 diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
 index d26cd4f..9cd9f51 100644
 --- a/include/rex/graphics/pipeline/texture/cache.h
@@ -457,6 +502,21 @@ index 7642601..1b1df31 100644
    std::deque<PendingToast> queue_;
    AchievementIconCache icon_cache_;
  };
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817f..f0caaf8 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -151,6 +151,10 @@ class VulkanDevice {
+ 
+     bool shaderDemoteToHelperInvocation = false;
+ 
++    // Vulkan 1.1 subgroup properties
++
++    bool subgroupQuadOperationsInFragment = false;
++
+     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
+ 
+     bool dynamicRendering = false;
 diff --git a/resources/templates/codegen/init_cpp.inja b/resources/templates/codegen/init_cpp.inja
 index 1be4759..0d3e207 100644
 --- a/resources/templates/codegen/init_cpp.inja
@@ -978,7 +1038,7 @@ index a744375..16713ab 100644
          rex::thread::SyncMemory();
          ReturnFromWait();
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..3510be5 100644
+index 19874a5..9518ec2 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -31,6 +31,10 @@
@@ -1672,6 +1732,254 @@ index 953c5fd..5e13ce1 100644
    }
  
    if (interlock_barrier_only) {
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f97..7ab3e99 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -42,7 +42,8 @@ SpirvShaderTranslator::Features::Features(bool all)
+       rounding_mode_rte_float32(all),
+       fragment_shader_sample_interlock(all),
+       demote_to_helper_invocation(all),
+-      sample_rate_shading(all) {}
++      sample_rate_shading(all),
++      quad_robust_texture_derivatives(false) {}
+ 
+ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
+     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
+@@ -59,7 +60,8 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const
+       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
+       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
+       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
+-      sample_rate_shading(vulkan_device->properties().sampleRateShading) {
++      sample_rate_shading(vulkan_device->properties().sampleRateShading),
++      quad_robust_texture_derivatives(false) {
+   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
+   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+     spirv_version = spv::Spv_1_5;
+@@ -70,6 +72,11 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const
+   } else {
+     spirv_version = spv::Spv_1_0;
+   }
++#if defined(__APPLE__)
++  quad_robust_texture_derivatives = spirv_version >= spv::Spv_1_3 &&
++                                    demote_to_helper_invocation &&
++                                    vulkan_device->properties().subgroupQuadOperationsInFragment;
++#endif
+ }
+ 
+ uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..bf1e09a 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -568,8 +568,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+     uint32_t derivative_component_index;
+     while (rex::bit_scan_forward(derivative_components_remaining, &derivative_component_index)) {
+       derivative_components_remaining &= ~(UINT32_C(1) << derivative_component_index);
+-      result[derivative_component_index] = builder_->createUnaryOp(
+-          (derivative_component_index & 0b01) ? spv::OpDPdyCoarse : spv::OpDPdxCoarse, type_float_,
++      result[derivative_component_index] = TextureCoordinateDerivative(
++          (derivative_component_index & 0b01) != 0, type_float_,
+           (derivative_component_index & 0b10) ? derivative_function_y : derivative_function_x);
+     }
+   } else {
+@@ -1486,10 +1486,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+                 }
+               } else {
+                 builder_->addCapability(spv::CapabilityDerivativeControl);
+-                gradient_h_1d =
+-                    builder_->createUnaryOp(spv::OpDPdxCoarse, type_float_, coordinates[0]);
+-                gradient_v_1d =
+-                    builder_->createUnaryOp(spv::OpDPdyCoarse, type_float_, coordinates[0]);
++                TextureCoordinateDerivatives(type_float_, coordinates[0], gradient_h_1d, gradient_v_1d);
+               }
+               gradient_h_1d = builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
+                                                                  gradient_h_1d, lod_gradient_scale);
+@@ -1537,10 +1534,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+                 spv::Id gradient_coordinate_vector =
+                     builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+                 builder_->addCapability(spv::CapabilityDerivativeControl);
+-                gradients_h = builder_->createUnaryOp(spv::OpDPdxCoarse, type_float2_,
+-                                                      gradient_coordinate_vector);
+-                gradients_v = builder_->createUnaryOp(spv::OpDPdyCoarse, type_float2_,
+-                                                      gradient_coordinate_vector);
++                TextureCoordinateDerivatives(type_float2_, gradient_coordinate_vector, gradients_h, gradients_v);
+               }
+               gradients_h = builder_->createNoContractionBinOp(
+                   spv::OpVectorTimesScalar, type_float2_, gradients_h, lod_gradient_scale);
+@@ -1574,10 +1568,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+                 spv::Id gradient_coordinate_vector =
+                     builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+                 builder_->addCapability(spv::CapabilityDerivativeControl);
+-                gradients_h = builder_->createUnaryOp(spv::OpDPdxCoarse, type_float3_,
+-                                                      gradient_coordinate_vector);
+-                gradients_v = builder_->createUnaryOp(spv::OpDPdyCoarse, type_float3_,
+-                                                      gradient_coordinate_vector);
++                TextureCoordinateDerivatives(type_float3_, gradient_coordinate_vector, gradients_h, gradients_v);
+               }
+               gradients_h = builder_->createNoContractionBinOp(
+                   spv::OpVectorTimesScalar, type_float3_, gradients_h, lod_gradient_scale);
+@@ -1600,10 +1591,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+                 spv::Id gradient_coordinate_vector =
+                     builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+                 builder_->addCapability(spv::CapabilityDerivativeControl);
+-                gradients_h = builder_->createUnaryOp(spv::OpDPdxCoarse, type_float3_,
+-                                                      gradient_coordinate_vector);
+-                gradients_v = builder_->createUnaryOp(spv::OpDPdyCoarse, type_float3_,
+-                                                      gradient_coordinate_vector);
++                TextureCoordinateDerivatives(type_float3_, gradient_coordinate_vector, gradients_h, gradients_v);
+               }
+               gradients_h = builder_->createNoContractionBinOp(
+                   spv::OpVectorTimesScalar, type_float3_, gradients_h, lod_gradient_scale);
+@@ -2218,6 +2206,148 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
+   }
+ }
+ 
++spv::Id SpirvShaderTranslator::TextureCoordinateDerivative(bool vertical, spv::Id type,
++                                                           spv::Id value) {
++  builder_->addCapability(spv::CapabilityDerivativeControl);
++  if (!features_.quad_robust_texture_derivatives) {
++    return builder_->createUnaryOp(vertical ? spv::OpDPdyCoarse : spv::OpDPdxCoarse, type, value);
++  }
++  // Each lane gets the difference along its own row (or column) of the quad,
++  // the same as with fine derivatives. A pair containing a helper invocation is
++  // unusable on Apple GPUs, so the other row's (or column's) difference is taken
++  // then. Lanes from the neighbouring triangle can also land in the quad, so of
++  // two usable pairs the smaller difference wins. With no usable pair, the
++  // derivative is 0 (the most detailed mip, like magnification).
++  builder_->addCapability(spv::CapabilityGroupNonUniform);
++  builder_->addCapability(spv::CapabilityGroupNonUniformQuad);
++  // TODO(Triang3l): Promoted to SPIR-V 1.6 - don't add the extension there.
++  builder_->addExtension("SPV_EXT_demote_to_helper_invocation");
++  builder_->addCapability(spv::CapabilityDemoteToHelperInvocationEXT);
++  int component_count = builder_->getNumTypeComponents(type);
++  spv::Id type_bool_vector =
++      component_count > 1 ? builder_->makeVectorType(type_bool_, component_count) : type_bool_;
++  auto splat_bool = [&](spv::Id scalar) {
++    if (component_count <= 1) {
++      return scalar;
++    }
++    id_vector_temp_.clear();
++    id_vector_temp_.insert(id_vector_temp_.end(), size_t(component_count), scalar);
++    return builder_->createCompositeConstruct(type_bool_vector, id_vector_temp_);
++  };
++  // Direction 0 swaps with the horizontal neighbour, 1 with the vertical one.
++  auto quad_swap = [&](spv::Id swap_type, spv::Id swap_value, uint32_t direction) {
++    id_vector_temp_.clear();
++    id_vector_temp_.push_back(builder_->makeUintConstant(spv::ScopeSubgroup));
++    id_vector_temp_.push_back(swap_value);
++    id_vector_temp_.push_back(builder_->makeUintConstant(direction));
++    return builder_->createOp(spv::OpGroupNonUniformQuadSwap, swap_type, id_vector_temp_);
++  };
++  uint32_t direction_along = vertical ? 1 : 0;
++  uint32_t direction_across = vertical ? 0 : 1;
++
++  id_vector_temp_.clear();
++  spv::Id is_helper =
++      builder_->createOp(spv::OpIsHelperInvocationEXT, type_bool_, id_vector_temp_);
++  // Bools can't be swapped portably, using 0 / 1 floats.
++  spv::Id helper_float = builder_->createTriOp(spv::OpSelect, type_float_, is_helper,
++                                               const_float_1_, const_float_0_);
++  spv::Id pair_helpers = builder_->createBinOp(
++      spv::OpFAdd, type_float_, helper_float, quad_swap(type_float_, helper_float, direction_along));
++  spv::Id other_pair_helpers = quad_swap(type_float_, pair_helpers, direction_across);
++  spv::Id pair_usable =
++      builder_->createBinOp(spv::OpFOrdEqual, type_bool_, pair_helpers, const_float_0_);
++  spv::Id other_pair_usable =
++      builder_->createBinOp(spv::OpFOrdEqual, type_bool_, other_pair_helpers, const_float_0_);
++
++  spv::Id derivative =
++      builder_->createUnaryOp(vertical ? spv::OpDPdyFine : spv::OpDPdxFine, type, value);
++  spv::Id other_derivative = quad_swap(type, derivative, direction_across);
++  spv::Id zero = component_count > 1
++                     ? builder_->makeCompositeConstant(
++                           type, std::vector<spv::Id>(size_t(component_count), const_float_0_))
++                     : const_float_0_;
++
++  spv::Id other_smaller = builder_->createBinOp(
++      spv::OpFOrdLessThan, type_bool_vector,
++      builder_->createUnaryBuiltinCall(type, ext_inst_glsl_std_450_, GLSLstd450FAbs,
++                                       other_derivative),
++      builder_->createUnaryBuiltinCall(type, ext_inst_glsl_std_450_, GLSLstd450FAbs, derivative));
++  spv::Id take_other = builder_->createBinOp(
++      spv::OpLogicalAnd, type_bool_vector, splat_bool(other_pair_usable),
++      builder_->createBinOp(
++          spv::OpLogicalOr, type_bool_vector,
++          splat_bool(builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, pair_usable)),
++          other_smaller));
++  spv::Id result = builder_->createTriOp(
++      spv::OpSelect, type, splat_bool(pair_usable), derivative, zero);
++  return builder_->createTriOp(spv::OpSelect, type, take_other, other_derivative, result);
++}
++
++void SpirvShaderTranslator::TextureCoordinateDerivatives(spv::Id type, spv::Id value,
++                                                         spv::Id& horizontal_out,
++                                                         spv::Id& vertical_out) {
++  horizontal_out = TextureCoordinateDerivative(false, type, value);
++  vertical_out = TextureCoordinateDerivative(true, type, value);
++  if (!features_.quad_robust_texture_derivatives) {
++    return;
++  }
++  // When a pixel on an edge is shaded for both triangles with MSAA, one of the
++  // two invocations may still get unusable values in lanes that are not
++  // reported as helpers - off by orders of magnitude. An axis whose derivative
++  // is more than 16 times (the maximum anisotropy) longer than the other one is
++  // dropped.
++  int component_count = builder_->getNumTypeComponents(type);
++  auto length = [&](spv::Id derivative) {
++    spv::Id magnitude =
++        builder_->createUnaryBuiltinCall(type, ext_inst_glsl_std_450_, GLSLstd450FAbs, derivative);
++    if (component_count <= 1) {
++      return magnitude;
++    }
++    spv::Id result = builder_->createCompositeExtract(magnitude, type_float_, 0);
++    for (int i = 1; i < component_count; ++i) {
++      result = builder_->createBinBuiltinCall(
++          type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax, result,
++          builder_->createCompositeExtract(magnitude, type_float_, uint32_t(i)));
++    }
++    return result;
++  };
++  spv::Id zero = component_count > 1
++                     ? builder_->makeCompositeConstant(
++                           type, std::vector<spv::Id>(size_t(component_count), const_float_0_))
++                     : const_float_0_;
++  spv::Id max_ratio = builder_->makeFloatConstant(16.0f);
++  spv::Id horizontal_length = length(horizontal_out);
++  spv::Id vertical_length = length(vertical_out);
++  spv::Id horizontal_outlier = builder_->createBinOp(
++      spv::OpFOrdGreaterThan, type_bool_, horizontal_length,
++      builder_->createBinOp(spv::OpFMul, type_float_, vertical_length, max_ratio));
++  spv::Id vertical_outlier = builder_->createBinOp(
++      spv::OpFOrdGreaterThan, type_bool_, vertical_length,
++      builder_->createBinOp(spv::OpFMul, type_float_, horizontal_length, max_ratio));
++  // A zero derivative (no usable quad pair) along the other axis doesn't tell
++  // anything.
++  horizontal_outlier = builder_->createBinOp(
++      spv::OpLogicalAnd, type_bool_, horizontal_outlier,
++      builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, vertical_length, const_float_0_));
++  vertical_outlier = builder_->createBinOp(
++      spv::OpLogicalAnd, type_bool_, vertical_outlier,
++      builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, horizontal_length,
++                            const_float_0_));
++  auto splat = [&](spv::Id scalar) {
++    if (component_count <= 1) {
++      return scalar;
++    }
++    id_vector_temp_.clear();
++    id_vector_temp_.insert(id_vector_temp_.end(), size_t(component_count), scalar);
++    return builder_->createCompositeConstruct(builder_->makeVectorType(type_bool_, component_count),
++                                              id_vector_temp_);
++  };
++  horizontal_out =
++      builder_->createTriOp(spv::OpSelect, type, splat(horizontal_outlier), zero, horizontal_out);
++  vertical_out =
++      builder_->createTriOp(spv::OpSelect, type, splat(vertical_outlier), zero, vertical_out);
++}
++
+ spv::Id SpirvShaderTranslator::QueryTextureLod(spv::Builder::TextureParameters& texture_parameters,
+                                                spv::Id image_unsigned, spv::Id image_signed,
+                                                spv::Id sampler, spv::Id is_all_signed) {
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index 76f5600..157082b 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
@@ -6725,6 +7033,44 @@ index b94fe9e..7e78f14 100644
 +}
 +
  }  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..61f81a4 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -313,6 +313,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       features_KHR_portability_subset;
+   VkPhysicalDeviceDriverPropertiesKHR properties_1_2_KHR_driver_properties = {
+       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
++  VkPhysicalDeviceSubgroupProperties properties_1_1_subgroup = {
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+   VkPhysicalDeviceFloatControlsProperties properties_1_2_KHR_shader_float_controls = {
+       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+   VulkanFeatures<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT,
+@@ -354,6 +356,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     if (ext_KHR_portability_subset) {
+       features_KHR_portability_subset.Link(supported_features_2, device_create_info);
+     }
++    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
++      properties_1_1_subgroup.pNext = properties_2.pNext;
++      properties_2.pNext = &properties_1_1_subgroup;
++    }
+     if (ext_1_2_KHR_driver_properties) {
+       properties_1_2_KHR_driver_properties.pNext = properties_2.pNext;
+       properties_2.pNext = &properties_1_2_KHR_driver_properties;
+@@ -590,6 +596,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+                 properties_1_2_KHR_driver_properties.conformanceVersion.patch);
+   }
+ 
++  device->properties_.subgroupQuadOperationsInFragment =
++      (properties_1_1_subgroup.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
++      (properties_1_1_subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT);
++  if (device->properties_.subgroupQuadOperationsInFragment) {
++    REXLOG_INFO("* subgroupQuadOperationsInFragment");
++  }
++
+   XE_UI_VULKAN_LIMIT(maxImageDimension2D)
+   XE_UI_VULKAN_LIMIT(maxImageDimension3D)
+   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
 index 23645ef..f5dc42e 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
@@ -6749,7 +7095,7 @@ index 23645ef..f5dc42e 100644
            present_modes.cend()) {
      // Allowing tearing to reduce latency, and possibly variable refresh rate
 diff --git a/src/ui/window.cpp b/src/ui/window.cpp
-index b4e045f..d850ca4 100644
+index b4e045f..0e61501 100644
 --- a/src/ui/window.cpp
 +++ b/src/ui/window.cpp
 @@ -15,6 +15,7 @@
@@ -6760,17 +7106,23 @@ index b4e045f..d850ca4 100644
  #include <rex/ui/imgui_drawer.h>
  #include <rex/ui/presenter.h>
  #include <rex/ui/window.h>
-@@ -34,6 +35,9 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
+@@ -34,7 +35,15 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
  // kHotReload (default): Window::SetFullscreen can be applied live, so the
  // change callback registered in ReXApp::SetupPresentation keeps the window
  // in sync whenever this cvar is changed at runtime.
 +REXCVAR_DEFINE_BOOL(debug_pause_key, false, "UI/Window",
 +                    "F1 freezes/resumes all guest threads (debugging aid)");
 +
++// ge: macOS starts windowed; fullscreen there is a separate Space.
++#if defined(__APPLE__)
++REXCVAR_DEFINE_BOOL(fullscreen, false, "UI/Window", "Start the window in fullscreen mode");
++#else
  REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
++#endif
  
  REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
-@@ -636,6 +640,15 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
+                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
+@@ -636,6 +645,15 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
  }
  
  void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {

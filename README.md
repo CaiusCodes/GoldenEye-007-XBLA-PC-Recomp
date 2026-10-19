@@ -189,6 +189,34 @@ from there, link your extracted package in as its `assets` folder:
 New-Item -ItemType Junction -Path "out\build\win-amd64-release\assets" -Target game
 ```
 
+### macOS (Apple Silicon)
+
+The same steps work on macOS with Xcode's command line tools (AppleClang 16
+or newer), `brew install cmake ninja` and Python 3. The game renders through
+Vulkan on MoltenVK, which the build places next to it. PowerShell is not
+needed: `tools/extract_stfs.py` is the same extractor in Python.
+
+```bash
+python3 tools/extract_stfs.py <your package> game
+cmake --preset mac-arm64-release
+cmake --build --preset mac-arm64-release --target ge_codegen
+cmake --preset mac-arm64-release
+cmake --build --preset mac-arm64-release
+ln -sfn ../../../game "out/build/mac-arm64-release/assets"
+"out/build/mac-arm64-release/GoldenEye 007"
+```
+
+A setup window comes up before the game starts (graphics, controls, key
+bindings); untick "Show this window at start" or set `ge_show_setup = false`
+to skip it. If the frame rate is low, set the internal resolution to 1x there
+(in testing, 1x ran at about 60 FPS where the default 2x ran at about 15).
+
+The macOS port is new and still has known issues. Faint dotted lines can show
+along some triangle edges: Apple GPUs give unusable texture coordinate
+derivatives at edge pixels with MSAA, and the workaround in the SDK patch
+(`quad_robust_texture_derivatives`) removes most but not all of them.
+Fullscreen can come up black; the game starts windowed by default.
+
 ReXGlue's developer hotkeys (F3 debug overlay, backtick console, F4 settings
 overlay, F7 achievements overlay) are off. Set `developer_hotkeys = true` in
 `ge.toml` to bring them back; `ge_debug_menu = true` enables the game's hidden

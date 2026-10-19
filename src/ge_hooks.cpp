@@ -33,14 +33,14 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <cstdio>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "ge_win32_compat.h"  // <windows.h>, or its SDL3 stand-in elsewhere
+#if defined(_WIN32)
 #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
+#else
+#include <spawn.h>
+#include <rex/filesystem.h>  // GetExecutablePath (relaunch)
+extern char** environ;
+#endif
 #include <string>
 
 // Replaces the unsupported `bc 20,lt,0x820F285C` at 0x820F2838. BO=20 makes
@@ -119,6 +119,48 @@ namespace ge {
 // ge.toml (new username / server / online-enable) at boot, then the caller tears
 // the current process down. Launching a second instance of a running exe is fine
 // on Windows -- the image file is opened share-read.
+#if !defined(_WIN32)
+void LaunchSelfDetached() {
+  const std::string exe = rex::filesystem::GetExecutablePath().string();
+  const std::string dir = rex::filesystem::GetExecutableFolder().string();
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_addchdir_np(&actions, dir.c_str());
+  char* argv[] = {const_cast<char*>(exe.c_str()), nullptr};
+  pid_t pid = 0;
+  posix_spawn(&pid, exe.c_str(), &actions, nullptr, argv, environ);
+  posix_spawn_file_actions_destroy(&actions);
+}
+
+// Windowed mode: make the game window's content w x h, keeping it centred where
+// it was and inside the usable area of its display.
+void ResizeGameWindow(int w, int h) {
+  HWND win = g_game_hwnd_for_resize();
+  if (!win || w <= 0 || h <= 0) return;
+  const SDL_WindowFlags flags = SDL_GetWindowFlags(win);
+  if (flags & SDL_WINDOW_FULLSCREEN) return;  // fullscreen: the display size applies
+  if (flags & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(win);
+  int x = 0, y = 0, cw = 0, ch = 0;
+  SDL_GetWindowPosition(win, &x, &y);
+  SDL_GetWindowSize(win, &cw, &ch);
+  SDL_Rect wa{};
+  if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &wa)) {
+    w = std::min(w, wa.w);
+    h = std::min(h, wa.h);
+  } else {
+    wa = {x, y, w, h};
+  }
+  const int cx = x + cw / 2, cy = y + ch / 2;
+  SDL_SetWindowSize(win, w, h);
+  SDL_SetWindowPosition(win, std::clamp(cx - w / 2, wa.x, std::max(wa.x, wa.x + wa.w - w)),
+                        std::clamp(cy - h / 2, wa.y, std::max(wa.y, wa.y + wa.h - h)));
+}
+
+void RestartSelf() {
+  LaunchSelfDetached();
+  _exit(0);
+}
+#else
 void LaunchSelfDetached() {
   wchar_t exe_path[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
@@ -169,6 +211,7 @@ void RestartSelf() {
   for (;;) {
   }
 }
+#endif  // _WIN32
 }  // namespace ge
 
 // Probe to read CommandProcessor's protected ring read pointer (legal: a
@@ -926,17 +969,31 @@ std::atomic<bool> g_rebind_capturing{false};
 // True while the in-mission pause menu (the watch) is open: the pointer is shown
 // and free there so its tabs and rows can be clicked (ge_watch_mouse).
 std::atomic<bool> g_watch_open{false};
+// True while the front-end menus are up (title stage), set every frame by
+// ge_menu_cursor_from_pointer. macOS confines the pointer there instead of
+// switching to relative mode, so the crosshair can follow it.
+std::atomic<bool> g_frontend_menus{false};
 
 // Cursor-capture state (touched from the mouse thread + SetMouselookSuppressed).
 HWND g_game_hwnd = nullptr;
+#if defined(_WIN32)
 HCURSOR g_arrow_cursor = nullptr;
 HCURSOR g_blank_cursor = nullptr;
+#endif
 bool g_captured = false;
 
 bool ge_mouselook_on() { return REXCVAR_GET(ge_mouselook_enable); }
 }  // namespace
 HWND g_game_hwnd_for_resize() {
   if (g_game_hwnd) return g_game_hwnd;
+#if !defined(_WIN32)
+  // Not focused yet: the app has a single SDL window.
+  int count = 0;
+  SDL_Window** windows = SDL_GetWindows(&count);
+  HWND found = (windows && count > 0) ? windows[0] : nullptr;
+  SDL_free(windows);
+  return found;
+#else
   // Not focused yet: take this process's visible captioned top-level window.
   HWND found = nullptr;
   EnumWindows(
@@ -952,6 +1009,7 @@ HWND g_game_hwnd_for_resize() {
       },
       reinterpret_cast<LPARAM>(&found));
   return found;
+#endif
 }
 namespace {
 
@@ -1013,6 +1071,7 @@ bool ge_mouse_active() {
          !g_watch_open.load(std::memory_order_relaxed) && ge_game_has_focus();
 }
 
+#if defined(_WIN32)
 HCURSOR ge_make_blank_cursor() {
   // 32x32 fully transparent cursor (AND=1 / XOR=0 == transparent everywhere).
   BYTE and_mask[32 * 32 / 8];
@@ -1138,6 +1197,78 @@ void ge_mouse_thread() {
     DispatchMessageW(&m);
   }
 }
+
+#else  // !_WIN32
+// A button held with the pointer outside the window: the click that starts a
+// title-bar drag. Moving the pointer onto the crosshair then would fight it.
+bool ge_window_drag_active(HWND hwnd) {
+  if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000) && !(GetAsyncKeyState(VK_RBUTTON) & 0x8000))
+    return false;
+  POINT pt;
+  RECT rc;
+  if (!GetCursorPos(&pt) || !GetClientRect(hwnd, &rc) || !ScreenToClient(hwnd, &pt)) return false;
+  return pt.x < 0 || pt.y < 0 || pt.x >= rc.right || pt.y >= rc.bottom;
+}
+
+// macOS / Linux: SDL relative mouse mode hides and holds the pointer and turns
+// motion into deltas, so it stands in for raw input and ClipCursor. The mode is
+// switched on SDL's main thread; the events are read through an event watch.
+// 0 = free, 1 = confined to the window (front-end menus: the crosshair follows
+// the pointer, as with ClipCursor on Windows), 2 = relative (mouse-look).
+void ge_set_capture_mode(HWND hwnd, int mode) {
+  struct Req { HWND hwnd; int mode; };
+  SDL_RunOnMainThread(
+      [](void* p) {
+        auto* r = static_cast<Req*>(p);
+        SDL_SetWindowRelativeMouseMode(r->hwnd, r->mode == 2);
+        SDL_SetWindowMouseGrab(r->hwnd, r->mode == 1);
+        delete r;
+      },
+      new Req{hwnd, mode}, false);
+}
+
+void ge_update_mouse_capture() {
+  static int mode = 0;
+  HWND hwnd = ge_game_window();
+  // The pointer stays free in the front-end menus (the crosshair follows it while
+  // it is over the window) and while Cmd is held, so Cmd-Tab and clicks outside
+  // the window always work.
+  int want = 0;
+  if (ge_mouse_active() && hwnd != nullptr && !g_frontend_menus.load(std::memory_order_relaxed) &&
+      !(SDL_GetModState() & SDL_KMOD_GUI))
+    want = 2;
+  if (want == mode) return;
+  mode = want;
+  g_captured = want != 0;
+  if (hwnd) ge_set_capture_mode(hwnd, want);
+  REXKRNL_INFO("GEMOUSE capture mode {} window={}", want, (void*)hwnd);
+}
+
+bool ge_mouse_event_watch(void*, SDL_Event* e) {
+  if (e->type == SDL_EVENT_MOUSE_MOTION && ge_mouse_active()) {
+    g_mouse_dx.fetch_add(static_cast<int>(e->motion.xrel), std::memory_order_relaxed);
+    g_mouse_dy.fetch_add(static_cast<int>(e->motion.yrel), std::memory_order_relaxed);
+  } else if (e->type == SDL_EVENT_MOUSE_WHEEL &&
+             !g_mouselook_suppressed.load(std::memory_order_relaxed) && ge_game_has_focus()) {
+    int notches = e->wheel.integer_y;
+    if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) notches = -notches;
+    if (notches != 0) {
+      std::atomic<int>& queue = notches > 0 ? g_wheel_up_queue : g_wheel_down_queue;
+      if (queue.load(std::memory_order_relaxed) < 4) queue.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  return true;
+}
+
+void ge_mouse_thread() {
+  SDL_AddEventWatch(ge_mouse_event_watch, nullptr);
+  REXKRNL_INFO("GEMOUSE thread up: SDL event watch");
+  for (;;) {  // ~60Hz capture-state poll, like the Windows timer
+    ge_update_mouse_capture();
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  }
+}
+#endif  // _WIN32
 
 void ge_start_mouse_once() {
   static std::atomic<bool> started{false};
@@ -1835,6 +1966,7 @@ void ge_menu_cursor_clamp_y() {
 // the pointer is not confined to the window (unfocused, mouse-look off) or a
 // mission is running.
 bool ge_menu_cursor_from_pointer(uint8_t* base) {
+  g_frontend_menus.store(LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE, std::memory_order_relaxed);
   static POINT last{-1, -1};
   static float last_x = -1e9f, last_y = -1e9f;  // crosshair as we last left it
   // Follow the pointer whenever the game has focus in the front-end menus,

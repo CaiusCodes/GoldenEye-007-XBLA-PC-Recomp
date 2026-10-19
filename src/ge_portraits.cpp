@@ -13,6 +13,7 @@
 // costumes) borrowed Bond's, Natalya's and Trevelyan's photos; they show "?"
 // until they have their own.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -36,6 +38,11 @@
 #endif
 #include <windows.h>
 #include <wincodec.h>
+#else
+#include <fstream>
+#include <iterator>
+#include <rex/ui/image_decode.h>
+#endif
 
 namespace ge {
 bool SetGameText(uint8_t* base, uint32_t id, const std::string& text);  // ge_native_menu.cpp
@@ -91,6 +98,31 @@ void AssignPictures(uint8_t* base) {
 }
 
 // A PNG scaled to kPicW x kPicH, as RGBA rows; empty if it cannot be read.
+#if !defined(_WIN32)
+// Decoded with the SDK's stb_image and box-filtered to size (WIC's Fant
+// scaler is an area filter too).
+std::vector<uint8_t> LoadPicture(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  const std::vector<uint8_t> file{std::istreambuf_iterator<char>(in), {}};
+  int sw = 0, sh = 0;
+  const std::vector<uint8_t> src = rex::ui::DecodeImageRGBA(file.data(), file.size(), sw, sh);
+  if (src.empty() || sw <= 0 || sh <= 0) return {};
+  std::vector<uint8_t> out(kPicW * kPicH * 4);
+  for (int y = 0; y < kPicH; ++y) {
+    const int y0 = y * sh / kPicH, y1 = std::max(y0 + 1, (y + 1) * sh / kPicH);
+    for (int x = 0; x < kPicW; ++x) {
+      const int x0 = x * sw / kPicW, x1 = std::max(x0 + 1, (x + 1) * sw / kPicW);
+      uint32_t sum[4] = {};
+      for (int sy = y0; sy < y1; ++sy)
+        for (int sx = x0; sx < x1; ++sx)
+          for (int c = 0; c < 4; ++c) sum[c] += src[(size_t(sy) * sw + sx) * 4 + c];
+      const uint32_t n = uint32_t((y1 - y0) * (x1 - x0));
+      for (int c = 0; c < 4; ++c) out[(size_t(y) * kPicW + x) * 4 + c] = uint8_t(sum[c] / n);
+    }
+  }
+  return out;
+}
+#else
 std::vector<uint8_t> LoadPicture(const std::filesystem::path& path) {
   std::vector<uint8_t> out;
   const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -120,6 +152,7 @@ std::vector<uint8_t> LoadPicture(const std::filesystem::path& path) {
   if (SUCCEEDED(co)) CoUninitialize();
   return out;
 }
+#endif
 
 // Byte offset of texel (x, y) in a tiled 32-bit Xenos texture (width aligned to 32).
 uint32_t TiledOffset(uint32_t x, uint32_t y, uint32_t width) {

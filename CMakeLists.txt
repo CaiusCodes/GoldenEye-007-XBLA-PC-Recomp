@@ -43,6 +43,7 @@ set(GE_SOURCES
     src/ge_ce_patches.cpp
     src/ge_native_menu.cpp
     src/ge_portraits.cpp
+    src/ge_setup.cpp
 )
 
 # The release version: VERSION is the single source of truth (Make-Release.ps1
@@ -91,11 +92,34 @@ endif()
 # internal target/app name "ge" (which still drives ge.toml / the user data dir).
 set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye 007")
 
+# The SDK sets REXGLUE_ROOT in its own directory scope only; its macOS helper
+# (staging MoltenVK next to the game) reads it from ours.
+if(APPLE AND REXSDK_DIR AND NOT REXGLUE_ROOT)
+    set(REXGLUE_ROOT "${REXSDK_DIR}")
+endif()
+
 rexglue_setup_target(ge GPU_PLUGINS xenos)
+
+# macOS file systems are case-insensitive by default: with the project folder on
+# the include path, the VERSION file shadows the C++ <version> header. Nothing
+# includes from the project folder itself (src/ and generated/ are on the path),
+# so it is taken off again.
+if(APPLE)
+    foreach(_ge_target ge ge_recomp)
+        if(TARGET ${_ge_target})
+            get_target_property(_ge_dirs ${_ge_target} INCLUDE_DIRECTORIES)
+            list(REMOVE_ITEM _ge_dirs "${CMAKE_CURRENT_SOURCE_DIR}")
+            set_target_properties(${_ge_target} PROPERTIES INCLUDE_DIRECTORIES "${_ge_dirs}")
+        endif()
+    endforeach()
+endif()
 
 # Same CPU baseline as the PD/Hexic ports (AVX2 class). -ffp-contract=off keeps
 # float results identical to the guest (no fused multiply-add).
-target_compile_options(ge PRIVATE -march=x86-64-v3 -ffp-contract=off)
+target_compile_options(ge PRIVATE -ffp-contract=off)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    target_compile_options(ge PRIVATE -march=x86-64-v3)
+endif()
 
 # Character pictures are read with WIC (ge_portraits.cpp).
 if(WIN32)

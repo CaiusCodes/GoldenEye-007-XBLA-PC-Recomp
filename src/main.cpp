@@ -4,7 +4,7 @@
 // This file is yours to edit. 'rexglue migrate' will NOT overwrite it.
 
 //#include "generated/ge_config.h"
-#include "generated/ge_init.h"
+#include "ge_init.h"  // generated/ is on the include path
 
 #include "ge_app.h"
 
