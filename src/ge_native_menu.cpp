@@ -36,13 +36,11 @@
 #include <rex/kernel/xam/ge_online_control.h>
 #include <rex/system/xam/user_profile.h>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include <filesystem>
+
+#include <rex/filesystem.h>  // GetExecutableFolder
+
+#include "ge_win32_compat.h"  // <windows.h>, or its SDL3 stand-in elsewhere
 
 namespace ge {
 void SetRebindCapturing(bool v);  // ge_hooks.cpp: swallow pad input while capturing
@@ -358,11 +356,19 @@ std::vector<Row> BuildPage(Page page) {
           },
           [] {
             if (GetB("fullscreen")) {  // the size of the screen the game is on
+#if !defined(_WIN32)
+              SDL_Rect r{};
+              HWND win = GetForegroundWindow();
+              const SDL_DisplayID display = win ? SDL_GetDisplayForWindow(win) : SDL_GetPrimaryDisplay();
+              if (display && SDL_GetDisplayBounds(display, &r))
+                return std::to_string(r.w) + "x" + std::to_string(r.h) + " (screen)";
+#else
               MONITORINFO mi{sizeof(mi)};
               HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
               if (mon && GetMonitorInfoW(mon, &mi))
                 return std::to_string(mi.rcMonitor.right - mi.rcMonitor.left) + "x" +
                        std::to_string(mi.rcMonitor.bottom - mi.rcMonitor.top) + " (screen)";
+#endif
               return std::string("Screen size");
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
@@ -1130,13 +1136,13 @@ bool LanRefreshHover(uint8_t* base, float y, int w) {
 // show nothing. Called by the main menu's row draw (ge_f2_driver).
 namespace {
 std::string ReadVersionText() {
-  wchar_t path[MAX_PATH];
-  const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) return {};
-  std::wstring dir(path, n);
-  dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
-  for (const std::wstring& file : {dir + L"resources\\version.txt", dir + L"version.txt"}) {
+  const std::filesystem::path dir = rex::filesystem::GetExecutableFolder();
+  for (const std::filesystem::path& file : {dir / "resources" / "version.txt", dir / "version.txt"}) {
+#if defined(_WIN32)
     FILE* f = _wfopen(file.c_str(), L"rb");
+#else
+    FILE* f = std::fopen(file.c_str(), "rb");
+#endif
     if (!f) continue;
     char buf[32] = {};
     const size_t got = std::fread(buf, 1, sizeof(buf) - 1, f);
@@ -1346,6 +1352,7 @@ void ge_controller_tick() {
   static int countdown = 0;
   if (--countdown > 0) return;
   countdown = 60;
+#if defined(_WIN32)
   typedef DWORD(WINAPI * GetStateFn)(DWORD, void*);
   static GetStateFn get_state = [] {
     HMODULE m = LoadLibraryW(L"xinput1_4.dll");
@@ -1356,15 +1363,13 @@ void ge_controller_tick() {
   bool connected = false;
   alignas(8) unsigned char state[16] = {};
   for (DWORD i = 0; i < 4 && !connected; ++i) connected = get_state(i, state) == ERROR_SUCCESS;
+#else
+  bool connected = SDL_HasGamepad();
+#endif
   // Testing aid: a file named fakepad.txt beside the exe stands for a controller.
   if (!connected) {
-    wchar_t exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) {
-      std::wstring dir(exe, n);
-      dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"fakepad.txt";
-      connected = GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
+    std::error_code ec;
+    connected = std::filesystem::exists(rex::filesystem::GetExecutableFolder() / "fakepad.txt", ec);
   }
   static int last = -1;
   if (last == static_cast<int>(connected)) return;

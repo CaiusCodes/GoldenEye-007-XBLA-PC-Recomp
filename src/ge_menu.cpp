@@ -160,6 +160,11 @@ int ImGuiKeyToVk(ImGuiKey k) {
 
 }  // namespace
 
+namespace ge {
+// Shared with the setup window's key bindings (ge_setup.cpp).
+int ImGuiKeyToVirtualKey(ImGuiKey k) { return ImGuiKeyToVk(k); }
+}  // namespace ge
+
 GeMenuDialog::GeMenuDialog(rex::ui::ImGuiDrawer* drawer, Callbacks callbacks)
     : rex::ui::ImGuiDialog(drawer), callbacks_(std::move(callbacks)) {}
 

@@ -18,10 +18,12 @@
 
 #include <cctype>
 #include <functional>
+#include <optional>
 #include <string>
 
 #include "ge_menu.h"
 #include "ge_postfx.h"
+#include "ge_setup.h"
 
 // Relaunch the current executable as a fresh process (implemented in
 // ge_hooks.cpp, which owns the Win32 includes). Used by the ONLINE menu's
@@ -129,6 +131,31 @@ class GeApp : public rex::ReXApp {
   }
 
   void OnConfigureFonts(ImFontAtlas* atlas) override { ge::AddOverlayFont(atlas); }
+
+  // The setup window (ge_setup.h) comes before the game: the runtime and GPU
+  // are only created once Play is pressed, so everything chosen there applies
+  // to this start.
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
+    if (!ge::ShowSetupAtStart() || !imgui_drawer()) return defaults;
+    ge::SetMouselookSuppressed(true);  // the pointer is needed here
+    if (window()) window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+    GeSetupDialog::Callbacks cb;
+    cb.persist_config = [this] { PersistConfig(); };
+    cb.resize_window = [this](int w, int h) {
+      app_context().CallInUIThreadDeferred([w, h] { ge::ResizeGameWindow(w, h); });
+    };
+    cb.play = [this, defaults, resume] {
+      app_context().CallInUIThreadDeferred([this, defaults, resume] {
+        if (window()) window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+        ge::SetMouselookSuppressed(false);
+        resume(defaults);
+      });
+    };
+    cb.quit = [this] { app_context().CallInUIThreadDeferred([this] { app_context().QuitFromUIThread(); }); };
+    new GeSetupDialog(imgui_drawer(), std::move(cb));  // deletes itself on close
+    return std::nullopt;
+  }
 
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.
