@@ -294,6 +294,66 @@ index 696ff48..c72d0d7 100644
    // Has no dependencies on specific pipeline stages on both ends to simplify
    // use in different scenarios with different pipelines - use explicit barriers
    // for synchronization.
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..89f2cd2 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <chrono>
+ #include <memory>
+ #include <vector>
+ 
+@@ -64,6 +65,9 @@ class InputSystem : public system::IInputSystem {
+   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
++  // ge: RefreshDevices runs on every guest pad poll (4 users x 60 Hz); the
++  // drivers are asked again at most every kRefreshInterval.
++  std::chrono::steady_clock::time_point last_refresh_{};
+   std::vector<InputDriver*> device_owners_;
+ };
+ 
+diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
+index cf0e3d1..3a13fe9 100644
+--- a/include/rex/input/sdl/sdl_input_driver.h
++++ b/include/rex/input/sdl/sdl_input_driver.h
+@@ -11,6 +11,8 @@
+ 
+ #pragma once
+ 
++#include <thread>
++#include <string>
+ #include <atomic>
+ #include <mutex>
+ #include <optional>
+@@ -67,6 +69,12 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+     DeviceId id;
+     // Per pad rather than per guest user, so it survives reassignment.
+     KeystrokeState keystroke;
++    // ge: read once when the pad is added, so polling never calls into SDL
++    // (each SDL joystick call takes SDL's global joystick lock, which the UI
++    // thread holds while SDL rescans devices).
++    std::string name;
++    std::string guid;
++    SDL_JoystickID instance_id = 0;
+   };
+ 
+   // WindowListener
+@@ -95,6 +103,11 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+   bool SDL_Gamepad_initialized_;
+   std::atomic<int> sdl_events_unflushed_;
+   std::atomic<bool> sdl_pumpevents_queued_;
++  // ge: joystick updates (including SDL's device rescans) run on this thread,
++  // not inside SDL_PumpEvents on the UI thread: a slow rescan (52 ms measured)
++  // there held up presenting and the game waited on it (a frame spike).
++  std::thread joystick_thread_;
++  std::atomic<bool> joystick_thread_run_{false};
+   // Appended in connection order, never re-sorted, and unbounded: the
+   // assignment decides how many the guest sees.
+   std::vector<ControllerState> controllers_;
 diff --git a/include/rex/kernel/xam/ge_online_control.h b/include/rex/kernel/xam/ge_online_control.h
 new file mode 100644
 index 0000000..bf78e85
@@ -879,6 +939,92 @@ index 1645848..2513717 100644
    // Rebuild all loggers with new sinks
    for (auto& entry : g_registry) {
      if (entry.name.empty())
+diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
+index d0dce00..6650400 100644
+--- a/src/filesystem/devices/host_path_entry.cpp
++++ b/src/filesystem/devices/host_path_entry.cpp
+@@ -75,11 +75,20 @@ bool HostPathEntry::Truncate() {
+   if (is_read_only() || (attributes_ & kFileAttributeDirectory)) {
+     return false;
+   }
+-  auto file = rex::filesystem::OpenFile(host_path_, "wb");
+-  if (!file) {
+-    return false;
++  auto file_handle = rex::filesystem::FileHandle::OpenExisting(
++      host_path_, FileAccess::kGenericWrite,
++      static_cast<HostPathDevice*>(device_)->allow_share_delete());
++  if (file_handle) {
++    if (!file_handle->SetLength(0)) {
++      return false;
++    }
++  } else {
++    auto file = rex::filesystem::OpenFile(host_path_, "wb");
++    if (!file) {
++      return false;
++    }
++    fclose(file);
+   }
+-  fclose(file);
+   size_ = 0;
+   allocation_size_ = 0;
+   return true;
+@@ -112,11 +121,16 @@ bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
+   if (entry->attributes() & kFileAttributeDirectory) {
+     // Delete entire directory and contents.
+     auto removed = std::filesystem::remove_all(full_path, ec);
+-    return removed >= 1 && removed != static_cast<std::uintmax_t>(-1);
++    if (removed < 1 || removed == static_cast<std::uintmax_t>(-1)) {
++      return false;
++    }
+   } else {
+     // Delete file.
+-    return !std::filesystem::is_directory(full_path) && std::filesystem::remove(full_path, ec);
++    if (std::filesystem::is_directory(full_path, ec) || !std::filesystem::remove(full_path, ec)) {
++      return false;
++    }
+   }
++  return std::filesystem::status(full_path, ec).type() == std::filesystem::file_type::not_found;
+ }
+ 
+ X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>& path_parts) {
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+index a1b4dad..682b23d 100644
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -292,11 +292,12 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+         assert_always();
+         return X_STATUS_ACCESS_DENIED;
+       case FileDisposition::kSuperscede:
+-        // Replace (by delete + recreate).
+-        if (!entry->Delete()) {
+-          return X_STATUS_ACCESS_DENIED;
++        if (!entry->Truncate()) {
++          if (!entry->Delete()) {
++            return X_STATUS_ACCESS_DENIED;
++          }
++          entry = nullptr;
+         }
+-        entry = nullptr;
+         *out_action = FileAction::kSuperseded;
+         break;
+       case FileDisposition::kOpen:
+@@ -306,12 +307,11 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+         break;
+       case FileDisposition::kOverwrite:
+       case FileDisposition::kOverwriteIf:
+-        // Overwrite by delete + recreate, or truncate if delete fails
+-        // (host file may be briefly locked by cloud sync, AV, etc.).
+-        if (entry->Delete()) {
++        if (!entry->Truncate()) {
++          if (!entry->Delete()) {
++            return X_STATUS_ACCESS_DENIED;
++          }
+           entry = nullptr;
+-        } else if (!entry->Truncate()) {
+-          return X_STATUS_ACCESS_DENIED;
+         }
+         *out_action = FileAction::kOverwritten;
+         break;
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
 index a744375..16713ab 100644
 --- a/src/graphics/command_processor.cpp
@@ -1471,6 +1617,45 @@ index 19874a5..3510be5 100644
    }
    return IssueCopy_ReadbackResolvePath();
  }
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 8e6b854..fb1a54d 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -911,6 +912,10 @@ bool PipelineCache::ConfigurePipeline(
+ 
+   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+                    pixel_shader != nullptr;
++  // ge: vblank_timing_log reports each new pipeline (first-time shader work).
++  const auto ge_config_start = std::chrono::steady_clock::now();
++  const bool ge_vs_was_translated = vertex_shader->is_translated();
++  const bool ge_ps_was_translated = !pixel_shader || pixel_shader->is_translated();
+ 
+   // Ensure shaders are translated - needed now for GetCurrentStateDescription.
+   // Edge flags are not supported yet (because polygon primitives are not).
+@@ -1052,6 +1057,15 @@ bool PipelineCache::ConfigurePipeline(
+   current_pipeline_ = new_pipeline;
+   *pipeline_handle_out = new_pipeline;
+   *root_signature_out = new_pipeline->root_signature.load(std::memory_order_acquire);
++  if (rex::cvar::GetFlagByName("vblank_timing_log") == "true") {
++    const double ms = std::chrono::duration<double, std::milli>(
++                          std::chrono::steady_clock::now() - ge_config_start)
++                          .count();
++    REXGPU_INFO("ge new pipeline: {} ({} pixel shader), {:.2f} ms on the GPU thread, "
++                "new shaders: vertex {} pixel {}",
++                use_async ? "built in the background" : "built now", pixel_shader ? "with" : "no",
++                ms, ge_vs_was_translated ? "no" : "yes", ge_ps_was_translated ? "no" : "yes");
++  }
+   return true;
+ }
+ 
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
 index 8f2fcb0..95579a8 100644
 --- a/src/graphics/graphics_system.cpp
@@ -4545,6 +4730,204 @@ index 001f36b..b1e22d8 100644
  void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                                                  bool primitive_polygonal,
                                                  reg::RB_DEPTHCONTROL normalized_depth_control) {
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..9c17e23 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/cvar.h>
++#include <chrono>
+ #include <algorithm>
+ #include <cmath>
+ 
+@@ -79,6 +81,14 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
+ }
+ 
+ void InputSystem::RefreshDevices() {
++  // ge: a new or removed pad is noticed within 250 ms; until then the last
++  // device list (and each driver's own connected check) stands.
++  const auto now = std::chrono::steady_clock::now();
++  if (last_refresh_.time_since_epoch().count() != 0 &&
++      now - last_refresh_ < std::chrono::milliseconds(250)) {
++    return;
++  }
++  last_refresh_ = now;
+   std::vector<DeviceInfo> seen;
+   std::vector<InputDriver*> owners;
+   std::vector<DeviceInfo> enumerated;
+@@ -184,9 +194,28 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+   return nullptr;
+ }
+ 
++// ge: vblank_timing_log diagnostics. Logs a call that took at least `min_ms`.
++namespace {
++struct GeSlowCallTimer {
++  const char* what;
++  double min_ms;
++  uint32_t arg;
++  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++  GeSlowCallTimer(const char* w, double m, uint32_t a) : what(w), min_ms(m), arg(a) {}
++  ~GeSlowCallTimer() {
++    const double ms = std::chrono::duration<double, std::milli>(
++                          std::chrono::steady_clock::now() - start).count();
++    if (ms >= min_ms && rex::cvar::GetFlagByName("vblank_timing_log") == "true") {
++      REXLOG_INFO("ge slow call: {}({}) {:.2f} ms", what, arg, ms);
++    }
++  }
++};
++}  // namespace
++
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
++  GeSlowCallTimer ge_timer("input GetCapabilities", 2.0, user_index);
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -214,6 +243,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
++  GeSlowCallTimer ge_timer("input GetState", 2.0, user_index);
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..2e4baaa 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <chrono>
+ #include <array>
+ #include <filesystem>
+ 
+@@ -30,6 +31,24 @@ namespace {
+ // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
+ constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+ 
++// ge: vblank_timing_log diagnostics. Logs a call that took at least `min_ms`.
++namespace {
++struct GeSlowCallTimer {
++  const char* what;
++  double min_ms;
++  uint32_t arg;
++  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++  GeSlowCallTimer(const char* w, double m, uint32_t a) : what(w), min_ms(m), arg(a) {}
++  ~GeSlowCallTimer() {
++    const double ms = std::chrono::duration<double, std::milli>(
++                          std::chrono::steady_clock::now() - start).count();
++    if (ms >= min_ms && rex::cvar::GetFlagByName("vblank_timing_log") == "true") {
++      REXLOG_INFO("ge slow call: {}({}) {:.2f} ms", what, arg, ms);
++    }
++  }
++};
++}  // namespace
++
+ }  // namespace
+ 
+ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
+@@ -95,6 +114,21 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+       }
+       SDL_Gamepad_initialized_ = true;
+ 
++      // ge: update joysticks on our own thread (SDL_UpdateJoysticks is safe from
++      // any thread); the UI thread's SDL_PumpEvents then only handles window
++      // events. Pad events still reach HandleEvent through the event watch.
++      SDL_SetHint(SDL_HINT_AUTO_UPDATE_JOYSTICKS, "0");
++      joystick_thread_run_ = true;
++      joystick_thread_ = std::thread([this]() {
++        while (joystick_thread_run_.load(std::memory_order_relaxed)) {
++          {
++            GeSlowCallTimer ge_timer("SDL_UpdateJoysticks (input thread)", 4.0, 0);
++            SDL_UpdateJoysticks();
++          }
++          std::this_thread::sleep_for(std::chrono::milliseconds(4));
++        }
++      });
++
+       // Load custom controller mappings if available
+       if (!REXCVAR_GET(hid_mappings_file).empty()) {
+         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
+@@ -124,6 +158,10 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
+       attached_window_->app_context().CallInUIThreadSynchronous(
+           [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
+     }
++    if (joystick_thread_.joinable()) {
++      joystick_thread_run_ = false;
++      joystick_thread_.join();
++    }
+     for (auto& controller : controllers_) {
+       SDL_CloseGamepad(controller.sdl);
+     }
+@@ -155,12 +193,8 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
+   for (const auto& controller : controllers_) {
+     DeviceInfo info;
+     info.id = controller.id;
+-    const char* name = SDL_GetGamepadName(controller.sdl);
+-    info.name = name ? name : "";
+-    char guid_text[33] = {};
+-    SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(controller.sdl)), guid_text,
+-                     static_cast<int>(sizeof(guid_text)));
+-    info.guid = guid_text;
++    info.name = controller.name;  // ge: stored at add time, no SDL call here
++    info.guid = controller.guid;
+     info.synthetic = false;
+     out.push_back(info);
+   }
+@@ -463,6 +497,16 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+   ControllerState state = {};
+   state.sdl = controller;
+   state.id = AllocateDeviceId();
++  {
++    const char* name = SDL_GetGamepadName(controller);
++    state.name = name ? name : "";
++    SDL_Joystick* joystick = SDL_GetGamepadJoystick(controller);
++    char guid_text[33] = {};
++    SDL_GUIDToString(SDL_GetJoystickGUID(joystick), guid_text,
++                     static_cast<int>(sizeof(guid_text)));
++    state.guid = guid_text;
++    state.instance_id = SDL_GetJoystickID(joystick);
++  }
+   state.state_changed = true;  // XInput starts with packet_number = 1
+   UpdateXCapabilities(state);
+   controllers_.push_back(state);
+@@ -590,13 +634,9 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
+ 
+ std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_JoystickID instance_id) {
+   // Loop through our controllers and try to match the given ID.
++  // ge: compare the id stored at add time (no SDL lock per stick/button event).
+   for (size_t i = 0; i < controllers_.size(); i++) {
+-    auto controller = controllers_.at(i).sdl;
+-    auto joystick = SDL_GetGamepadJoystick(controller);
+-    assert(joystick);
+-    auto joy_instance_id = SDL_GetJoystickID(joystick);
+-    assert(joy_instance_id >= 0);
+-    if (joy_instance_id == instance_id) {
++    if (controllers_[i].instance_id == instance_id) {
+       return i;
+     }
+   }
+@@ -668,12 +708,14 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+   c.vibration.right_motor_speed = 0xFFFFu;
+ }
+ 
++
+ void SDLInputDriver::QueueControllerUpdate() {
+   // Pump SDL events to ensure controller state is up to date.
+   bool is_queued = false;
+   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+   if (!is_queued) {
+     attached_window_->app_context().CallInUIThread([this]() {
++      GeSlowCallTimer ge_timer("SDL_PumpEvents (UI thread)", 4.0, 0);
+       SDL_PumpEvents();
+       sdl_pumpevents_queued_ = false;
+     });
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
 index 984b97d..146daaf 100644
 --- a/src/kernel/CMakeLists.txt
@@ -4558,6 +4941,32 @@ index 984b97d..146daaf 100644
      xam/xam_notify.cpp
      xam/xam_nui.cpp
      xam/xam_party.cpp
+diff --git a/src/kernel/crt/file.cpp b/src/kernel/crt/file.cpp
+index e74a44e..1fe75ab 100644
+--- a/src/kernel/crt/file.cpp
++++ b/src/kernel/crt/file.cpp
+@@ -78,8 +78,9 @@ u32 CreateFileA_entry(mapped_string lpFileName, u32 dwDesiredAccess, u32 dwShare
+     return kInvalidHandleValue;
+   }
+ 
+-  auto* xfile = new rex::system::XFile(ks, vfs_file, true);
+-  auto handle = xfile->handle();
++  auto file =
++      rex::system::object_ref<rex::system::XFile>(new rex::system::XFile(ks, vfs_file, true));
++  auto handle = file->handle();
+   REXKRNL_NOISY_DEBUG("rexcrt_CreateFileA: '{}' -> handle={:#x}", path, handle);
+   return handle;
+ }
+@@ -285,7 +286,8 @@ u32 FindFirstFileA_entry(mapped_string lpFileName, mapped_void lpFindFileData) {
+     return kInvalidHandleValue;
+   }
+ 
+-  auto* xfile = new rex::system::XFile(ks, vfs_file, true);
++  auto xfile =
++      rex::system::object_ref<rex::system::XFile>(new rex::system::XFile(ks, vfs_file, true));
+   xfile->SetFindPattern(pattern);
+ 
+   auto* entry = xfile->FindNext();
 diff --git a/src/kernel/xam/ge_lan.cpp b/src/kernel/xam/ge_lan.cpp
 new file mode 100644
 index 0000000..7ee2ded
@@ -5381,8 +5790,72 @@ index 0000000..947905c
 +#pragma pack(pop)
 +
 +}  // namespace rex::kernel::xam::geonline
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 1fb1e16..86c4353 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -160,16 +160,12 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+         // Close any existing mount under this root name first.
+         // Games may reuse the same root without explicitly closing.
+         content_manager->CloseContent(root_name);
+-        if (content_manager->ContentExists(xuid, content_data)) {
+-          content_manager->DeleteContent(xuid, content_data);
+-        }
+-        // Check filesystem state after deletion attempt to decide
+-        // whether to create fresh or open existing.
+-        if (content_manager->ContentExists(xuid, content_data)) {
+-          disposition = kDispositionState::Open;
+-        } else {
+-          disposition = kDispositionState::Create;
++        if (content_manager->ContentExists(xuid, content_data) &&
++            content_manager->DeleteContent(xuid, content_data) != X_ERROR_SUCCESS) {
++          result = X_ERROR_ACCESS_DENIED;
++          break;
+         }
++        disposition = kDispositionState::Create;
+         break;
+       case 3:  // OPEN_EXISTING
+                // Open only if exists.
+@@ -193,9 +189,8 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+           result = X_ERROR_PATH_NOT_FOUND;
+         } else {
+           content_manager->CloseContent(root_name);
+-          content_manager->DeleteContent(xuid, content_data);
+-          if (content_manager->ContentExists(xuid, content_data)) {
+-            disposition = kDispositionState::Open;
++          if (content_manager->DeleteContent(xuid, content_data) != X_ERROR_SUCCESS) {
++            result = X_ERROR_ACCESS_DENIED;
+           } else {
+             disposition = kDispositionState::Create;
+           }
+@@ -209,14 +204,14 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+     uint32_t content_license = 0;
+     if (disposition == kDispositionState::Create) {
+       result = content_manager->CreateContent(root_name, xuid, content_data);
+-      if (XSUCCEEDED(result)) {
++      if (result == X_ERROR_SUCCESS) {
+         content_manager->WriteContentHeaderFile(xuid, content_data);
+       }
+     } else if (disposition == kDispositionState::Open) {
+       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
+     }
+ 
+-    if (license_mask_ptr && XSUCCEEDED(result)) {
++    if (license_mask_ptr && result == X_ERROR_SUCCESS) {
+       *license_mask_ptr = content_license;
+     }
+ 
+@@ -340,7 +335,7 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
+ 
+   *buffer_size_ptr = uint32_t(buffer.size());
+ 
+-  if (XSUCCEEDED(result)) {
++  if (result == X_ERROR_SUCCESS) {
+     // Write data, if we were given a pointer.
+     // This may have just been a size query.
+     if (buffer_ptr) {
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 58e36a4..2de04b8 100644
+index 58e36a4..4651496 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -5610,6 +6083,15 @@ index 58e36a4..2de04b8 100644
  
    // TODO: Instantly complete overlapped
  
+@@ -377,7 +543,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+ }
+ 
+ u32 NetDll_WSACreateEvent_entry() {
+-  XEvent* ev = new XEvent(REX_KERNEL_STATE());
++  auto ev = object_ref<XEvent>(new XEvent(REX_KERNEL_STATE()));
+   ev->Initialize(true, false);
+   return ev->handle();
+ }
 @@ -436,9 +602,25 @@ struct XnAddrStatus {
  };
  
@@ -5738,6 +6220,22 @@ index 58e36a4..2de04b8 100644
  }
  
  u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,13 +800,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+ }
+ 
+ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+-  XSocket* socket = new XSocket(REX_KERNEL_STATE());
++  auto socket = object_ref<XSocket>(new XSocket(REX_KERNEL_STATE()));
+   X_STATUS result =
+       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
+                          XSocket::Protocol((uint32_t)protocol));
+ 
+   if (XFAILED(result)) {
+-    socket->Release();
++    socket->ReleaseHandle();
+ 
+     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
+     XThread::SetLastError(error);
 @@ -603,6 +824,14 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
      return -1;
    }
@@ -5794,7 +6292,19 @@ index 58e36a4..2de04b8 100644
    return 0;
  }
  
-@@ -933,11 +1189,55 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
+@@ -763,7 +1019,10 @@ struct host_set {
+       }
+       // Convert from Xenia -> native
+       auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+-      assert_not_null(socket);
++      if (!socket) {
++        this->count = i;
++        break;
++      }
+       this->sockets[i] = socket;
+     }
+   }
+@@ -933,11 +1192,55 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
    XThread::SetLastError(error_code);
  }
  
@@ -5850,7 +6360,7 @@ index 58e36a4..2de04b8 100644
  REX_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
  REX_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
  REX_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
-@@ -1030,25 +1330,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,25 +1333,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -5876,6 +6386,129 @@ index 58e36a4..2de04b8 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index 3f1a852..a840cdd 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -12,6 +12,8 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <chrono>
++#include <rex/cvar.h>
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -100,11 +102,30 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
+   return true;
+ }
+ 
++// ge: vblank_timing_log diagnostics. Logs a call that took at least `min_ms`.
++namespace {
++struct GeSlowCallTimer {
++  const char* what;
++  double min_ms;
++  uint32_t arg;
++  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++  GeSlowCallTimer(const char* w, double m, uint32_t a) : what(w), min_ms(m), arg(a) {}
++  ~GeSlowCallTimer() {
++    const double ms = std::chrono::duration<double, std::milli>(
++                          std::chrono::steady_clock::now() - start).count();
++    if (ms >= min_ms && rex::cvar::GetFlagByName("vblank_timing_log") == "true") {
++      REXLOG_INFO("ge slow call: {}({}) {:.2f} ms", what, arg, ms);
++    }
++  }
++};
++}  // namespace
++
+ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+                        ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
+                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
+                        u32 file_attributes, u32 share_access, u32 creation_disposition,
+                        u32 create_options) {
++  GeSlowCallTimer ge_timer("NtCreateFile", 2.0, 0);
+   // note used. maybe later
+   // uint64_t allocation_size = 0;  // is this correct???
+   // if (allocation_size_ptr) {
+@@ -179,6 +200,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+                      ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attributes,
+                      ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, u32 open_options) {
++  GeSlowCallTimer ge_timer("NtOpenFile", 2.0, 0);
+   return NtCreateFile_entry(handle_out, desired_access, object_attributes, io_status_block, nullptr,
+                             0, 0, static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
+                             open_options);
+@@ -187,6 +209,20 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
++  // ge: vblank_timing_log reports game file reads taking 2 ms or more.
++  struct GeReadTimer {
++    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    uint32_t length;
++    explicit GeReadTimer(uint32_t len) : length(len) {}
++    ~GeReadTimer() {
++      const double ms = std::chrono::duration<double, std::milli>(
++                            std::chrono::steady_clock::now() - start)
++                            .count();
++      if (ms >= 2.0 && rex::cvar::GetFlagByName("vblank_timing_log") == "true") {
++        REXKRNL_INFO("ge file read: {} bytes, {:.2f} ms", length, ms);
++      }
++    }
++  } ge_read_timer{static_cast<uint32_t>(buffer_length)};
+   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
+   const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
+   REXKRNL_IMPORT_TRACE(
+@@ -382,6 +418,7 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
+ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,
+                       ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_void buffer,
+                       u32 buffer_length, mapped_u64 byte_offset_ptr) {
++  GeSlowCallTimer ge_timer("NtWriteFile", 2.0, 0);
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   // Grab event to signal.
+@@ -455,7 +492,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
+ 
+ u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
+                                mapped_void object_attribs, u32 num_concurrent_threads) {
+-  auto completion = new XIOCompletion(REX_KERNEL_STATE());
++  auto completion = object_ref<XIOCompletion>(new XIOCompletion(REX_KERNEL_STATE()));
+   if (out_handle) {
+     *out_handle = completion->handle();
+   }
+@@ -488,7 +525,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
+ 
+   auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
+   if (!port) {
+-    status = X_STATUS_INVALID_HANDLE;
++    return X_STATUS_INVALID_HANDLE;
+   }
+ 
+   uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
+@@ -515,6 +552,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
+ 
+ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
+                                     ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
++  GeSlowCallTimer ge_timer("NtQueryFullAttributesFile", 2.0, 0);
+   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
+   auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+   REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
+@@ -560,6 +598,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+                                ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                                ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
+                                ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
++  GeSlowCallTimer ge_timer("NtQueryDirectoryFile", 2.0, 0);
+   if (length < 72) {
+     return X_STATUS_INFO_LENGTH_MISMATCH;
+   }
+@@ -598,6 +637,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+ }
+ 
+ u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
++  GeSlowCallTimer ge_timer("NtFlushBuffersFile", 2.0, 0);
+   auto result = X_STATUS_SUCCESS;
+ 
+   if (io_status_block_ptr) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_module.cpp b/src/kernel/xboxkrnl/xboxkrnl_module.cpp
 index dcb3af6..10b111e 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_module.cpp
@@ -6069,6 +6702,43 @@ index c10694c..d85444a 100644
      }
    }
  
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index bd6c797..d0c7bfd 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -155,9 +155,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+       continue;
+     }
+ 
+-    XCONTENT_AGGREGATE_DATA content_data;
+-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
+-                                         content_type, content_data))) {
++    XCONTENT_AGGREGATE_DATA content_data{};
++    if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
++                              content_data) == X_ERROR_SUCCESS) {
+       result.emplace_back(std::move(content_data));
+     } else {
+       content_data.device_id = device_id;
+@@ -375,7 +375,8 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
+   auto package_path = ResolvePackagePath(xuid, data);
+   std::error_code ec;
+   auto dir_removed = std::filesystem::remove_all(package_path, ec);
+-  if (ec) {
++  if (ec ||
++      std::filesystem::status(package_path, ec).type() != std::filesystem::file_type::not_found) {
+     return X_ERROR_ACCESS_DENIED;
+   }
+ 
+@@ -427,7 +428,8 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
+ 
+   std::error_code ec;
+   auto dir_removed = std::filesystem::remove_all(package_path, ec);
+-  if (ec) {
++  if (ec ||
++      std::filesystem::status(package_path, ec).type() != std::filesystem::file_type::not_found) {
+     return X_ERROR_ACCESS_DENIED;
+   }
+ 
 diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
 index a77f5e6..166b286 100644
 --- a/src/system/xam/user_profile.cpp
@@ -6173,10 +6843,23 @@ index c24fbd1..d8d2395 100644
    REXSYS_DEBUG("XEvent {:08X} ({})", handle(), manual_reset_ ? "manual" : "auto");
    SaveObject(stream);
 diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
-index 2d13ac8..c06d0b7 100644
+index 2d13ac8..987ec24 100644
 --- a/src/system/xsocket.cpp
 +++ b/src/system/xsocket.cpp
-@@ -163,28 +163,30 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+@@ -61,7 +61,12 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
+ }
+ 
+ X_STATUS XSocket::Close() {
++  if (native_handle_ == uint64_t(-1)) {
++    return X_STATUS_SUCCESS;
++  }
++
+   int ret = rex::net::socket_close(native_handle_);
++  native_handle_ = -1;
+   if (ret != 0) {
+     return X_STATUS_UNSUCCESSFUL;
+   }
+@@ -163,28 +168,30 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
  
  int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
                        uint32_t* from_len) {
@@ -6219,7 +6902,7 @@ index 2d13ac8..c06d0b7 100644
  
    sockaddr_in nfrom;
    socklen_t nfromlen = sizeof(sockaddr_in);
-@@ -192,8 +194,8 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+@@ -192,8 +199,8 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
                       (sockaddr*)&nfrom, &nfromlen);
    if (from) {
      from->sin_family = nfrom.sin_family;
@@ -6230,7 +6913,7 @@ index 2d13ac8..c06d0b7 100644
      std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
    }
  
-@@ -221,15 +223,17 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+@@ -221,15 +228,17 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
    }
    */
  

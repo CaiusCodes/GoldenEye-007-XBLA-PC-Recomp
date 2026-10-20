@@ -31,6 +31,8 @@ namespace ge {
 void LaunchSelfDetached();
 // Start a fresh copy of the game and end this one at once (settings saved first).
 [[noreturn]] void RestartSelf();
+// Render Scale: sets resolution_scale from ge_render_scale (ge_native_menu.cpp).
+void ApplyRenderScale();
 // Windowed mode: resize the game window's client area (call on the UI thread).
 void ResizeGameWindow(int w, int h);
 // Native Video Settings page: resize the window for a chosen resolution.
@@ -129,6 +131,13 @@ class GeApp : public rex::ReXApp {
   }
 
   void OnConfigureFonts(ImFontAtlas* atlas) override { ge::AddOverlayFont(atlas); }
+
+  // Render Scale (ge_render_scale): sets the SDK's resolution_scale after the
+  // config is loaded and before the emulated GPU is created (it is read once).
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    (void)config;
+    ge::ApplyRenderScale();
+  }
 
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.

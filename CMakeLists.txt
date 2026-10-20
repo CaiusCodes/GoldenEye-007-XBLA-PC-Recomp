@@ -43,6 +43,7 @@ set(GE_SOURCES
     src/ge_ce_patches.cpp
     src/ge_native_menu.cpp
     src/ge_portraits.cpp
+    src/ge_gpu_detect.cpp
 )
 
 # The release version: VERSION is the single source of truth (Make-Release.ps1

@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "ge_gpu_detect.h"
 #include "ge_init.h"  // PPCRegister/PPCContext + generated function decls
 
 #include <rex/cvar.h>
@@ -182,6 +183,56 @@ void SetS(const char* cvar, const std::string& v) {
   if (g_persist) g_persist();
 }
 float GetF(const char* cvar) { return static_cast<float>(std::atof(GetS(cvar).c_str())); }
+
+// Render Scale (see ge::ApplyRenderScale below).
+int g_render_scale_active = 0;  // the scale this run uses (0 = not set yet)
+ge::GpuForScale g_scale_gpu;    // read once at start
+// Auto: the smallest scale whose internal height (720 x scale) covers the
+// display height (720p 1x, up to 1440p 2x, above 3x), capped at 1x on an
+// integrated GPU or one with under 4 GB of video memory and at 2x otherwise:
+// 3x is only ever a manual choice. Ultrawide goes by height (the game draws
+// into 16:9 surfaces and the picture is stretched to 21:9).
+int AutoRenderScale(int display_height) {
+  const int target = display_height <= 720 ? 1 : display_height <= 1440 ? 2 : 3;
+  const bool modest_gpu = g_scale_gpu.integrated ||
+                          (g_scale_gpu.known && g_scale_gpu.video_memory_mb < 4096);
+  return std::min(target, modest_gpu ? 1 : 2);
+}
+// The display height the game uses now: in fullscreen the real mode of the
+// monitor the game window is on, windowed the chosen window height. Cached for
+// half a second (the Video page asks every frame).
+int CurrentDisplayHeight() {
+  static ULONGLONG last = 0;
+  static int cached = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (cached && now - last < 500) return cached;
+  last = now;
+  int h = 0;
+  if (GetB("fullscreen")) {
+    if (HWND w = GetForegroundWindow()) {
+      DWORD pid = 0;
+      GetWindowThreadProcessId(w, &pid);
+      if (pid == GetCurrentProcessId()) h = ge::WindowDisplayHeight(w);
+    }
+    if (h <= 0) h = ge::StartupDisplayHeight(std::atoi(GetS("monitor").c_str()));
+  } else {
+    h = std::atoi(GetS("ge_window_height").c_str());
+  }
+  cached = h > 0 ? h : 1080;
+  return cached;
+}
+int DesiredRenderScale() {
+  const std::string v = GetS("ge_render_scale");
+  if (v == "1" || v == "2" || v == "3") return v[0] - '0';
+  return AutoRenderScale(CurrentDisplayHeight());
+}
+// Leaving the Video page with a different Render Scale: save and restart now
+// (the emulated GPU reads the scale only when it starts).
+void RestartIfRenderScaleChanged() {
+  if (g_render_scale_active && DesiredRenderScale() != g_render_scale_active && g_restart) {
+    g_restart();
+  }
+}
 
 std::vector<Row> BuildPage(Page page);
 void CycleName(int dir);  // the player card's name list (below)
@@ -367,12 +418,32 @@ std::vector<Row> BuildPage(Page page) {
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
           });
-      // Render backend, used from the next start (Auto: NVIDIA -> Direct3D 12,
-      // other GPUs -> Vulkan; D3D12 crashes on AMD for this game).
-      AddChoice(rows, "Graphics API:", "gpu",
-                {{"Auto", "auto"}, {"Direct3D 12", "d3d12"}, {"Vulkan", "vulkan"}});
+      // No Graphics API row: Auto picks it (NVIDIA -> Direct3D 12, other GPUs
+      // -> Vulkan); gpu = "d3d12" / "vulkan" in ge.toml still overrides it.
+      AddAction(
+          rows, "Render Scale:",
+          [] {
+            static const char* const kOrder[] = {"auto", "1", "2", "3"};
+            const std::string cur = GetS("ge_render_scale");
+            int i = 0;
+            for (int k = 0; k < 4; ++k)
+              if (cur == kOrder[k]) i = k;
+            SetS("ge_render_scale", kOrder[(i + 1) % 4]);
+          },
+          [] {
+            const std::string v = GetS("ge_render_scale");
+            std::string text = v == "1" || v == "2" || v == "3"
+                                   ? v + "x"
+                                   : "Auto (" + std::to_string(DesiredRenderScale()) + "x)";
+            if (g_render_scale_active && DesiredRenderScale() != g_render_scale_active)
+              text += " - restarts";
+            return text;
+          });
       AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
-      AddAction(rows, "Done", [] { g_leave_page = true; });
+      AddAction(rows, "Done", [] {
+        RestartIfRenderScaleChanged();
+        g_leave_page = true;
+      });
       break;
     }
     case Page::PostFx:
@@ -738,6 +809,7 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
       g_page = parent;
       return false;
     }
+    if (g_page == Page::Video) RestartIfRenderScaleChanged();
     return true;
   }
   g_name_arrow = 0;
@@ -1148,6 +1220,35 @@ std::string ReadVersionText() {
   return {};
 }
 }  // namespace
+
+// --- Render Scale -------------------------------------------------------------
+// The SDK's resolution_scale multiplies the game's 1280x720 render targets
+// (2x = 2560x1440). It is read once when the emulated GPU starts, so a change
+// applies by restarting the game (done for the player on leaving the Video
+// page). Auto: 1x on an integrated GPU (handhelds, laptops), else 2x.
+REXCVAR_DEFINE_STRING(ge_render_scale, "auto", "Video",
+                      "Render scale: auto (1x on integrated GPUs, else 2x), 1, 2 or 3")
+    .allowed({"auto", "1", "2", "3"});
+namespace ge {
+void ApplyRenderScale() {
+  g_scale_gpu = DetectGpuForScale();
+  // The window does not exist yet: fullscreen uses the monitor it will open on.
+  const bool fullscreen = GetB("fullscreen");
+  const int height = fullscreen ? StartupDisplayHeight(std::atoi(GetS("monitor").c_str()))
+                                : std::atoi(GetS("ge_window_height").c_str());
+  const int auto_scale = AutoRenderScale(height > 0 ? height : 1080);
+  const std::string choice = GetS("ge_render_scale");
+  g_render_scale_active =
+      (choice == "1" || choice == "2" || choice == "3") ? choice[0] - '0' : auto_scale;
+  rex::cvar::SetFlagByName("resolution_scale", std::to_string(g_render_scale_active));
+  REXLOG_INFO(
+      "Render scale {}x (setting {}; auto {}x from {} display height {}; GPU {}, {}, {} MB video "
+      "memory)",
+      g_render_scale_active, choice, auto_scale, fullscreen ? "fullscreen" : "windowed", height,
+      g_scale_gpu.name, g_scale_gpu.integrated ? "integrated" : "dedicated",
+      g_scale_gpu.video_memory_mb);
+}
+}  // namespace ge
 
 // Run-time state shared with the renderer (never saved to ge.toml).
 REXCVAR_DEFINE_BOOL(ge_backdrop_active, false, "Transient",

@@ -80,8 +80,9 @@ Help & Options on the main menu holds the PC settings:
                      invert look, key bindings
   Video Settings     windowed or fullscreen, window size (up to 3840x2160),
                      V-Sync, FPS counter, field of view, anti-aliasing,
-                     texture filtering, graphics API (Auto = Direct3D 12
-                     on NVIDIA, Vulkan on AMD and others), post-processing
+                     texture filtering, render scale (Auto: 1x on
+                     handhelds and laptops, 2x on most graphics cards),
+                     post-processing
   Online Settings    player name and the online server options
 
 Screen Ratio (Normal, 16:9 or 21:9) is in the game's own options.

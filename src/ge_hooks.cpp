@@ -185,6 +185,10 @@ struct CPProbe : rex::graphics::CommandProcessor {
 std::atomic<uint32_t> g_present_cpcnt{0};
 // Guest tick at the last present, for a bounded completion wait.
 std::atomic<uint32_t> g_present_tb{0};
+// vblank_timing_log slow-frame report: GPU waits since the last present.
+std::atomic<uint64_t> g_hitch_gpu_wait_us{0};
+std::atomic<uint64_t> g_hitch_gpu_wait_max_us{0};
+std::atomic<uint32_t> g_hitch_watchdog{0};
 inline rex::graphics::CommandProcessor* ge_cp() {
   auto* ks = rex::system::kernel_state();
   if (!ks) return nullptr;
@@ -516,11 +520,114 @@ void ge_watchdog_thread() {
   }
 }
 
+// vblank_timing_log: late-frame sampler. When the game has not shown a frame
+// for 28 ms (a missed 60 Hz tick), sample the main game thread (start
+// 0x8235E4A8) without stopping it: its last guest return address (lr) and the
+// guest return addresses on its stack, i.e. the call chain it is stuck in.
+// Up to three samples per late frame (at about +28, +53, +78 ms).
+void ge_stall_sampler_thread() {
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  PPCContext* main_ctx = nullptr;
+  uint32_t sampled_for = 0;
+  int samples = 0;
+  uint32_t flag_poll = 0;
+  bool on = false;
+  LARGE_INTEGER freq;
+  QueryPerformanceFrequency(&freq);
+  for (;;) {
+    Sleep(1);
+    if ((flag_poll++ % 500) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+    if (!on) continue;
+    if (!main_ctx) {
+      auto* ks = rex::system::kernel_state();
+      if (!ks) continue;
+      for (auto& th : ks->object_table()->GetObjectsByType<rex::system::XThread>()) {
+        if (th && th->creation_params()->start_address == 0x8235E4A8u && th->thread_state()) {
+          main_ctx = th->thread_state()->context();
+          break;
+        }
+      }
+      if (!main_ctx) continue;
+    }
+    // Where the main thread spends its time: every 10 s, the most common
+    // guest return addresses (lr) sampled once a millisecond.
+    {
+      static std::vector<std::pair<uint32_t, uint32_t>> hist;
+      static LARGE_INTEGER hist_start{};
+      LARGE_INTEGER t;
+      QueryPerformanceCounter(&t);
+      if (!hist_start.QuadPart) hist_start = t;
+      const uint32_t lr_now = static_cast<uint32_t>(main_ctx->lr);
+      bool found = false;
+      for (auto& e : hist)
+        if (e.first == lr_now) { ++e.second; found = true; break; }
+      if (!found && hist.size() < 256) hist.push_back({lr_now, 1});
+      if (t.QuadPart - hist_start.QuadPart >= 10 * freq.QuadPart) {
+        std::sort(hist.begin(), hist.end(),
+                  [](const auto& x, const auto& y) { return x.second > y.second; });
+        uint32_t total = 0;
+        for (auto& e : hist) total += e.second;
+        char hb[400];
+        int ho = 0;
+        hb[0] = 0;
+        for (size_t i = 0; i < hist.size() && i < 8 && ho < 360; ++i) {
+          int k = std::snprintf(hb + ho, sizeof(hb) - ho, "%x:%u%% ", hist[i].first,
+                                total ? hist[i].second * 100 / total : 0);
+          if (k > 0) ho += k;
+        }
+        REXKRNL_INFO("ge main thread lr: {}", hb);
+        hist.clear();
+        hist_start = t;
+      }
+    }
+    const uint32_t n = g_guest_presents.load(std::memory_order_acquire);
+    if (n < 2) continue;
+    if (n != sampled_for) {
+      sampled_for = n;
+      samples = 0;
+    }
+    if (samples >= 3) continue;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const int64_t last = g_present_qpc[(n - 1) % kPresentRing].load(std::memory_order_relaxed);
+    const double age_ms = double(now.QuadPart - last) * 1000.0 / double(freq.QuadPart);
+    if (age_ms < 28.0 + 25.0 * samples || age_ms > 2000.0) continue;
+    ++samples;
+    const uint32_t lr = static_cast<uint32_t>(main_ctx->lr);
+    const uint32_t sp = main_ctx->r1.u32;
+    char buf[400];
+    int off = 0;
+    buf[0] = 0;
+    if (sp >= 0x10000u && sp < 0xC0000000u) {
+      MEMORY_BASIC_INFORMATION mbi;
+      uint8_t* hsp = base + sp;
+      if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT) {
+        uint8_t* end = std::min(hsp + 0x1800u,
+                                static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize);
+        int found = 0;
+        for (uint8_t* pp = hsp; pp + 4 <= end && found < 14 && off < 360; pp += 4) {
+          uint32_t v;
+          std::memcpy(&v, pp, 4);
+          v = __builtin_bswap32(v);
+          if (v >= 0x82000000u && v < 0x84000000u) {
+            int k = std::snprintf(buf + off, sizeof(buf) - off, "%x ", v);
+            if (k > 0) off += k;
+            ++found;
+          }
+        }
+      }
+    }
+    REXKRNL_INFO("ge stall sample: no frame for {:.0f} ms; game thread lr={:#x} stack: {}", age_ms,
+                 lr, buf);
+  }
+}
+
 inline void ge_start_watchdog_once() {
   static std::atomic<bool> started{false};
   bool expected = false;
   if (started.compare_exchange_strong(expected, true)) {
     std::thread(ge_watchdog_thread).detach();
+    std::thread(ge_stall_sampler_thread).detach();
   }
 }
 }  // namespace
@@ -605,11 +712,13 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   // this stays a one-shot "proceed past this stall", not a permanent skip.
   static thread_local uint32_t s_wait_start = 0;
   static thread_local bool s_waiting = false;
+  static thread_local LARGE_INTEGER s_wait_qpc{};
   if (!drawn) {
-    if (!s_waiting) { s_waiting = true; s_wait_start = t; }
+    if (!s_waiting) { s_waiting = true; s_wait_start = t; QueryPerformanceCounter(&s_wait_qpc); }
     else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
       drawn = true;
       if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
+      g_hitch_watchdog.fetch_add(1, std::memory_order_relaxed);
     }
     // The six GPU-completion waits poll this routine in a TIGHT busy spin. With
     // dozens of guest threads that oversubscribes the cores and starves the
@@ -618,9 +727,38 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // never advances, the spin never exits = freeze (visual stops, audio thread
     // keeps running on its own core). Yield here while still waiting so the CP
     // worker reliably gets CPU and can finish the frame.
-    if (!drawn) std::this_thread::yield();
-  } else {
+    // The game waits here for most of each frame (87% of its main thread,
+    // measured in Dam). Yield for the first ~0.5 ms, then sleep in 0.5 ms
+    // high-resolution steps: a whole CPU core no longer spins at 100%, which
+    // on power-limited handhelds leaves more power for the GPU. Sleeping also
+    // gives the CP worker the CPU it needs.
+    if (!drawn) {
+      if ((uint32_t)(t - s_wait_start) < 25000u) {  // ~0.5 ms @49.875MHz
+        std::this_thread::yield();
+      } else {
+        static thread_local HANDLE s_wait_timer =
+            CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */,
+                                   TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -5000;  // 0.5 ms in 100 ns units
+        if (s_wait_timer && SetWaitableTimer(s_wait_timer, &due, 0, nullptr, nullptr, FALSE)) {
+          WaitForSingleObject(s_wait_timer, INFINITE);
+        } else {
+          std::this_thread::yield();
+        }
+      }
+    }
+  }
+  if (drawn && s_waiting) {
+    // vblank_timing_log: how long the game waited for the GPU this frame.
     s_waiting = false;
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    const uint64_t us = uint64_t((now.QuadPart - s_wait_qpc.QuadPart) * 1000000 / freq.QuadPart);
+    g_hitch_gpu_wait_us.fetch_add(us, std::memory_order_relaxed);
+    uint64_t prev = g_hitch_gpu_wait_max_us.load(std::memory_order_relaxed);
+    while (us > prev && !g_hitch_gpu_wait_max_us.compare_exchange_weak(prev, us)) {}
   }
 
   if (dev && idblk && idblk < 0xFFFFFFFEu && drawn) {
@@ -664,6 +802,26 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     static int64_t log_start = 0;
     if ((poll++ & 0x3F) == 0)
       log_on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+    // Each slow frame (over 25 ms, i.e. a missed 60 Hz tick) on its own line,
+    // with what the game thread waited on; file reads and new pipelines are
+    // logged by the SDK at the same time stamps.
+    {
+      const uint64_t wait_us = g_hitch_gpu_wait_us.exchange(0, std::memory_order_relaxed);
+      const uint64_t wait_max_us = g_hitch_gpu_wait_max_us.exchange(0, std::memory_order_relaxed);
+      const uint32_t watchdog = g_hitch_watchdog.exchange(0, std::memory_order_relaxed);
+      const uint32_t n = g_guest_presents.load(std::memory_order_relaxed);
+      if (log_on && n >= 2) {
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        const int64_t prev = g_present_qpc[(n - 2) % kPresentRing].load(std::memory_order_relaxed);
+        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(freq.QuadPart);
+        if (prev && ms > 25.0 && ms < 1000.0) {
+          REXKRNL_INFO("ge slow frame: {:.1f} ms; GPU wait {:.1f} ms (longest {:.1f}){}; stage {}",
+                       ms, wait_us / 1000.0, wait_max_us / 1000.0,
+                       watchdog ? ", GPU wait timed out" : "", LD32(base, 0x82423E00u));  // stage number
+        }
+      }
+    }
     if (log_on) {
       LARGE_INTEGER freq;
       QueryPerformanceFrequency(&freq);
