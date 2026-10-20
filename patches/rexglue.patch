@@ -58,7 +58,7 @@ index 9e5b57e..17b9171 100644
  > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
  
 diff --git a/cmake/rex_version.cmake b/cmake/rex_version.cmake
-index 2c14df1..7bfa3b6 100644
+index 2c14df1..d0ee072 100644
 --- a/cmake/rex_version.cmake
 +++ b/cmake/rex_version.cmake
 @@ -22,7 +22,9 @@ function(rex_compute_version out_var)
@@ -72,6 +72,15 @@ index 2c14df1..7bfa3b6 100644
              set(${out_var} "${CMAKE_MATCH_1}" PARENT_SCOPE)
              return()
          endif()
+@@ -39,7 +41,7 @@ function(rex_compute_version out_var)
+         return()
+     endif()
+ 
+-    if(NOT ARG_GIT_DESCRIBE_LONG MATCHES "^v([0-9]+)\\.([0-9]+)(\\.([0-9]+))?(\\.([0-9]+))?-([0-9]+)-g([0-9a-f]+)$")
++    if(NOT ARG_GIT_DESCRIBE_LONG MATCHES "^v([0-9]+)\\.([0-9]+)(\\.([0-9]+))?(\\.([0-9]+))?[A-Za-z]*-([0-9]+)-g([0-9a-f]+)$")
+         message(FATAL_ERROR "rex_compute_version: unparseable describe output '${ARG_GIT_DESCRIBE_LONG}'")
+     endif()
+     set(tag_major ${CMAKE_MATCH_1})
 diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
 index 41e6dce..8dfbb98 100644
 --- a/cmake/rexglue_helpers.cmake
