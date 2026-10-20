@@ -683,43 +683,59 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   bool drawn = (cpc != g_present_cpcnt.load(std::memory_order_relaxed)) ||
                (wpi != 0u && rpi == wpi);
 
-  //  (c) WATCHDOG. If neither (a) nor (b) has happened for a long stretch
-  //      (~80ms of real wall time), the CP is genuinely stuck on this frame
-  //      (e.g. blocked in a D3D12 op the backend can't complete for this
-  //      title's scene). Force-complete so the guest's GPU-completion spin
-  //      clears instead of deadlocking forever -- and, critically, releases the
-  //      device spinlock other guest threads (sub_821A3A40) are blocked on.
-  //      This turns a permanent freeze into a recoverable hitch. 80ms is far
-  //      above any real frame time, so normal frames still clear via (a)/(b).
-  // sub_82198C28 checks the skip bit *(device+10941)&2 at its very top and
-  // returns 0 (proceed) before any fence/timeout logic -- the only GUARANTEED
-  // way out of the spin. Writing the completion fence does not always release
-  // it (it resets the routine's own timeout anchor, and only helps when
-  // submit>=target). So: when the wait has stalled for a real wall-clock
-  // stretch (~80ms, far above any frame), SET the skip bit so the guest stops
-  // blocking on a GPU completion the CP cannot deliver -- and, crucially,
-  // releases the device spinlock the rest of the guest threads are stuck on.
-  // When the CP is keeping up (drawn via (a)/(b)) CLEAR it again so waits are
-  // honored and frames stay visible. Net: visible when the GPU keeps up, a
-  // brief skipped (black) frame during a stall instead of a permanent freeze.
-  // Do NOT touch the skip bit on the normal/keeping-up path -- the game manages
-  // *(device+10941)&2 itself (sets it when it intends NOT to block, clears it
-  // when it wants to wait), and clearing it during early init hangs the boot.
-  // Only SET it when the wait has genuinely stalled (~80ms, far above any real
-  // frame): that forces sub_82198C28 to return 0 next iteration so the guest
-  // stops blocking on a GPU completion the CP cannot deliver -- breaking the
-  // spinlock cascade / freeze. The game re-clears it on its own next frame, so
-  // this stays a one-shot "proceed past this stall", not a permanent skip.
+  //  (c) WATCHDOG. If the game has been stuck in this wait for a long stretch
+  //      (~80 ms, far above any real frame), the GPU fence it waits for is not
+  //      coming (the CP is stuck on this frame, or idle with the fence never
+  //      written). Do what the game's own GPU-hang handler (sub_821A2D50) does
+  //      to the fence, without its "GPU dead" mode: mark every fence issued so
+  //      far as reached, *(dev+10896)[0] := target - 2 (dev+10908 = the next
+  //      fence; sub_8219CEA0 keeps target = last fence + 2). The caller
+  //      (sub_8219D060 and friends) then sees its fence passed and moves on;
+  //      the GPU keeps processing the ring and later fences work normally.
+  //      This turns a permanent freeze into a recoverable hitch.
+  //      Do NOT set the skip bit *(dev+10941)&2 for this: that bit is the
+  //      game's "GPU is hung" mode (sub_821A2D50 sets it, sub_821A4D50 then
+  //      stops sending anything to the GPU, sub_8219CEA0 fakes fences on the
+  //      CPU) and nothing ever clears it, so the picture froze for good while
+  //      the sound played on (the 0.9.5e black-screen report; old builds too).
+  //      The stretch is measured from the last sign of progress: the GPU fence
+  //      or the game's present count changing, or this thread not polling
+  //      for over ~2 ms (a new wait). It counts whether or not (a)/(b) say
+  //      "drawn", because with the ring drained (b) holds while the fence
+  //      still never arrives.
+  const uint32_t fence_ptr = dev ? LD32(base, dev + 10896) : 0;
+  const bool fence_ok = fence_ptr >= 0x1000u && fence_ptr < 0xFFFFFFF0u;
+  const uint32_t fence = fence_ok ? LD32(base, fence_ptr) : 0;
+  const uint32_t presents = g_guest_presents.load(std::memory_order_relaxed);
+  static thread_local uint32_t s_ep_start = 0, s_ep_last = 0, s_ep_fence = 0, s_ep_presents = 0;
+  static thread_local bool s_ep = false;
+  if (!s_ep || (uint32_t)(t - s_ep_last) > 100000u ||  // ~2 ms @49.875MHz
+      fence != s_ep_fence || presents != s_ep_presents) {
+    s_ep = true;
+    s_ep_start = t;
+    s_ep_fence = fence;
+    s_ep_presents = presents;
+  }
+  s_ep_last = t;
+  if ((uint32_t)(t - s_ep_start) > 4000000u && fence_ok) {  // ~80 ms @49.875MHz
+    s_ep_start = t;
+    const uint32_t reached = LD32(base, dev + 10908) - 2u;
+    if (static_cast<int32_t>(reached - fence) > 0) {
+      ST32(base, fence_ptr, reached);
+      s_ep_fence = reached;
+    }
+    drawn = true;
+    g_hitch_watchdog.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+      REXKRNL_INFO("GE GPU wait timed out (over 80 ms); marked issued fences reached");
+    }
+  }
   static thread_local uint32_t s_wait_start = 0;
   static thread_local bool s_waiting = false;
   static thread_local LARGE_INTEGER s_wait_qpc{};
   if (!drawn) {
     if (!s_waiting) { s_waiting = true; s_wait_start = t; QueryPerformanceCounter(&s_wait_qpc); }
-    else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
-      drawn = true;
-      if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
-      g_hitch_watchdog.fetch_add(1, std::memory_order_relaxed);
-    }
     // The six GPU-completion waits poll this routine in a TIGHT busy spin. With
     // dozens of guest threads that oversubscribes the cores and starves the
     // rexglue CP worker thread -- which is the very thread that must advance the
