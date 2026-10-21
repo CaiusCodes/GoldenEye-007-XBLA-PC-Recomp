@@ -33,6 +33,7 @@ void LaunchSelfDetached();
 [[noreturn]] void RestartSelf();
 // Render Scale: sets resolution_scale from ge_render_scale (ge_native_menu.cpp).
 void ApplyRenderScale();
+void ApplyRenderScaleToGpu();
 // Windowed mode: resize the game window's client area (call on the UI thread).
 void ResizeGameWindow(int w, int h);
 // Native Video Settings page: resize the window for a chosen resolution.
@@ -132,8 +133,8 @@ class GeApp : public rex::ReXApp {
 
   void OnConfigureFonts(ImFontAtlas* atlas) override { ge::AddOverlayFont(atlas); }
 
-  // Render Scale (ge_render_scale): sets the SDK's resolution_scale after the
-  // config is loaded and before the emulated GPU is created (it is read once).
+  // Render Scale (ge_render_scale): picks the scale once the config is loaded;
+  // OnCreateDialogs hands it to the GPU plugin before the emulated GPU starts.
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
     ge::ApplyRenderScale();
@@ -142,6 +143,9 @@ class GeApp : public rex::ReXApp {
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    // The GPU plugin (and its resolution_scale cvar) is loaded by now and the
+    // emulated GPU is not created yet: apply the Render Scale chosen above.
+    ge::ApplyRenderScaleToGpu();
     // Window/taskbar title shown while running. Overrides the SDK default
     // ("ge <build stamp>"); the internal app name stays "ge" so ge.toml and the
     // user data dir are unchanged.

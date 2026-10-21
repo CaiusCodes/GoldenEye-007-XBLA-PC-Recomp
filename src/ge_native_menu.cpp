@@ -1243,13 +1243,25 @@ void ApplyRenderScale() {
   const std::string choice = GetS("ge_render_scale");
   g_render_scale_active =
       (choice == "1" || choice == "2" || choice == "3") ? choice[0] - '0' : auto_scale;
-  rex::cvar::SetFlagByName("resolution_scale", std::to_string(g_render_scale_active));
+  // resolution_scale belongs to the GPU plugin, which is not loaded yet:
+  // ApplyRenderScaleToGpu sets it once the plugin is in (setting it here was
+  // silently rejected, so every scale drew at the plugin's default 2x).
   REXLOG_INFO(
       "Render scale {}x (setting {}; auto {}x from {} display height {}; GPU {}, {}, {} MB video "
       "memory)",
       g_render_scale_active, choice, auto_scale, fullscreen ? "fullscreen" : "windowed", height,
       g_scale_gpu.name, g_scale_gpu.integrated ? "integrated" : "dedicated",
       g_scale_gpu.video_memory_mb);
+}
+void ApplyRenderScaleToGpu() {
+  const std::string want = std::to_string(g_render_scale_active > 0 ? g_render_scale_active : 2);
+  const bool ok = rex::cvar::SetFlagByName("resolution_scale", want);
+  const std::string now = rex::cvar::GetFlagByName("resolution_scale");
+  if (ok && now == want) {
+    REXLOG_INFO("Render scale: resolution_scale = {}", now);
+  } else {
+    REXLOG_WARN("Render scale: could not set resolution_scale to {} (it is {})", want, now);
+  }
 }
 }  // namespace ge
 

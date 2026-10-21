@@ -405,17 +405,18 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       // --- Internal resolution (supersampling). This is the resolution the 3D
       //     scene is actually rendered at, independent of the window size: the
       //     game's native 1280x720 surfaces are scaled by an integer factor and
-      //     downsampled to the window. Driven by the engine's resolution_scale
-      //     cvar (1x/2x/3x/4x). It is kRequiresRestart, so the choice is written
-      //     now and the render targets are rebuilt at this size on next launch.
+      //     downsampled to the window. The same setting as Render Scale on the
+      //     game's Video page (ge_render_scale, which sets the engine's
+      //     resolution_scale at start-up), so the two menus always agree; it is
+      //     read once at start, so the choice applies on the next launch.
       //     1080p is intentionally absent: 720p x 1.5 is not an integer scale,
       //     and only integer supersampling is guaranteed to change render res. ---
       static const struct { const char* label; const char* scale; } kIRes[] = {
+          {"Auto", "auto"},
           {"720p (native, 1x)", "1"},
           {"1440p / 2K (2x)", "2"},
-          {"2160p / 4K (3x)", "3"},
-          {"2880p (4x)", "4"}};
-      const std::string cur_scale = rex::cvar::GetFlagByName("resolution_scale");
+          {"2160p / 4K (3x)", "3"}};
+      const std::string cur_scale = rex::cvar::GetFlagByName("ge_render_scale");
       int ires_idx = 0;
       for (int i = 0; i < IM_ARRAYSIZE(kIRes); ++i)
         if (cur_scale == kIRes[i].scale) ires_idx = i;
@@ -425,7 +426,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
         for (int i = 0; i < IM_ARRAYSIZE(kIRes); ++i) {
           bool sel = (i == ires_idx);
           if (ImGui::Selectable(kIRes[i].label, sel)) {
-            rex::cvar::SetFlagByName("resolution_scale", kIRes[i].scale);
+            rex::cvar::SetFlagByName("ge_render_scale", kIRes[i].scale);
             if (callbacks_.persist_config) callbacks_.persist_config();
           }
           if (sel) ImGui::SetItemDefaultFocus();
