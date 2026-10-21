@@ -850,9 +850,6 @@ void SetNativeMenuCallbacks(std::function<void(bool)> fullscreen, std::function<
   g_persist = std::move(persist);
   g_restart = std::move(restart);
 }
-void PersistSettings() {
-  if (g_persist) g_persist();
-}
 void SetWindowSizeHandler(std::function<void(int, int)> handler) {
   g_window_size = std::move(handler);
 }

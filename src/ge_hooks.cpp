@@ -55,7 +55,6 @@ void ge_fix_mp_menu_branch() {
 // The game window (found when it has focus); defined with the mouse code.
 HWND g_game_hwnd_for_resize();
 namespace ge { void ApplyPlayerName(const std::string& requested); }
-namespace ge { void PersistSettings(); }  // ge_native_menu.cpp: save ge.toml
 namespace ge { void TestEnterText(const std::string& text); }  // ge_native_menu.cpp
 namespace ge { void TestToggleReady(); void LobbyPollTick(uint8_t* base, uint32_t menu); }  // ge_native_menu.cpp
 namespace { void ge_rename_tick(PPCContext& ctx, uint8_t* base); }  // below: a new player name
@@ -1058,13 +1057,11 @@ void ge_hook_830E0750(PPCRegister& r7, PPCRegister& r8, PPCRegister& r11,
 // user-facing sensitivity multiplier is ge_mouse_sens (defined below).
 REXCVAR_DEFINE_BOOL(ge_invert_x, false, "Input", "Invert mouse X (horizontal) look");
 REXCVAR_DEFINE_BOOL(ge_invert_y, false, "Input", "Invert mouse Y (vertical) look");
-REXCVAR_DEFINE_BOOL(ge_disable_autoaim, true, "Input",
-                    "Turn auto-aim off once for mouse-look (the player can turn it back on in "
-                    "the game's options); look-ahead stays off while mouse-look is on");
-// Set once ge_disable_autoaim has turned the game's auto-aim option off, so the
-// player's own choice in the options or the watch is kept from then on.
-REXCVAR_DEFINE_BOOL(ge_autoaim_default_applied, false, "Input",
-                    "Auto-aim has been turned off once for mouse-look");
+// Off by default: the game's own Auto-Aim option (front-end Controls, watch)
+// decides. On, mouse-look keeps auto-aim off whatever that option says.
+REXCVAR_DEFINE_BOOL(ge_disable_autoaim, false, "Input",
+                    "Keep auto-aim off while mouse-look is on, whatever the game's Auto-Aim "
+                    "option says");
 REXCVAR_DEFINE_DOUBLE(ge_menu_sensitivity, 1.0, "Input",
                       "Mouse sensitivity in menus").range(0.05, 20.0);
 REXCVAR_DEFINE_DOUBLE(ge_aim_turn_distance, 0.4, "Input",
@@ -2168,25 +2165,20 @@ void ge_mouse_camera(uint8_t* base) {
   if (game_control_disabled == 0)
     game_control_disabled = LD32(base, player + GE_OFF_WATCH);
 
-  // Disable look-ahead, only when the pause/control state changes -- xenia's
-  // exact behaviour. (Doing it every frame oscillated against the game's
-  // per-frame auto-aim in multiplayer and caused the camera jitter.)
-  // Auto-aim is turned off only once (ge_autoaim_default_applied): xenia
-  // cleared it on every pause change, so turning Auto-Aim on in the options or
-  // the watch was undone within a moment and did nothing.
+  // Disable look-ahead (and auto-aim only with ge_disable_autoaim), only when
+  // the pause/control state changes -- xenia's exact behaviour. (Doing it
+  // every frame oscillated against the game's per-frame auto-aim in
+  // multiplayer and caused the camera jitter.) Auto-aim used to be cleared here
+  // by default, so turning Auto-Aim on in the options or the watch was undone
+  // at the next pause and did nothing.
   if (game_pause_flag != prev_pause || game_control_disabled != prev_disabled) {
     const uint32_t sp = LD32(base, GE_SETTINGS_PTR);
     if (sp) {
       const uint32_t sva = sp + GE_SETTINGS_BITS;
       uint32_t settings = LD32(base, sva);
       if (settings & GE_SET_LookAhead) settings &= ~(uint32_t)GE_SET_LookAhead;
-      // In a mission, so the profile's saved options have been loaded.
-      if (disable_autoaim && !REXCVAR_GET(ge_autoaim_default_applied) &&
-          LD32(base, GE_CURRENT_STAGE) != GE_TITLE_STAGE) {
+      if (disable_autoaim && (settings & GE_SET_AutoAim))
         settings &= ~(uint32_t)GE_SET_AutoAim;
-        rex::cvar::SetFlagByName("ge_autoaim_default_applied", "true");
-        ge::PersistSettings();
-      }
       ST32(base, sva, settings);
     }
     prev_pause = game_pause_flag;
