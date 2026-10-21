@@ -6421,19 +6421,20 @@ index 58e36a4..4651496 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-index 3f1a852..a840cdd 100644
+index 3f1a852..fa79346 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-@@ -12,6 +12,8 @@
+@@ -12,6 +12,9 @@
  // Disable warnings about unused parameters for kernel functions
  #pragma GCC diagnostic ignored "-Wunused-parameter"
  
++#include <atomic>
 +#include <chrono>
 +#include <rex/cvar.h>
  #include <rex/filesystem/device.h>
  #include <rex/kernel/xboxkrnl/private.h>
  #include <rex/logging.h>
-@@ -100,11 +102,30 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
+@@ -100,11 +103,30 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
    return true;
  }
  
@@ -6464,7 +6465,24 @@ index 3f1a852..a840cdd 100644
    // note used. maybe later
    // uint64_t allocation_size = 0;  // is this correct???
    // if (allocation_size_ptr) {
-@@ -179,6 +200,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+@@ -169,7 +191,15 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+ 
+   *handle_out = handle;
+   if (XFAILED(result)) {
+-    REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
++    // ge: games probe for many optional files (GoldenEye: hundreds per boot),
++    // which buried everything else in the log. Log the first 20.
++    static std::atomic<uint32_t> ge_failed_opens{0};
++    const uint32_t ge_failed = ge_failed_opens.fetch_add(1, std::memory_order_relaxed);
++    if (ge_failed < 20) {
++      REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
++    } else if (ge_failed == 20) {
++      REXKRNL_INFO("NtCreateFile: further files that are not found are not logged");
++    }
+   } else {
+     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+   }
+@@ -179,6 +209,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
  u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
                       ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attributes,
                       ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, u32 open_options) {
@@ -6472,7 +6490,7 @@ index 3f1a852..a840cdd 100644
    return NtCreateFile_entry(handle_out, desired_access, object_attributes, io_status_block, nullptr,
                              0, 0, static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
                              open_options);
-@@ -187,6 +209,20 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+@@ -187,6 +218,20 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
  u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                       mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                       mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
@@ -6493,7 +6511,7 @@ index 3f1a852..a840cdd 100644
    uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
    const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
    REXKRNL_IMPORT_TRACE(
-@@ -382,6 +418,7 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
+@@ -382,6 +427,7 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
  u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,
                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_void buffer,
                        u32 buffer_length, mapped_u64 byte_offset_ptr) {
@@ -6501,7 +6519,7 @@ index 3f1a852..a840cdd 100644
    X_STATUS result = X_STATUS_SUCCESS;
  
    // Grab event to signal.
-@@ -455,7 +492,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
+@@ -455,7 +501,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
  
  u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
                                 mapped_void object_attribs, u32 num_concurrent_threads) {
@@ -6510,7 +6528,7 @@ index 3f1a852..a840cdd 100644
    if (out_handle) {
      *out_handle = completion->handle();
    }
-@@ -488,7 +525,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
+@@ -488,7 +534,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
  
    auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
    if (!port) {
@@ -6519,7 +6537,7 @@ index 3f1a852..a840cdd 100644
    }
  
    uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
-@@ -515,6 +552,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
+@@ -515,6 +561,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
  
  u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
                                      ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
@@ -6527,7 +6545,7 @@ index 3f1a852..a840cdd 100644
    auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
    auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
    REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
-@@ -560,6 +598,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+@@ -560,6 +607,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
                                 ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                                 ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
                                 ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
@@ -6535,7 +6553,7 @@ index 3f1a852..a840cdd 100644
    if (length < 72) {
      return X_STATUS_INFO_LENGTH_MISMATCH;
    }
-@@ -598,6 +637,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+@@ -598,6 +646,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
  }
  
  u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {

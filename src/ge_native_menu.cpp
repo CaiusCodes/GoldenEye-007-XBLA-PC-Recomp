@@ -21,6 +21,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ge_gpu_detect.h"
@@ -1252,6 +1253,52 @@ void ApplyRenderScale() {
       g_render_scale_active, choice, auto_scale, fullscreen ? "fullscreen" : "windowed", height,
       g_scale_gpu.name, g_scale_gpu.integrated ? "integrated" : "dedicated",
       g_scale_gpu.video_memory_mb);
+}
+// The top of every log: what a bug report needs to know about the player's
+// PC and settings, once at start-up (nothing runs per frame).
+void LogSessionHeader() {
+  std::string windows = "unknown";
+  if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    if (auto rtl_get_version =
+            reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"))) {
+      RTL_OSVERSIONINFOW vi{};
+      vi.dwOSVersionInfoSize = sizeof(vi);
+      if (rtl_get_version(&vi) == 0) {
+        windows = std::to_string(vi.dwMajorVersion) + "." + std::to_string(vi.dwMinorVersion) +
+                  " build " + std::to_string(vi.dwBuildNumber);
+      }
+    }
+  }
+  std::string cpu = "unknown";
+  {
+    wchar_t name[128] = {};
+    DWORD size = sizeof(name);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     L"ProcessorNameString", RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS) {
+      char utf8[256] = {};
+      WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+      cpu = utf8;
+      while (!cpu.empty() && cpu.back() == ' ') cpu.pop_back();
+    }
+  }
+  MEMORYSTATUSEX mem{};
+  mem.dwLength = sizeof(mem);
+  GlobalMemoryStatusEx(&mem);
+  const std::string version = ReadVersionText();
+  REXLOG_INFO("==== GoldenEye 007 XBLA PC Recomp {} ====", version.empty() ? "dev build" : version);
+  REXLOG_INFO("PC: Windows {}; {} ({} threads); {} GB RAM", windows, cpu,
+              std::thread::hardware_concurrency(), (mem.ullTotalPhys + (512ull << 20)) >> 30);
+  REXLOG_INFO("GPU: {} ({}, {} MB video memory), driver {}",
+              g_scale_gpu.name.empty() ? "unknown" : g_scale_gpu.name,
+              g_scale_gpu.integrated ? "integrated" : "dedicated", g_scale_gpu.video_memory_mb,
+              g_scale_gpu.driver.empty() ? "unknown" : g_scale_gpu.driver);
+  REXLOG_INFO("Display: {}; {} {}x{}", StartupDisplayMode(std::atoi(GetS("monitor").c_str())),
+              GetB("fullscreen") ? "fullscreen, window" : "windowed", GetS("ge_window_width"),
+              GetS("ge_window_height"));
+  REXLOG_INFO("Settings: renderer {}, render scale {} ({}x), V-Sync {}, mouse look {}",
+              GetS("gpu"), GetS("ge_render_scale"), g_render_scale_active, GetS("vsync"),
+              GetS("ge_mouselook_enable"));
 }
 void ApplyRenderScaleToGpu() {
   const std::string want = std::to_string(g_render_scale_active > 0 ? g_render_scale_active : 2);

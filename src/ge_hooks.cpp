@@ -865,10 +865,38 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     } else {
       log_start = 0;
     }
+    // Always on, for bug reports: one line a minute with the frame rate, the
+    // frames that missed a 60 Hz tick and the worst one. A few counters per
+    // frame, no allocation; the stage number says where the player was.
+    {
+      static LARGE_INTEGER freq{};
+      static int64_t minute_start = 0, prev = 0;
+      static uint32_t frames = 0, slow = 0, very_slow = 0;
+      static double worst = 0.0;
+      if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+      if (prev) {
+        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(freq.QuadPart);
+        ++frames;
+        if (ms > 25.0) ++slow;
+        if (ms > 100.0) ++very_slow;
+        if (ms < 5000.0) worst = std::max(worst, ms);
+      }
+      prev = qpc.QuadPart;
+      if (!minute_start) minute_start = qpc.QuadPart;
+      const double elapsed = double(qpc.QuadPart - minute_start) / double(freq.QuadPart);
+      if (elapsed >= 60.0) {
+        REXKRNL_INFO("ge minute: {:.1f} fps; {} frames over 25 ms ({} over 100 ms); worst {:.0f} ms; "
+                     "stage {}",
+                     frames / elapsed, slow, very_slow, worst, LD32(base, 0x82423E00u));
+        minute_start = qpc.QuadPart;
+        frames = slow = very_slow = 0;
+        worst = 0.0;
+      }
+    }
   }
 
-  static uint32_t n = 0;                       // throttled fps heartbeat
-  if ((n++ & 0x3F) == 0)
+  static uint32_t n = 0;  // throttled present heartbeat (vblank_timing_log only)
+  if ((n++ & 0x3F) == 0 && rex::cvar::GetFlagByName("vblank_timing_log") == "true")
     REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
 }
 

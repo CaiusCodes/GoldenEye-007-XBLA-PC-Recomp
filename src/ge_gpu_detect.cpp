@@ -58,6 +58,13 @@ GpuForScale DetectGpuForScale() {
         WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr,
                             nullptr);
         out.name = name;
+        LARGE_INTEGER umd{};
+        if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
+          out.driver = std::to_string(HIWORD(umd.HighPart)) + "." +
+                       std::to_string(LOWORD(umd.HighPart)) + "." +
+                       std::to_string(HIWORD(umd.LowPart)) + "." +
+                       std::to_string(LOWORD(umd.LowPart));
+        }
         ID3D12Device* device = nullptr;
         if (SUCCEEDED(create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                     reinterpret_cast<void**>(&device)))) {
@@ -94,9 +101,10 @@ int ModeHeight(HMONITOR monitor) {
 }
 }  // namespace
 
+namespace {
 // The display the game shows on, before its window exists: the SDK's `monitor`
 // option (0 = default, 1 = primary, 2.. = by enumeration order) or the primary.
-int StartupDisplayHeight(int monitor_option) {
+HMONITOR StartupMonitor(int monitor_option) {
   HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
   if (monitor_option > 1) {
     std::vector<HMONITOR> all;
@@ -109,7 +117,21 @@ int StartupDisplayHeight(int monitor_option) {
         reinterpret_cast<LPARAM>(&all));
     if (monitor_option <= int(all.size())) monitor = all[monitor_option - 1];
   }
-  return ModeHeight(monitor);
+  return monitor;
+}
+}  // namespace
+
+int StartupDisplayHeight(int monitor_option) { return ModeHeight(StartupMonitor(monitor_option)); }
+
+std::string StartupDisplayMode(int monitor_option) {
+  MONITORINFOEXW mi{};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(StartupMonitor(monitor_option), &mi)) return "unknown";
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &mode)) return "unknown";
+  return std::to_string(mode.dmPelsWidth) + "x" + std::to_string(mode.dmPelsHeight) + " @ " +
+         std::to_string(mode.dmDisplayFrequency) + " Hz";
 }
 
 // The display a window (the game's) is on.
