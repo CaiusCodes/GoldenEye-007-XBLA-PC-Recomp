@@ -538,7 +538,13 @@ void ge_stall_sampler_thread() {
   for (;;) {
     Sleep(1);
     if ((flag_poll++ % 500) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
-    if (!on) continue;
+    if (!on) {
+      // Diagnostics off: check again in half a second instead of waking up a
+      // thousand times a second for nothing.
+      Sleep(500);
+      flag_poll = 0;
+      continue;
+    }
     if (!main_ctx) {
       auto* ks = rex::system::kernel_state();
       if (!ks) continue;
