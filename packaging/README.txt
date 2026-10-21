@@ -154,6 +154,18 @@ If setup rejects your package, the reason is shown in the window and in
 resources\runtime\logs\setup.log. When reporting a problem, include the
 newest files from resources\runtime\logs.
 
+Reporting slowdowns, stutter or freezes:
+  1. Close the game. Open resources\userdata\ge.toml in Notepad and add
+     this line:  performance_diagnostics = true
+  2. Start the game and do what shows the problem (for example stand
+     where the stutter happens for a minute or two), then close it.
+  3. Send the newest ge_NNN.log from resources\runtime\logs (sort the
+     folder by date). Its first lines list the settings and the PC's
+     graphics card; it holds no saves, passwords or file names of yours.
+  4. Change the line back to false (or delete it): the detailed log
+     writes more often and is only needed while reporting.
+The 20 newest logs are kept; older ones are deleted automatically.
+
 LEGAL
 -----
 

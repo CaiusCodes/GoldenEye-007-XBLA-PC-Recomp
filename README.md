@@ -149,6 +149,19 @@ console.
 **If something goes wrong include the newest files from
 `resources\runtime\logs` when reporting it.**
 
+For slowdowns, stutter or freezes, a detailed log helps most:
+
+1. Close the game and add `performance_diagnostics = true` to
+   `resources\userdata\ge.toml` (open it in Notepad).
+2. Start the game, do what shows the problem for a minute or two, then close it.
+3. Attach the newest `ge_NNN.log` from `resources\runtime\logs`. It lists the
+   settings and graphics card at the top, then frame timing; it holds no saves
+   or passwords.
+4. Set it back to `false` afterwards.
+
+Every log, detailed or not, has a line a minute with the frame rate and the
+frames that took too long. The 20 newest logs are kept.
+
 ## For Developers
 
 Building from source. You need Git, CMake 3.25 or newer, Ninja, LLVM/Clang 18

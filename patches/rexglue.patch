@@ -908,7 +908,7 @@ index ae72b7a..237315f 100644
  
  // Offset of the current guest system file time relative to the guest base time.
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
-index 228728d..43d5154 100644
+index 228728d..912a144 100644
 --- a/src/core/cvar.cpp
 +++ b/src/core/cvar.cpp
 @@ -539,6 +539,8 @@ std::string SerializeToTOML() {
@@ -920,6 +920,15 @@ index 228728d..43d5154 100644
      if (entry.getter() != entry.default_value) {
        if (entry.type == FlagType::String) {
          result += entry.name + " = \"" + entry.getter() + "\"\n";
+@@ -705,7 +707,7 @@ void SaveConfig(const std::filesystem::path& config_path) {
+     }
+     file << "# Auto-generated cvar configuration\n";
+     file << content;
+-    REXLOG_INFO("Saved config to {}", config_path.string());
++    REXLOG_INFO("Saved config to {}", config_path.filename().string());  // ge: no user folder in logs
+   } catch (const std::exception& e) {
+     REXLOG_ERROR("SaveConfig: {}", e.what());
+   }
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
 index 1645848..2513717 100644
 --- a/src/core/logging.cpp
@@ -1691,7 +1700,7 @@ index 8e6b854..fb1a54d 100644
  }
  
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..95579a8 100644
+index 8f2fcb0..cdb9bba 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -12,6 +12,7 @@
@@ -1710,7 +1719,7 @@ index 8f2fcb0..95579a8 100644
  #include <rex/graphics/command_processor.h>
  #include <rex/graphics/flags.h>
  #include <rex/kernel/xboxkrnl/video.h>
-@@ -31,14 +33,32 @@
+@@ -31,14 +33,34 @@
  #include <rex/ui/window.h>
  #include <rex/ui/windowed_app_context.h>
  
@@ -1733,7 +1742,9 @@ index 8f2fcb0..95579a8 100644
                      "Store shaders persistently and load them when loading games to avoid "
                      "runtime spikes and freezes when playing the game not for the first time.");
  
-+REXCVAR_DEFINE_BOOL(vblank_timing_log, false, "GPU",
++// ge: Transient (never written to ge.toml): the game turns it on from its
++// performance_diagnostics option, which is the setting players change.
++REXCVAR_DEFINE_BOOL(vblank_timing_log, false, "Transient",
 +                    "Log the guest vblank timer's interval jitter every 10 seconds");
 +
 +REXCVAR_DEFINE_INT32(max_fps, 60, "GPU",
@@ -1744,7 +1755,7 @@ index 8f2fcb0..95579a8 100644
  namespace {
  
  rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
-@@ -156,18 +176,98 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -156,18 +178,98 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
          uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
          uint64_t vsync_interval_ticks =
              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
@@ -1848,7 +1859,7 @@ index 8f2fcb0..95579a8 100644
          return 0;
        }));
    // TODO: set_can_debugger_suspend not yet ported
-@@ -312,8 +412,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -312,8 +414,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
    //          interrupt_callback_, source, cpu);
  
    uint64_t args[] = {source, interrupt_callback_data_};

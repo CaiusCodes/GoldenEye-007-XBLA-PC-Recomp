@@ -35,6 +35,7 @@ void LaunchSelfDetached();
 void ApplyRenderScale();
 void ApplyRenderScaleToGpu();
 void LogSessionHeader();
+void ApplyDiagnostics();
 // Windowed mode: resize the game window's client area (call on the UI thread).
 void ResizeGameWindow(int w, int h);
 // Native Video Settings page: resize the window for a chosen resolution.
@@ -147,6 +148,7 @@ class GeApp : public rex::ReXApp {
     // The GPU plugin (and its resolution_scale cvar) is loaded by now and the
     // emulated GPU is not created yet: apply the Render Scale chosen above.
     ge::ApplyRenderScaleToGpu();
+    ge::ApplyDiagnostics();
     ge::LogSessionHeader();
     // Window/taskbar title shown while running. Overrides the SDK default
     // ("ge <build stamp>"); the internal app name stays "ge" so ge.toml and the

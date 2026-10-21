@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1254,6 +1255,41 @@ void ApplyRenderScale() {
       g_scale_gpu.name, g_scale_gpu.integrated ? "integrated" : "dedicated",
       g_scale_gpu.video_memory_mb);
 }
+// performance_diagnostics (ge.toml, off by default): the one setting players
+// change to send a detailed log. It turns on the existing detailed timing,
+// vblank_timing_log (slow frames with what the game waited on, GPU waits,
+// input/SDL/file timers, the stall sampler, frame and present statistics),
+// which is never saved itself. Off, only the header, the minute line and
+// warnings/errors are logged. Called once the GPU plugin is loaded.
+REXCVAR_DEFINE_BOOL(performance_diagnostics, false, "Diagnostics",
+                    "Detailed performance logging for bug reports (restart to apply)");
+void ApplyDiagnostics() {
+  if (GetB("performance_diagnostics")) {
+    rex::cvar::SetFlagByName("vblank_timing_log", "true");
+    // Write the log out every 2 s, so a game that freezes and is closed from
+    // Task Manager still leaves the lines that lead up to it.
+    spdlog::flush_every(std::chrono::seconds(2));
+  }
+  // Keep the 20 newest session logs (each run starts a new ge_NNN.log).
+  wchar_t exe[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return;
+  std::wstring dir(exe, n);
+  dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"logs\\";
+  std::vector<std::pair<int, std::wstring>> logs;
+  WIN32_FIND_DATAW fd;
+  HANDLE find = FindFirstFileW((dir + L"ge_*.log").c_str(), &fd);
+  if (find == INVALID_HANDLE_VALUE) return;
+  do {
+    const int seq = _wtoi(fd.cFileName + 3);
+    if (seq > 0) logs.emplace_back(seq, fd.cFileName);
+  } while (FindNextFileW(find, &fd));
+  FindClose(find);
+  if (logs.size() <= 20) return;
+  std::sort(logs.begin(), logs.end());
+  for (size_t i = 0; i + 20 < logs.size(); ++i) DeleteFileW((dir + logs[i].second).c_str());
+}
+
 // The top of every log: what a bug report needs to know about the player's
 // PC and settings, once at start-up (nothing runs per frame).
 void LogSessionHeader() {
@@ -1299,6 +1335,9 @@ void LogSessionHeader() {
   REXLOG_INFO("Settings: renderer {}, render scale {} ({}x), V-Sync {}, mouse look {}",
               GetS("gpu"), GetS("ge_render_scale"), g_render_scale_active, GetS("vsync"),
               GetS("ge_mouselook_enable"));
+  REXLOG_INFO("Performance diagnostics: {}",
+              GetB("performance_diagnostics") ? "on" : "off (set performance_diagnostics = true "
+                                                       "in ge.toml for a detailed log)");
 }
 void ApplyRenderScaleToGpu() {
   const std::string want = std::to_string(g_render_scale_active > 0 ? g_render_scale_active : 2);
