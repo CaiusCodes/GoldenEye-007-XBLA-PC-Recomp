@@ -55,6 +55,7 @@ void ge_fix_mp_menu_branch() {
 // The game window (found when it has focus); defined with the mouse code.
 HWND g_game_hwnd_for_resize();
 namespace ge { void ApplyPlayerName(const std::string& requested); }
+namespace ge { void PersistSettings(); }  // ge_native_menu.cpp: save ge.toml
 namespace ge { void TestEnterText(const std::string& text); }  // ge_native_menu.cpp
 namespace ge { void TestToggleReady(); void LobbyPollTick(uint8_t* base, uint32_t menu); }  // ge_native_menu.cpp
 namespace { void ge_rename_tick(PPCContext& ctx, uint8_t* base); }  // below: a new player name
@@ -2413,6 +2414,53 @@ static void ge_watch_help_rows(uint8_t* base) {
 // screen, or a window stretched that far) gets 21:9, anything else 16:9. The
 // game shapes its 16:9 frame for the chosen TV, so the frame is presented at
 // that shape too (4:3 and 21:9; 16:9 is the frame's own).
+// Auto-Aim is kept in ge.toml (ge_autoaim, off by default): applied to the
+// first profile's option bit (+0x298 & 0x10) when the profile is loaded, and
+// a change the player makes in the Controls options or the watch is saved
+// back, so the choice lasts whether or not the game saves its profile.
+REXCVAR_DEFINE_BOOL(ge_autoaim, false, "Input", "Auto-aim (the game's Auto-Aim option)");
+void ge_autoaim_tick(uint8_t* base) {
+  static uint32_t last_profile = 0, settle_word = 0;
+  static int settle = 0;  // frames the profile's options have been unchanged
+  static bool applied = false, last_on = false;
+  const uint32_t profile = LD32(base, GE_SETTINGS_PTR);
+  if (!profile || base[profile + 1358u] == 0) {
+    last_profile = 0;
+    return;
+  }
+  const uint32_t sva = profile + GE_SETTINGS_BITS;
+  const uint32_t word = LD32(base, sva);
+  const bool on = (word & GE_SET_AutoAim) != 0;
+  if (profile != last_profile) {
+    last_profile = profile;
+    applied = false;
+    settle = 0;
+    settle_word = word;
+    return;
+  }
+  // The game fills in the saved options a frame or so after the profile
+  // appears: wait until they have stayed put for a second, then apply ours.
+  if (!applied) {
+    if (word != settle_word) {
+      settle_word = word;
+      settle = 0;
+      return;
+    }
+    if (++settle < 60) return;
+    const bool want = REXCVAR_GET(ge_autoaim);
+    if (on != want) ST32(base, sva, want ? (word | GE_SET_AutoAim) : (word & ~(uint32_t)GE_SET_AutoAim));
+    applied = true;
+    last_on = want;
+    return;
+  }
+  if (on != last_on) {
+    last_on = on;
+    rex::cvar::SetFlagByName("ge_autoaim", on ? "true" : "false");
+    ge::PersistSettings();
+    REXKRNL_INFO("GEAUTOAIM {}", on ? "on" : "off");
+  }
+}
+
 void ge_screen_ratio_tick(uint8_t* base) {
   static int countdown = 0;
   static int shown = -1;
@@ -3705,6 +3753,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
                      menu != 12u && menu != 24u && menu != 25u);
   }
   ge_screen_ratio_tick(base);
+  ge_autoaim_tick(base);
   ge_charsel_tick(base);
 
   if (g_test_aim > 0) {
