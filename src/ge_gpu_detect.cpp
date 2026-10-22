@@ -134,6 +134,37 @@ std::string StartupDisplayMode(int monitor_option) {
          std::to_string(mode.dmDisplayFrequency) + " Hz";
 }
 
+// Exact refresh rate of the display a window is on (for example 59.940), from
+// the display configuration's rational refresh; 0 if unknown.
+double DisplayRefreshHz(HWND window) {
+  MONITORINFOEXW mi{};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &mi)) return 0.0;
+  UINT32 path_count = 0, mode_count = 0;
+  if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) !=
+      ERROR_SUCCESS) {
+    return 0.0;
+  }
+  std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+  std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+  if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count,
+                         modes.data(), nullptr) != ERROR_SUCCESS) {
+    return 0.0;
+  }
+  for (UINT32 i = 0; i < path_count; ++i) {
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+    source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    source.header.size = sizeof(source);
+    source.header.adapterId = paths[i].sourceInfo.adapterId;
+    source.header.id = paths[i].sourceInfo.id;
+    if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
+    if (wcscmp(source.viewGdiDeviceName, mi.szDevice) != 0) continue;
+    const DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+    return r.Denominator ? double(r.Numerator) / double(r.Denominator) : 0.0;
+  }
+  return 0.0;
+}
+
 // The display a window (the game's) is on.
 int WindowDisplayHeight(HWND window) {
   return ModeHeight(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY));

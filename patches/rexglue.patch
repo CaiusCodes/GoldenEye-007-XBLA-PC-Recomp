@@ -148,14 +148,81 @@ index 0000000..33d3dcc
 +}  // namespace gpu_recovery
 +}  // namespace rex
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
-index 96d362b..fb9caab 100644
+index 96d362b..7fa0b66 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
 +++ b/include/rex/graphics/d3d12/command_processor.h
-@@ -220,7 +220,11 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -78,6 +78,41 @@ class D3D12CommandProcessor : public CommandProcessor {
+   }
+ 
+   uint64_t GetCurrentFrame() const { return frame_current_; }
++
++  // ge: GPU pass timing (vblank_timing_log only). Timestamp queries around the
++  // command processor's submissions, resolves, EDRAM dumps and render target
++  // transfers, summed per frame and logged every 600 frames ("ge gpu time").
++  enum class GeGpuTimer : uint32_t {
++    kSubmission,
++    kResolve,
++    kDump,
++    kTransfer,
++    kTextureLoad,
++    kUpload,
++    kCount
++  };
++  // Returns a timestamp index to pass to GeGpuTimerEnd, or UINT32_MAX when off.
++  uint32_t GeGpuTimerBegin();
++  void GeGpuTimerEnd(GeGpuTimer timer, uint32_t begin);
++  void GeCountUploadBytes(uint32_t address, uint64_t bytes) {
++    if (ge_gpu_timer_on_) {
++      ge_gpu_timer_upload_bytes_ += bytes;
++      ge_gpu_timer_upload_by_mb_[(address >> 20) & 511] += bytes;
++    }
++  }
++  class GeGpuTimerScope {
++   public:
++    GeGpuTimerScope(D3D12CommandProcessor& command_processor, GeGpuTimer timer)
++        : command_processor_(command_processor),
++          timer_(timer),
++          begin_(command_processor.GeGpuTimerBegin()) {}
++    ~GeGpuTimerScope() { command_processor_.GeGpuTimerEnd(timer_, begin_); }
++
++   private:
++    D3D12CommandProcessor& command_processor_;
++    GeGpuTimer timer_;
++    uint32_t begin_;
++  };
+   uint64_t GetCompletedFrame() const { return frame_completed_; }
+ 
+   // Returns true if the barrier has been inserted (the new state is different).
+@@ -220,7 +255,36 @@ class D3D12CommandProcessor : public CommandProcessor {
    bool IssueCopy() override;
  
   private:
 -  static constexpr uint32_t kQueueFrames = 3;
++  // ge: GPU pass timing (see GeGpuTimerBegin).
++  static constexpr uint32_t kGeGpuTimestampsPerFrame = 4096;
++  struct GeGpuTimerInterval {
++    GeGpuTimer timer;
++    uint32_t begin;
++    uint32_t end;
++  };
++  void GeGpuTimerFrameOpen();
++  void GeGpuTimerFrameClose();
++  Microsoft::WRL::ComPtr<ID3D12QueryHeap> ge_gpu_timer_heap_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> ge_gpu_timer_readback_;
++  bool ge_gpu_timer_on_ = false;
++  bool ge_gpu_timer_failed_ = false;
++  uint64_t ge_gpu_timer_frequency_ = 0;
++  std::vector<GeGpuTimerInterval> ge_gpu_timer_intervals_[6];
++  uint32_t ge_gpu_timer_count_[6] = {};
++  bool ge_gpu_timer_resolved_[6] = {};
++  uint32_t ge_gpu_timer_submission_begin_ = UINT32_MAX;
++  double ge_gpu_timer_sum_ms_[size_t(GeGpuTimer::kCount)] = {};
++  uint64_t ge_gpu_timer_calls_[size_t(GeGpuTimer::kCount)] = {};
++  double ge_gpu_timer_max_frame_ms_ = 0.0;
++  uint32_t ge_gpu_timer_frames_ = 0;
++  uint64_t ge_gpu_timer_upload_bytes_ = 0;
++  uint64_t ge_gpu_timer_upload_by_mb_[512] = {};
++
 +  // ge: 6, not 3. The emulated GPU swaps twice per game frame, so 3 was only
 +  // 1.5 game frames of headroom: when the host GPU briefly fell behind (at 1x it
 +  // idles and drops its clocks), the command processor waited for it and the
@@ -164,7 +231,7 @@ index 96d362b..fb9caab 100644
  
    enum RootParameter : UINT {
      // Keep the size of the root signature at each stage 13 dwords or less
-@@ -582,6 +586,66 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -582,6 +646,66 @@ class D3D12CommandProcessor : public CommandProcessor {
    Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_pwl_pipeline_;
    Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_pwl_fxaa_luma_pipeline_;
  
@@ -257,7 +324,7 @@ index d26cd4f..9cd9f51 100644
      // the end of the usage queue. Must be called any time the texture is
      // referenced by any GPU work in the implementation to make sure it's not
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index 4d85a2b..ad525bb 100644
+index 4d85a2b..2f17f0f 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -95,6 +95,9 @@ class SharedMemory {
@@ -270,6 +337,47 @@ index 4d85a2b..ad525bb 100644
   protected:
    SharedMemory(memory::Memory& memory);
    // Call in implementation-specific initialization.
+@@ -140,6 +143,19 @@ class SharedMemory {
+   virtual bool UploadRanges(
+       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+ 
++  // ge: where UploadRanges copies the data of a physical address from - the
++  // upload mirror (see shared_memory_skip_unchanged_uploads) when it is in
++  // use, otherwise guest memory.
++  const uint8_t* UploadSource(uint32_t address) const;
++  // ge: MakeRangeValid for UploadRanges. With the upload mirror the pages were
++  // already made valid before the mirror was filled (FilterUnchangedUploads),
++  // and doing it again here could cancel an invalidation by a write since.
++  void MakeUploadRangeValid(uint32_t start, uint32_t length) {
++    if (!upload_mirror_ || upload_mirror_failed_) {
++      MakeRangeValid(start, length, false);
++    }
++  }
++
+  private:
+   memory::Memory& memory_;
+ 
+@@ -172,6 +188,20 @@ class SharedMemory {
+ 
+   // Pages whose contents in the buffer are in sync with guest memory.
+   std::vector<uint64_t> system_page_flags_valid_;
++
++  // ge: a CPU copy of what was last uploaded to each page of the buffer
++  // (reserved for the whole buffer, committed in 64 KB pieces as pages are
++  // uploaded). Pages requested again with the same content are made valid
++  // without an upload: clear_memory_page_state marks every CPU-uploaded page
++  // invalid at the end of each frame, which otherwise re-uploads megabytes of
++  // unchanged data every frame. A page's copy is dropped when the GPU writes
++  // to it (RangeWrittenByGpu), since the buffer then holds other data.
++  bool FilterUnchangedUploads();
++  uint8_t* upload_mirror_ = nullptr;
++  bool upload_mirror_failed_ = false;
++  std::vector<uint64_t> upload_mirror_page_valid_;
++  std::vector<uint64_t> upload_mirror_committed_;
++  std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_changed_;
+   // Subset of valid pages containing data written by the GPU.
+   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
+   uint32_t num_system_page_flags_ = 0;
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
 index 696ff48..4491a38 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
@@ -390,18 +498,28 @@ index cf0e3d1..3a13fe9 100644
    std::vector<ControllerState> controllers_;
 diff --git a/include/rex/kernel/xam/ge_online_control.h b/include/rex/kernel/xam/ge_online_control.h
 new file mode 100644
-index 0000000..bf78e85
+index 0000000..e74637a
 --- /dev/null
 +++ b/include/rex/kernel/xam/ge_online_control.h
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,20 @@
 +// GoldenEye recomp - controls for the online multiplayer client (ge_online.cpp).
 +#pragma once
++
++#include <cstdint>
 +
 +namespace rex::kernel::xam {
 +
 +// Drop the connection to the online server so the next online use reconnects
 +// with the current ge_online_server / ge_online_port. Safe when not connected.
 +void GeOnlineReconnect();
++
++// True while the game has a network session (system link / LAN or online):
++// an XSession created with peer networking and not yet deleted, or a session
++// key registered. Single-player stats sessions don't count. The game uses it
++// to keep every machine in a match on the same 60 Hz clock.
++bool GeNetworkGameActive();
++void GeNoteSessionCreated(uint32_t session_ptr, uint32_t flags);
++void GeNoteSessionDeleted(uint32_t session_ptr);
 +
 +}  // namespace rex::kernel::xam
 diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
@@ -551,6 +669,69 @@ index 7642601..1b1df31 100644
    std::deque<PendingToast> queue_;
    AchievementIconCache icon_cache_;
  };
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..fedbae9 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -1,4 +1,12 @@
+ #pragma once
++
++// ge: CAS and FSR 1 (the presenter's guest output effects) use prebuilt
++// shaders and need nothing from the FidelityFX SDK, so they are always built;
++// defining this here keeps every module that includes this header in step.
++// FSR 2/3 still need the SDK runtime (REX_HAS_FIDELITYFX_RUNTIME).
++#ifndef REX_HAS_FIDELITYFX_SDK
++#define REX_HAS_FIDELITYFX_SDK 1
++#endif
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -15,6 +23,7 @@
+ #include <atomic>
+ #include <climits>
+ #include <cmath>
++#include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
+@@ -367,6 +376,14 @@ class Presenter {
+   }
+   // For simplicity, may be called repeatedly even if no changes have been made.
+   void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
++  // ge: re-reads present_effect and its sharpness options (UI thread), so the
++  // game's Upscaling setting applies without a restart.
++  void ReloadGuestOutputPaintConfigFromCVarsFromUIThread();
++
++  // ge: paced presentation. Called by the guest vblank clock on each tick; a
++  // pacing thread then presents the latest guest frame a fixed time after
++  // the tick, so frames reach the display evenly spaced (see presenter.cpp).
++  void OnGuestVblank(std::chrono::steady_clock::time_point vblank_time);
+ 
+   void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
+   void RemoveUIDrawerFromUIThread(UIDrawer* drawer);
+@@ -1051,6 +1068,22 @@ class Presenter {
+ 
+   std::thread dxgi_ui_tick_thread_;
+ #endif  // XE_PLATFORM
++
++  // ge: paced presentation (OnGuestVblank).
++  void PresentLatestGuestOutput();
++  void GuestOutputPacingThread();
++  void StopGuestOutputPacing();
++  std::mutex guest_output_pacing_mutex_;
++  std::condition_variable guest_output_pacing_condition_;
++  std::thread guest_output_pacing_thread_;
++  bool guest_output_pacing_shutdown_ = false;
++  uint64_t guest_output_pacing_vblank_count_ = 0;
++  std::chrono::steady_clock::time_point guest_output_pacing_vblank_time_{};
++  std::chrono::steady_clock::duration guest_output_pacing_vblank_period_{};
++  std::atomic<bool> guest_output_paced_frame_pending_{false};
++  // steady_clock ticks when the pending frame arrived.
++  std::atomic<int64_t> guest_output_paced_frame_arrival_{0};
++  std::atomic<uint32_t> guest_output_paced_frames_replaced_{0};
+ };
+ 
+ }  // namespace ui
 diff --git a/resources/templates/codegen/init_cpp.inja b/resources/templates/codegen/init_cpp.inja
 index 1be4759..0d3e207 100644
 --- a/resources/templates/codegen/init_cpp.inja
@@ -982,6 +1163,66 @@ index 1645848..2513717 100644
    // Rebuild all loggers with new sinks
    for (auto& entry : g_registry) {
      if (entry.name.empty())
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..9e324b2 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -21,6 +21,14 @@
+ #include <rex/thread.h>
+ #include <rex/thread/timer_queue.h>
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ namespace dp = disruptorplus;
+ 
+ namespace rex::thread {
+@@ -66,10 +74,37 @@ class TimerQueue {
+ 
+     while (!stop_token.stop_requested()) {
+       {
+-        // Consume new wait items and add them to sorted wait queue
++        const clock::time_point due =
++            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_;
++#if REX_PLATFORM_WIN32
++        // ge: sleep until the next timer is due (at most 1 ms, so new timers
++        // are picked up within 1 ms) instead of spin-waiting the whole time.
++        // The kernel timestamp timer fires every 1 ms, so this thread used to
++        // spin and yield constantly: 4-8% of a CPU core for the whole session.
++        {
++          static thread_local HANDLE sleep_timer = CreateWaitableTimerExW(
++              nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
++          const auto now = clock::now();
++          if (sleep_timer && due > now) {
++            const auto sleep_for =
++                std::min<clock::duration>(due - now, std::chrono::milliseconds(1));
++            LARGE_INTEGER due_time;
++            due_time.QuadPart = -std::max<int64_t>(
++                1, std::chrono::duration_cast<std::chrono::nanoseconds>(sleep_for).count() / 100);
++            if (SetWaitableTimer(sleep_timer, &due_time, 0, nullptr, nullptr, FALSE)) {
++              WaitForSingleObject(sleep_timer, INFINITE);
++            }
++          }
++        }
++        // Consume new wait items and add them to sorted wait queue (returns
++        // at once when the timer is already due).
+         dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++            next_sequence, next_sequence - 1, std::min(due, clock::now()));
++#else
++        // Consume new wait items and add them to sorted wait queue
++        dp::sequence_t available =
++            claim_strategy_.wait_until_published(next_sequence, next_sequence - 1, due);
++#endif
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
 diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
 index d0dce00..6650400 100644
 --- a/src/filesystem/devices/host_path_entry.cpp
@@ -1069,7 +1310,7 @@ index a1b4dad..682b23d 100644
          *out_action = FileAction::kOverwritten;
          break;
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..16713ab 100644
+index a744375..c9a97c4 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -35,8 +35,23 @@
@@ -1138,7 +1379,7 @@ index a744375..16713ab 100644
    bool matched = false;
    do {
      uint32_t value = 0;
-@@ -1030,6 +1066,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1030,14 +1066,30 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
@@ -1152,8 +1393,14 @@ index a744375..16713ab 100644
        // Wait.
        if (wait >= 0x100) {
          PrepareForWait();
-@@ -1037,7 +1080,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
-           // User wants it fast and dangerous.
+-        if (!REXCVAR_GET(vsync)) {
+-          // User wants it fast and dangerous.
++        if (!REXCVAR_GET(vsync) &&
++            std::chrono::steady_clock::now() <
++                wait_deadline - std::chrono::milliseconds(60) + std::chrono::microseconds(500)) {
++          // V-Sync off: stay responsive for the first 0.5 ms of a wait, then
++          // poll every 1 ms like V-Sync on (ge: it busy-yielded for the whole
++          // wait, a CPU core spinning while the GPU waited on the game).
            rex::thread::MaybeYield();
          } else {
 -          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
@@ -1167,7 +1414,7 @@ index a744375..16713ab 100644
          rex::thread::SyncMemory();
          ReturnFromWait();
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..9518ec2 100644
+index 19874a5..da36c7a 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -31,6 +31,10 @@
@@ -1181,7 +1428,16 @@ index 19874a5..9518ec2 100644
  
  REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-@@ -57,6 +61,8 @@ namespace shaders {
+@@ -47,6 +51,8 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DECLARE(bool, vblank_timing_log);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -57,6 +63,8 @@ namespace shaders {
  #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_cs.h"
  #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
  #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
@@ -1190,7 +1446,7 @@ index 19874a5..9518ec2 100644
  #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
  }  // namespace shaders
  
-@@ -1342,6 +1348,147 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -1342,6 +1350,147 @@ bool D3D12CommandProcessor::SetupContext() {
      return false;
    }
  
@@ -1338,7 +1594,7 @@ index 19874a5..9518ec2 100644
    // Initialize compute pipelines for post-processing anti-aliasing.
    D3D12_ROOT_PARAMETER fxaa_root_parameters[UINT(FxaaRootParameter::kCount)];
    {
-@@ -1688,6 +1835,14 @@ void D3D12CommandProcessor::ShutdownContext() {
+@@ -1688,6 +1837,14 @@ void D3D12CommandProcessor::ShutdownContext() {
    resolve_downscale_pipeline_.Reset();
    resolve_downscale_root_signature_.Reset();
  
@@ -1353,7 +1609,7 @@ index 19874a5..9518ec2 100644
    apply_gamma_pwl_fxaa_luma_pipeline_.Reset();
    apply_gamma_pwl_pipeline_.Reset();
    apply_gamma_table_fxaa_luma_pipeline_.Reset();
-@@ -2088,11 +2243,41 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2088,11 +2245,41 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                : gamma_ramp_256_entry_table_up_to_date_) = true;
          }
  
@@ -1399,7 +1655,7 @@ index 19874a5..9518ec2 100644
            return false;
          }
          // Must not call anything that can change the descriptor heap from now
-@@ -2243,6 +2428,141 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2243,6 +2430,141 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                  apply_gamma_dest_initial_state);
          }
  
@@ -1541,7 +1797,7 @@ index 19874a5..9518ec2 100644
          // Need to submit all the commands before giving the image back to the
          // presenter so it can submit its own commands for displaying it to the
          // queue.
-@@ -2256,6 +2576,106 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2256,6 +2578,106 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
    EndSubmission(true);
  }
  
@@ -1648,18 +1904,227 @@ index 19874a5..9518ec2 100644
  void D3D12CommandProcessor::OnPrimaryBufferEnd() {
    if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
        CanEndSubmissionImmediately()) {
-@@ -2880,8 +3300,9 @@ bool D3D12CommandProcessor::IssueCopy() {
+@@ -2880,8 +3302,11 @@ bool D3D12CommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
 -    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
 -                                         written_address, written_length);
++    const uint32_t ge_timer = GeGpuTimerBegin();
 +    bool ok = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
 +                                            written_address, written_length);
++    GeGpuTimerEnd(GeGpuTimer::kResolve, ge_timer);
 +    return ok;
    }
    return IssueCopy_ReadbackResolvePath();
  }
+@@ -3114,9 +3539,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     if (queue_operations_done_since_submission_signal_) {
+       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
+       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+-      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
+-                    SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
+-                        fence_value, fence_completion_event_)))) {
++      // ge: each result checked on its own (was SUCCEEDED(a && b), which
++      // treated a failed Signal as success).
++      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value)) &&
++          SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
++              fence_value, fence_completion_event_))) {
+         PROFILE_CMD_BUFFER_STALL();
+         WaitForSingleObject(fence_completion_event_, INFINITE);
+         queue_operations_done_since_submission_signal_ = false;
+@@ -3295,8 +3722,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     }
+   }
+ 
++  bool ge_submission_opened = false;
+   if (!submission_open_) {
+     submission_open_ = true;
++    ge_submission_opened = true;
+ 
+     // Start a new deferred command list - will submit it to the real one in the
+     // end of the submission (when async pipeline creation requests are
+@@ -3366,11 +3795,167 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     primitive_processor_->BeginFrame();
+ 
+     texture_cache_->BeginFrame();
++
++    GeGpuTimerFrameOpen();
++  }
++
++  if (ge_submission_opened && frame_open_) {
++    ge_gpu_timer_submission_begin_ = GeGpuTimerBegin();
+   }
+ 
+   return true;
+ }
+ 
++uint32_t D3D12CommandProcessor::GeGpuTimerBegin() {
++  if (!ge_gpu_timer_on_ || !frame_open_ || !submission_open_) {
++    return UINT32_MAX;
++  }
++  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
++  uint32_t& count = ge_gpu_timer_count_[slot];
++  if (count + 2 > kGeGpuTimestampsPerFrame) {
++    return UINT32_MAX;
++  }
++  // Barriers queued before this point belong to the work before it.
++  SubmitBarriers();
++  const uint32_t index = count++;
++  deferred_command_list_.D3DEndQuery(ge_gpu_timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     slot * kGeGpuTimestampsPerFrame + index);
++  return index;
++}
++
++void D3D12CommandProcessor::GeGpuTimerEnd(GeGpuTimer timer, uint32_t begin) {
++  if (begin == UINT32_MAX || !ge_gpu_timer_on_ || !frame_open_ || !submission_open_) {
++    return;
++  }
++  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
++  uint32_t& count = ge_gpu_timer_count_[slot];
++  if (count + 1 > kGeGpuTimestampsPerFrame || begin >= count) {
++    return;
++  }
++  SubmitBarriers();
++  const uint32_t index = count++;
++  deferred_command_list_.D3DEndQuery(ge_gpu_timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     slot * kGeGpuTimestampsPerFrame + index);
++  ge_gpu_timer_intervals_[slot].push_back({timer, begin, index});
++}
++
++void D3D12CommandProcessor::GeGpuTimerFrameOpen() {
++  static_assert(kQueueFrames == 6, "ge_gpu_timer arrays are sized for 6 queued frames");
++  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
++  // The frame that last used this slot has completed (awaited in
++  // BeginSubmission before the frame is opened).
++  if (ge_gpu_timer_resolved_[slot] && ge_gpu_timer_frequency_) {
++    void* mapped = nullptr;
++    const D3D12_RANGE read_range = {slot * kGeGpuTimestampsPerFrame * sizeof(uint64_t),
++                                    (slot + 1) * kGeGpuTimestampsPerFrame * sizeof(uint64_t)};
++    if (SUCCEEDED(ge_gpu_timer_readback_->Map(0, &read_range,
++                                              &mapped))) {
++      const uint64_t* timestamps =
++          static_cast<const uint64_t*>(mapped) + slot * kGeGpuTimestampsPerFrame;
++      const double to_ms = 1000.0 / double(ge_gpu_timer_frequency_);
++      double frame_submission_ms = 0.0;
++      for (const GeGpuTimerInterval& interval : ge_gpu_timer_intervals_[slot]) {
++        const uint64_t t0 = timestamps[interval.begin], t1 = timestamps[interval.end];
++        const double ms = t1 > t0 ? double(t1 - t0) * to_ms : 0.0;
++        ge_gpu_timer_sum_ms_[size_t(interval.timer)] += ms;
++        ++ge_gpu_timer_calls_[size_t(interval.timer)];
++        if (interval.timer == GeGpuTimer::kSubmission) {
++          frame_submission_ms += ms;
++        }
++      }
++      const D3D12_RANGE written_range = {};
++      ge_gpu_timer_readback_->Unmap(0, &written_range);
++      ge_gpu_timer_max_frame_ms_ = std::max(ge_gpu_timer_max_frame_ms_, frame_submission_ms);
++      if (++ge_gpu_timer_frames_ >= 600) {
++        const double frames = double(ge_gpu_timer_frames_);
++        auto per_frame = [&](GeGpuTimer timer) {
++          return ge_gpu_timer_sum_ms_[size_t(timer)] / frames;
++        };
++        auto calls = [&](GeGpuTimer timer) {
++          return double(ge_gpu_timer_calls_[size_t(timer)]) / frames;
++        };
++        REXGPU_INFO(
++            "ge gpu time per frame: {:.2f} ms of emulated GPU work (max {:.2f}); resolves "
++            "{:.2f} ms ({:.1f}/frame) including EDRAM dumps {:.2f} ms ({:.1f}/frame); render "
++            "target transfers {:.2f} ms ({:.1f}/frame); texture loads {:.2f} ms ({:.1f}/frame); "
++            "memory uploads {:.2f} ms ({:.1f}/frame, {:.0f} KB/frame)",
++            per_frame(GeGpuTimer::kSubmission), ge_gpu_timer_max_frame_ms_,
++            per_frame(GeGpuTimer::kResolve), calls(GeGpuTimer::kResolve),
++            per_frame(GeGpuTimer::kDump), calls(GeGpuTimer::kDump),
++            per_frame(GeGpuTimer::kTransfer), calls(GeGpuTimer::kTransfer),
++            per_frame(GeGpuTimer::kTextureLoad), calls(GeGpuTimer::kTextureLoad),
++            per_frame(GeGpuTimer::kUpload), calls(GeGpuTimer::kUpload),
++            double(ge_gpu_timer_upload_bytes_) / 1024.0 / frames);
++        ge_gpu_timer_upload_bytes_ = 0;
++        {
++          // Where the uploads go (1 MB physical regions), largest first.
++          std::vector<std::pair<uint64_t, uint32_t>> regions;
++          for (uint32_t i = 0; i < 512; ++i) {
++            if (ge_gpu_timer_upload_by_mb_[i]) regions.emplace_back(ge_gpu_timer_upload_by_mb_[i], i);
++          }
++          std::sort(regions.rbegin(), regions.rend());
++          std::string text;
++          for (size_t i = 0; i < regions.size() && i < 8; ++i) {
++            text += fmt::format(" {:03X}xxxxx:{:.0f}KB", regions[i].second,
++                                double(regions[i].first) / 1024.0 / frames);
++          }
++          REXGPU_INFO("ge gpu uploads by physical MB per frame:{}", text);
++          std::fill(std::begin(ge_gpu_timer_upload_by_mb_), std::end(ge_gpu_timer_upload_by_mb_),
++                    uint64_t(0));
++        }
++        std::fill(std::begin(ge_gpu_timer_sum_ms_), std::end(ge_gpu_timer_sum_ms_), 0.0);
++        std::fill(std::begin(ge_gpu_timer_calls_), std::end(ge_gpu_timer_calls_), uint64_t(0));
++        ge_gpu_timer_max_frame_ms_ = 0.0;
++        ge_gpu_timer_frames_ = 0;
++      }
++    }
++  }
++  ge_gpu_timer_resolved_[slot] = false;
++  ge_gpu_timer_count_[slot] = 0;
++  ge_gpu_timer_intervals_[slot].clear();
++  ge_gpu_timer_submission_begin_ = UINT32_MAX;
++
++  ge_gpu_timer_on_ = REXCVAR_GET(vblank_timing_log) && !ge_gpu_timer_failed_;
++  if (ge_gpu_timer_on_ && !ge_gpu_timer_heap_) {
++    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++    ID3D12Device* device = provider.GetDevice();
++    D3D12_QUERY_HEAP_DESC heap_desc = {};
++    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    heap_desc.Count = kQueueFrames * kGeGpuTimestampsPerFrame;
++    D3D12_RESOURCE_DESC buffer_desc;
++    ui::d3d12::util::FillBufferResourceDesc(
++        buffer_desc, kQueueFrames * kGeGpuTimestampsPerFrame * sizeof(uint64_t),
++        D3D12_RESOURCE_FLAG_NONE);
++    UINT64 frequency = 0;
++    if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&ge_gpu_timer_heap_))) ||
++        FAILED(device->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
++            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++            IID_PPV_ARGS(&ge_gpu_timer_readback_))) ||
++        FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&frequency)) || !frequency) {
++      REXGPU_WARN("ge gpu time: timestamp queries unavailable");
++      ge_gpu_timer_heap_.Reset();
++      ge_gpu_timer_readback_.Reset();
++      ge_gpu_timer_failed_ = true;
++      ge_gpu_timer_on_ = false;
++    } else {
++      ge_gpu_timer_frequency_ = frequency;
++    }
++  }
++}
++
++void D3D12CommandProcessor::GeGpuTimerFrameClose() {
++  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
++  if (!ge_gpu_timer_on_ || !ge_gpu_timer_count_[slot]) {
++    return;
++  }
++  deferred_command_list_.D3DResolveQueryData(
++      ge_gpu_timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kGeGpuTimestampsPerFrame,
++      ge_gpu_timer_count_[slot], ge_gpu_timer_readback_.Get(),
++      slot * kGeGpuTimestampsPerFrame * sizeof(uint64_t));
++  ge_gpu_timer_resolved_[slot] = true;
++}
++
+ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+ 
+@@ -3410,6 +3995,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+ 
+     pipeline_cache_->EndSubmission();
+ 
++    GeGpuTimerEnd(GeGpuTimer::kSubmission, ge_gpu_timer_submission_begin_);
++    ge_gpu_timer_submission_begin_ = UINT32_MAX;
++    if (is_closing_frame) {
++      GeGpuTimerFrameClose();
++    }
++
+     // Submit barriers now because resources with the queued barriers may be
+     // destroyed between frames.
+     SubmitBarriers();
 diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
 index 8e6b854..fb1a54d 100644
 --- a/src/graphics/d3d12/pipeline_cache.cpp
@@ -1699,11 +2164,102 @@ index 8e6b854..fb1a54d 100644
    return true;
  }
  
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index dd321a5..d4b586c 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1067,8 +1067,17 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
+     case Path::kHostRenderTargets: {
+       RenderTarget* const* depth_and_color_render_targets =
+           last_update_accumulated_render_targets();
++      // ge: time the transfers (GPU pass timing) only when there are any.
++      uint32_t ge_timer = UINT32_MAX;
++      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++        if (!last_update_transfers()[i].empty()) {
++          ge_timer = command_processor_.GeGpuTimerBegin();
++          break;
++        }
++      }
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                        depth_and_color_render_targets, last_update_transfers());
++      command_processor_.GeGpuTimerEnd(D3D12CommandProcessor::GeGpuTimer::kTransfer, ge_timer);
+       SetCommandListRenderTargets(depth_and_color_render_targets);
+     } break;
+     case Path::kPixelShaderInterlock: {
+@@ -1213,10 +1222,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+           uint32_t dump_rows;
+           uint32_t dump_pitch;
+           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
++          const uint32_t ge_timer = command_processor_.GeGpuTimerBegin();
+           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
+             return false;
+           }
++          command_processor_.GeGpuTimerEnd(D3D12CommandProcessor::GeGpuTimer::kDump, ge_timer);
+         }
+       }
+ 
+@@ -5577,7 +5588,10 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
+ 
+   // Dedicated direct resolve dispatches are staged behind the same preflight;
+   // keep using the existing dump path until source-image direct shaders land.
+-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
++  const uint32_t ge_timer = command_processor_.GeGpuTimerBegin();
++  const bool dumped = DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
++  command_processor_.GeGpuTimerEnd(D3D12CommandProcessor::GeGpuTimer::kDump, ge_timer);
++  return dumped;
+ }
+ 
+ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index a5c97a0..4076fb3 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -308,6 +308,8 @@ bool D3D12SharedMemory::UploadRanges(
+   }
+   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+   command_processor_.SubmitBarriers();
++  D3D12CommandProcessor::GeGpuTimerScope ge_timer(command_processor_,
++                                                  D3D12CommandProcessor::GeGpuTimer::kUpload);
+   auto& command_list = command_processor_.GetDeferredCommandList();
+   for (auto upload_range : upload_page_ranges) {
+     uint32_t upload_range_start = upload_range.first;
+@@ -323,13 +325,14 @@ bool D3D12SharedMemory::UploadRanges(
+         REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
+         return false;
+       }
+-      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+-      std::memcpy(upload_buffer_mapping,
+-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
++      MakeUploadRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size));
++      std::memcpy(upload_buffer_mapping, UploadSource(upload_range_start << page_size_log2()),
+                   upload_buffer_size);
+       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
+                                        upload_buffer, UINT64(upload_buffer_offset),
+                                        UINT64(upload_buffer_size));
++      command_processor_.GeCountUploadBytes(upload_range_start << page_size_log2(),
++                                            upload_buffer_size);
+       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
+       upload_range_start += upload_buffer_pages;
+       upload_range_length -= upload_buffer_pages;
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 2be0e8e..72ae14c 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1562,6 +1562,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+   TextureKey texture_key = d3d12_texture.key();
+ 
++  D3D12CommandProcessor::GeGpuTimerScope ge_timer(
++      command_processor_, D3D12CommandProcessor::GeGpuTimer::kTextureLoad);
+   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+ 
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..cdb9bba 100644
+index 8f2fcb0..37c6384 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
-@@ -12,6 +12,7 @@
+@@ -12,14 +12,17 @@
  #include <rex/graphics/graphics_system.h>
  
  #include <algorithm>
@@ -1711,7 +2267,9 @@ index 8f2fcb0..cdb9bba 100644
  #include <cctype>
  #include <cstdint>
  #include <functional>
-@@ -20,6 +21,7 @@
+ #include <memory>
+ #include <mutex>
++#include <string>
  #include <utility>
  
  #include <rex/cvar.h>
@@ -1719,7 +2277,7 @@ index 8f2fcb0..cdb9bba 100644
  #include <rex/graphics/command_processor.h>
  #include <rex/graphics/flags.h>
  #include <rex/kernel/xboxkrnl/video.h>
-@@ -31,14 +33,34 @@
+@@ -31,14 +34,53 @@
  #include <rex/ui/window.h>
  #include <rex/ui/windowed_app_context.h>
  
@@ -1731,6 +2289,7 @@ index 8f2fcb0..cdb9bba 100644
 +#define NOMINMAX
 +#endif
 +#include <windows.h>
++#include <dwmapi.h>  // DWM_TIMING_INFO (DwmGetCompositionTimingInfo loaded at run time)
 +#endif
 +
  REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
@@ -1744,6 +2303,24 @@ index 8f2fcb0..cdb9bba 100644
  
 +// ge: Transient (never written to ge.toml): the game turns it on from its
 +// performance_diagnostics option, which is the setting players change.
++// ge: the guest vblank rate in Hz; 0 = the guest video mode's (60). The game
++// sets it to a ~60 Hz display's exact refresh (for example 59.94) so frames
++// line up with the screen instead of beating against it.
++REXCVAR_DEFINE_DOUBLE(vblank_rate_hz, 0.0, "Transient", "Guest vblank rate (0 = video mode)");
++
++// ge: while the vblank follows the display's rate (vblank_rate_hz), also keep
++// its phase locked to the display's own refresh, so the paced present (a fixed
++// time after the tick) lands mid-way between two display refreshes, never at
++// the edge where a few hundred microseconds of GPU timing decide whether a
++// frame shows on this refresh or the next. Corrections are at most 0.1 ms per
++// half second: the game clock's rate is unchanged.
++REXCVAR_DEFINE_BOOL(vblank_phase_lock, true, "Transient",
++                    "Lock the guest vblank's phase to the display refresh when the rates match");
++
++REXCVAR_DEFINE_INT32(vblank_present_phase_us, -1, "Transient",
++                     "Phase lock: where the paced present lands after a display refresh, "
++                     "in microseconds (-1 = half way)");
++
 +REXCVAR_DEFINE_BOOL(vblank_timing_log, false, "Transient",
 +                    "Log the guest vblank timer's interval jitter every 10 seconds");
 +
@@ -1755,12 +2332,13 @@ index 8f2fcb0..cdb9bba 100644
  namespace {
  
  rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
-@@ -156,18 +178,98 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -156,18 +198,182 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
          uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
          uint64_t vsync_interval_ticks =
              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
 -        uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
          uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        int64_t phase_step_ticks = 0;  // ge: display phase lock (one interval)
 +        // ge: the vblank is the game's clock, so it must tick evenly. Sleeping
 +        // 1 ms per loop (the old way) fired it up to ~1-2 ms late, so frames
 +        // landed 16/17/18 ms apart (judder). Now: sleep on a high-resolution
@@ -1773,7 +2351,9 @@ index 8f2fcb0..cdb9bba 100644
 +          wait_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
 +        }
 +#endif
-+        const uint64_t spin_ticks = guest_tick_frequency / 1000;  // last ~1 ms
++        // ge: yield-spin only the last ~0.75 ms (was 1 ms; 0.25 ms let the timer
++        // wake late and the vblank jittered by up to 0.6 ms).
++        const uint64_t spin_ticks = guest_tick_frequency * 3 / 4000;
 +        // vblank_timing_log: interval stats in microseconds.
 +        uint64_t log_start = last_frame_time, stat_count = 0;
 +        double stat_sum = 0.0, stat_sq = 0.0, stat_min = 1e9, stat_max = 0.0;
@@ -1788,11 +2368,27 @@ index 8f2fcb0..cdb9bba 100644
 +          // 2026-10-16) and slower (a 30 cap) slowed the game itself down, so
 +          // max_fps is no longer applied. vsync only decides how the presenter
 +          // shows frames.
-+          const uint64_t interval_ticks = vsync_interval_ticks;
++          // ge: follow vblank_rate_hz when set (a ~60 Hz display's exact rate).
++          static double applied_rate_hz = -1.0;
++          const double wanted_rate_hz = REXCVAR_GET(vblank_rate_hz);
++          if (wanted_rate_hz != applied_rate_hz) {
++            applied_rate_hz = wanted_rate_hz;
++            const double hz = wanted_rate_hz >= 30.0 && wanted_rate_hz <= 240.0
++                                  ? wanted_rate_hz
++                                  : refresh_rate_hz;
++            vsync_interval_ticks =
++                std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / hz));
++          }
++          // ge: one interval stretched or shortened by the display phase lock.
++          const uint64_t interval_ticks =
++              uint64_t(std::max<int64_t>(1, int64_t(vsync_interval_ticks) + phase_step_ticks));
 +          // Fire at most one vblank per wake; drop the backlog if starved (avoids
 +          // burst-flooding the guest vblank ISR after an off-core stall).
 +          if (current_time - last_frame_time >= interval_ticks) {
              MarkVblank();
++            phase_step_ticks = 0;  // used up by this interval
++            // ge: paced presentation is anchored to this tick.
++            if (presenter_) presenter_->OnGuestVblank(std::chrono::steady_clock::now());
 +            // Live anti-aliasing: re-apply swap_post_effect each vblank so the
 +            // menu toggle takes effect without a restart. SetDesiredSwapPostEffect
 +            // early-returns when unchanged, so this is cheap.
@@ -1804,6 +2400,71 @@ index 8f2fcb0..cdb9bba 100644
 +            if (current_time - last_frame_time >= interval_ticks) {
 +              last_frame_time = current_time;
 +            }
++#if REX_PLATFORM_WIN32
++            // ge: phase lock to the display (see vblank_phase_lock): stretch or
++            // shorten the next interval by up to 0.1 ms.
++            if (applied_rate_hz >= 30.0 && REXCVAR_GET(vblank_phase_lock)) {
++              static int phase_check = 0;
++              static HRESULT(WINAPI * dwm_timing)(HWND, DWM_TIMING_INFO*) = nullptr;
++              static bool dwm_loaded = false;
++              if (!dwm_loaded) {
++                dwm_loaded = true;
++                if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
++                  dwm_timing = reinterpret_cast<HRESULT(WINAPI*)(HWND, DWM_TIMING_INFO*)>(
++                      GetProcAddress(dwm, "DwmGetCompositionTimingInfo"));
++                }
++              }
++              if (dwm_timing && ++phase_check >= 30) {
++                phase_check = 0;
++                DWM_TIMING_INFO ti{};
++                ti.cbSize = sizeof(ti);
++                LARGE_INTEGER qpc_now, qpc_freq;
++                QueryPerformanceCounter(&qpc_now);
++                QueryPerformanceFrequency(&qpc_freq);
++                if (SUCCEEDED(dwm_timing(nullptr, &ti)) && ti.qpcRefreshPeriod > 0 &&
++                    ti.qpcVBlank > 0) {
++                  const int64_t period = int64_t(ti.qpcRefreshPeriod);
++                  // Present = tick + present_pacing_offset_us; aim it at mid-refresh.
++                  int64_t offset_us = 5000;
++                  {
++                    const std::string v = rex::cvar::GetFlagByName("present_pacing_offset_us");
++                    if (!v.empty()) offset_us = std::atoll(v.c_str());
++                  }
++                  const int64_t offset_qpc = offset_us * qpc_freq.QuadPart / 1000000;
++                  const int32_t present_phase_us = REXCVAR_GET(vblank_present_phase_us);
++                  const int64_t present_phase =
++                      present_phase_us >= 0
++                          ? int64_t(present_phase_us) * qpc_freq.QuadPart / 1000000
++                          : period / 2;
++                  const int64_t target_phase =
++                      ((present_phase - offset_qpc) % period + period) % period;
++                  // Where this tick sits relative to the display's refreshes.
++                  int64_t phase = (int64_t(qpc_now.QuadPart) - int64_t(ti.qpcVBlank)) % period;
++                  if (phase < 0) phase += period;
++                  int64_t error = phase - target_phase;
++                  if (error > period / 2) error -= period;
++                  if (error < -period / 2) error += period;
++                  // Move the next tick by a quarter of the error, at most 0.1 ms.
++                  const int64_t max_step = qpc_freq.QuadPart / 10000;
++                  const int64_t step = std::clamp<int64_t>(-error / 4, -max_step, max_step);
++                  const int64_t step_ticks =
++                      step * int64_t(guest_tick_frequency) / int64_t(qpc_freq.QuadPart);
++                  phase_step_ticks = step_ticks;  // applied to the next interval only
++                  if (REXCVAR_GET(vblank_timing_log)) {
++                    static int phase_log = 0;
++                    if (++phase_log >= 20) {  // every ~10 s
++                      phase_log = 0;
++                      REXGPU_INFO("ge vblank phase: {:.2f} ms after the display refresh (target "
++                                  "{:.2f} ms), display period {:.3f} ms",
++                                  double(phase) * 1000.0 / double(qpc_freq.QuadPart),
++                                  double(target_phase) * 1000.0 / double(qpc_freq.QuadPart),
++                                  double(period) * 1000.0 / double(qpc_freq.QuadPart));
++                    }
++                  }
++                }
++              }
++            }
++#endif
 +            if (REXCVAR_GET(vblank_timing_log)) {
 +              if (prev_fire) {
 +                const double us = double(current_time - prev_fire) * 1e6 /
@@ -1836,7 +2497,7 @@ index 8f2fcb0..cdb9bba 100644
 +          // Never wait longer than 4 ms per pass so cvar changes apply quickly.
 +          const uint64_t remaining = interval_ticks - (current_time - last_frame_time);
 +          if (remaining > spin_ticks) {
-+            const uint64_t sleep_ticks = std::min(remaining - spin_ticks, spin_ticks * 4);
++            const uint64_t sleep_ticks = std::min(remaining - spin_ticks, guest_tick_frequency / 250);
 +#if REX_PLATFORM_WIN32
 +            if (wait_timer) {
 +              LARGE_INTEGER due;
@@ -1859,7 +2520,7 @@ index 8f2fcb0..cdb9bba 100644
          return 0;
        }));
    // TODO: set_can_debugger_suspend not yet ported
-@@ -312,8 +414,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -312,8 +518,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
    //          interrupt_callback_, source, cpu);
  
    uint64_t args[] = {source, interrupt_callback_data_};
@@ -4265,6 +4926,155 @@ index 0000000..9c3ab08
 +
 +  xe_dest[coord] = float4(saturate(c), 1.0);
 +}
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..d90dfdd 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -14,14 +14,23 @@
+ #include <utility>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/shared_memory.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
++REXCVAR_DEFINE_BOOL(shared_memory_skip_unchanged_uploads, true, "GPU",
++                    "Don't upload guest memory pages to the GPU again when their content is the "
++                    "same as their last upload (keeps a CPU copy of uploaded pages)");
++
+ namespace rex::graphics {
+ 
++namespace {
++constexpr uint32_t kUploadMirrorCommitLog2 = 16;
++}  // namespace
++
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
+ }
+@@ -37,6 +46,79 @@ void SharedMemory::InitializeCommon() {
+ 
+   memory_invalidation_callback_handle_ =
+       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
++
++  if (REXCVAR_GET(shared_memory_skip_unchanged_uploads)) {
++    upload_mirror_ = static_cast<uint8_t*>(memory::AllocFixed(
++        nullptr, kBufferSize, memory::AllocationType::kReserve, memory::PageAccess::kNoAccess));
++    if (upload_mirror_) {
++      upload_mirror_page_valid_.assign(num_system_page_flags_, 0);
++      upload_mirror_committed_.assign(((kBufferSize >> kUploadMirrorCommitLog2) + 63) / 64, 0);
++    } else {
++      REXGPU_WARN("Shared memory: couldn't reserve the upload mirror; uploading every request");
++    }
++  }
++}
++
++const uint8_t* SharedMemory::UploadSource(uint32_t address) const {
++  if (upload_mirror_ && !upload_mirror_failed_) {
++    return upload_mirror_ + address;
++  }
++  return memory_.TranslatePhysical(address);
++}
++
++bool SharedMemory::FilterUnchangedUploads() {
++  const uint32_t page_size = uint32_t(1) << page_size_log2_;
++  upload_ranges_changed_.clear();
++  for (const std::pair<uint32_t, uint32_t>& range : upload_ranges_) {
++    const uint32_t page_first = range.first, page_end = range.first + range.second;
++    // Commit the mirror for the range.
++    const uint32_t commit_first = (page_first << page_size_log2_) >> kUploadMirrorCommitLog2;
++    const uint32_t commit_last = ((page_end << page_size_log2_) - 1) >> kUploadMirrorCommitLog2;
++    for (uint32_t i = commit_first; i <= commit_last; ++i) {
++      uint64_t& committed = upload_mirror_committed_[i >> 6];
++      if (committed & (uint64_t(1) << (i & 63))) {
++        continue;
++      }
++      if (!memory::AllocFixed(upload_mirror_ + (size_t(i) << kUploadMirrorCommitLog2),
++                              size_t(1) << kUploadMirrorCommitLog2,
++                              memory::AllocationType::kCommit, memory::PageAccess::kReadWrite)) {
++        // Fall back to uploading from guest memory. Pages already uploaded from
++        // the mirror hold the same data on the GPU, so nothing is lost.
++        REXGPU_WARN("Shared memory: couldn't commit the upload mirror; uploading every request");
++        upload_mirror_failed_ = true;
++        return false;
++      }
++      committed |= uint64_t(1) << (i & 63);
++    }
++    // Make the pages valid (and write-watched) before reading them, as
++    // UploadRanges does before its memcpy, so a write during the comparison or
++    // the copy into the mirror invalidates them again.
++    MakeRangeValid(page_first << page_size_log2_, range.second << page_size_log2_, false);
++    uint32_t run_start = UINT32_MAX;
++    for (uint32_t page = page_first; page < page_end; ++page) {
++      const uint8_t* guest = memory_.TranslatePhysical(page << page_size_log2_);
++      uint8_t* mirror = upload_mirror_ + (size_t(page) << page_size_log2_);
++      uint64_t& valid_block = upload_mirror_page_valid_[page >> 6];
++      const uint64_t valid_bit = uint64_t(1) << (page & 63);
++      if ((valid_block & valid_bit) && !std::memcmp(guest, mirror, page_size)) {
++        if (run_start != UINT32_MAX) {
++          upload_ranges_changed_.emplace_back(run_start, page - run_start);
++          run_start = UINT32_MAX;
++        }
++        continue;
++      }
++      std::memcpy(mirror, guest, page_size);
++      valid_block |= valid_bit;
++      if (run_start == UINT32_MAX) {
++        run_start = page;
++      }
++    }
++    if (run_start != UINT32_MAX) {
++      upload_ranges_changed_.emplace_back(run_start, page_end - run_start);
++    }
++  }
++  upload_ranges_.swap(upload_ranges_changed_);
++  return true;
+ }
+ 
+ void SharedMemory::InitializeSparseHostGpuMemory(uint32_t granularity_log2) {
+@@ -87,6 +169,14 @@ void SharedMemory::ShutdownCommon() {
+   system_page_flags_valid_and_gpu_written_.clear();
+   system_page_flags_valid_and_gpu_written_.shrink_to_fit();
+   num_system_page_flags_ = 0;
++
++  if (upload_mirror_) {
++    memory::DeallocFixed(upload_mirror_, 0, memory::DeallocationType::kRelease);
++    upload_mirror_ = nullptr;
++  }
++  upload_mirror_failed_ = false;
++  upload_mirror_page_valid_.clear();
++  upload_mirror_committed_.clear();
+ }
+ 
+ void SharedMemory::InvalidateAllPages() {
+@@ -267,6 +357,13 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   // the texture.
+   FireWatches(page_first, page_last, true);
+ 
++  // The buffer no longer holds the last uploaded data for these pages.
++  if (!upload_mirror_page_valid_.empty()) {
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      upload_mirror_page_valid_[page >> 6] &= ~(uint64_t(1) << (page & 63));
++    }
++  }
++
+   // Mark the range as valid (so pages are not reuploaded until modified by the
+   // CPU) and watch it so the CPU can reuse it and this will be caught.
+   MakeRangeValid(start, length, true);
+@@ -465,6 +562,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
++  if (upload_mirror_ && !upload_mirror_failed_ && FilterUnchangedUploads() &&
++      upload_ranges_.empty()) {
++    return true;
++  }
++
+   return UploadRanges(upload_ranges_);
+ }
+ 
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 001f36b..b1e22d8 100644
 --- a/src/graphics/vulkan/command_processor.cpp
@@ -4775,6 +5585,22 @@ index 001f36b..b1e22d8 100644
  void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                                                  bool primitive_polygonal,
                                                  reg::RB_DEPTHCONTROL normalized_depth_control) {
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214..ee589b0 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -300,9 +300,8 @@ bool VulkanSharedMemory::UploadRanges(
+         successful = false;
+         break;
+       }
+-      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+-      std::memcpy(upload_buffer_mapping,
+-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
++      MakeUploadRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size));
++      std::memcpy(upload_buffer_mapping, UploadSource(upload_range_start << page_size_log2()),
+                   upload_buffer_size);
+       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
 index 813bb1c..9c17e23 100644
 --- a/src/input/input_system.cpp
@@ -5012,6 +5838,34 @@ index e74a44e..1fe75ab 100644
    xfile->SetFindPattern(pattern);
  
    auto* entry = xfile->FindNext();
+diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
+index 2b222da..a8ef2f3 100644
+--- a/src/kernel/xam/apps/xgi_app.cpp
++++ b/src/kernel/xam/apps/xgi_app.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/kernel/xam/apps/xgi_app.h>
++#include <rex/kernel/xam/ge_online_control.h>
+ #include <rex/logging.h>
+ #include <rex/thread.h>
+ 
+@@ -113,6 +114,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+           "{:08X})",
+           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
+           nonce_ptr);
++      GeNoteSessionCreated(session_ptr, flags);
+       return X_E_SUCCESS;
+     }
+     case 0x000B0011: {
+@@ -123,6 +125,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
+ 
+       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
++      GeNoteSessionDeleted(obj_ptr);
+ 
+       return X_E_SUCCESS;
+     }
 diff --git a/src/kernel/xam/ge_lan.cpp b/src/kernel/xam/ge_lan.cpp
 new file mode 100644
 index 0000000..7ee2ded
@@ -5900,13 +6754,15 @@ index 1fb1e16..86c4353 100644
      // This may have just been a size query.
      if (buffer_ptr) {
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 58e36a4..4651496 100644
+index 58e36a4..81d93a4 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
-@@ -12,7 +12,11 @@
+@@ -12,13 +12,20 @@
  // Disable warnings about unused parameters for kernel functions
  #pragma GCC diagnostic ignored "-Wunused-parameter"
  
++#include <algorithm>
++#include <atomic>
 +#include <chrono>
  #include <cstring>
 +#include <mutex>
@@ -5915,7 +6771,14 @@ index 58e36a4..4651496 100644
  
  #if REX_PLATFORM_MAC
  #include <sys/select.h>
-@@ -33,6 +37,34 @@
+ #endif
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/kernel/xam/ge_online_control.h>
+ #include <rex/kernel/xam/module.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/kernel/xboxkrnl/error.h>
+@@ -33,6 +40,34 @@
  #include <rex/system/xthread.h>
  #include <rex/system/xtypes.h>
  
@@ -5950,7 +6813,7 @@ index 58e36a4..4651496 100644
  #if REX_PLATFORM_WIN32
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
-@@ -295,22 +327,103 @@ u32 NetDll_WSAGetLastError_entry() {
+@@ -295,22 +330,103 @@ u32 NetDll_WSAGetLastError_entry() {
    return XThread::GetLastError();
  }
  
@@ -6066,7 +6929,7 @@ index 58e36a4..4651496 100644
    return -1;
  }
  
-@@ -346,7 +459,60 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+@@ -346,7 +462,60 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
    }
  
    N_XSOCKADDR_IN native_to(to_ptr);
@@ -6128,7 +6991,7 @@ index 58e36a4..4651496 100644
  
    // TODO: Instantly complete overlapped
  
-@@ -377,7 +543,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+@@ -377,7 +546,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
  }
  
  u32 NetDll_WSACreateEvent_entry() {
@@ -6137,7 +7000,7 @@ index 58e36a4..4651496 100644
    ev->Initialize(true, false);
    return ev->handle();
  }
-@@ -436,9 +602,25 @@ struct XnAddrStatus {
+@@ -436,9 +605,25 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -6166,7 +7029,7 @@ index 58e36a4..4651496 100644
    addr_ptr->wPortOnline = 0;
  
    // TODO(gibbed): A proper mac address.
-@@ -453,6 +635,9 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+@@ -453,6 +638,9 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
    // "Mac address is a poor solution because you can't have multiple connections
    // from the same system"
    std::memset(addr_ptr->abEnet, 0xCC, 6);
@@ -6176,7 +7039,7 @@ index 58e36a4..4651496 100644
  
    std::memset(addr_ptr->abOnline, 0, 20);
  
-@@ -473,28 +658,55 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
+@@ -473,28 +661,55 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
  
  void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                       u32 string_size) {
@@ -6240,7 +7103,7 @@ index 58e36a4..4651496 100644
  
  // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
  struct XEthernetStatus {
-@@ -534,6 +746,8 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
+@@ -534,6 +749,8 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
  }
  
  u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
@@ -6249,7 +7112,7 @@ index 58e36a4..4651496 100644
    // Set pqos as some games will try accessing it despite non-successful result
    if (pqos) {
      auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
-@@ -559,7 +773,14 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+@@ -559,7 +776,14 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
  
  u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                 u32 flags) {
@@ -6265,7 +7128,7 @@ index 58e36a4..4651496 100644
  }
  
  u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
-@@ -579,13 +800,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,13 +803,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -6281,7 +7144,7 @@ index 58e36a4..4651496 100644
  
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
      XThread::SetLastError(error);
-@@ -603,6 +824,14 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+@@ -603,6 +827,14 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
      return -1;
    }
  
@@ -6296,7 +7159,7 @@ index 58e36a4..4651496 100644
    // TODO: Absolutely delete this object. It is no longer valid after calling
    // closesocket.
    socket->Close();
-@@ -670,12 +899,39 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+@@ -670,12 +902,39 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
    }
  
    N_XSOCKADDR_IN native_name(name);
@@ -6337,7 +7200,7 @@ index 58e36a4..4651496 100644
    return 0;
  }
  
-@@ -763,7 +1019,10 @@ struct host_set {
+@@ -763,7 +1022,10 @@ struct host_set {
        }
        // Convert from Xenia -> native
        auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
@@ -6349,7 +7212,7 @@ index 58e36a4..4651496 100644
        this->sockets[i] = socket;
      }
    }
-@@ -933,11 +1192,55 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
+@@ -933,11 +1195,97 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
    XThread::SetLastError(error_code);
  }
  
@@ -6385,12 +7248,54 @@ index 58e36a4..4651496 100644
 +  return 0;
 +}
 +
++// ge: network-session tracking (GeNetworkGameActive).
++namespace {
++std::atomic<int> g_ge_net_keys{0};
++std::atomic<int> g_ge_net_sessions{0};
++std::mutex g_ge_net_mutex;
++std::vector<uint32_t> g_ge_net_session_ptrs;  // open sessions with peer networking
++constexpr uint32_t kXSessionCreateUsesPeerNetwork = 0x20;
++}  // namespace
++bool GeNetworkGameActive() {
++  return g_ge_net_keys.load(std::memory_order_relaxed) > 0 ||
++         g_ge_net_sessions.load(std::memory_order_relaxed) > 0;
++}
++void GeNoteSessionCreated(uint32_t session_ptr, uint32_t flags) {
++  if (!(flags & kXSessionCreateUsesPeerNetwork)) {
++    REXKRNL_INFO("ge net: local session created (flags {:08X}), not a network game", flags);
++    return;
++  }
++  std::lock_guard<std::mutex> lock(g_ge_net_mutex);
++  g_ge_net_session_ptrs.push_back(session_ptr);
++  const int n = int(g_ge_net_session_ptrs.size());
++  g_ge_net_sessions.store(n, std::memory_order_relaxed);
++  REXKRNL_INFO("ge net: network session created (flags {:08X}, {} open)", flags, n);
++}
++void GeNoteSessionDeleted(uint32_t session_ptr) {
++  std::lock_guard<std::mutex> lock(g_ge_net_mutex);
++  auto it = std::find(g_ge_net_session_ptrs.begin(), g_ge_net_session_ptrs.end(), session_ptr);
++  if (it == g_ge_net_session_ptrs.end()) {
++    return;  // a local session
++  }
++  g_ge_net_session_ptrs.erase(it);
++  const int n = int(g_ge_net_session_ptrs.size());
++  g_ge_net_sessions.store(n, std::memory_order_relaxed);
++  REXKRNL_INFO("ge net: network session deleted ({} open)", n);
++}
++
 +u32 NetDll_XNetRegisterKey_entry(u32 caller, ppc_ptr_t<XNKID_t> pxnkid, ppc_ptr_t<XNKEY_t> pxnkey) {
 +  // No real registration needed for plaintext localhost play.
++  const int n = g_ge_net_keys.fetch_add(1, std::memory_order_relaxed) + 1;
++  REXKRNL_INFO("ge net: session key registered ({} registered)", n);
 +  return 0;
 +}
 +
-+u32 NetDll_XNetUnregisterKey_entry(u32 caller, ppc_ptr_t<XNKID_t> pxnkid) { return 0; }
++u32 NetDll_XNetUnregisterKey_entry(u32 caller, ppc_ptr_t<XNKID_t> pxnkid) {
++  int n = g_ge_net_keys.load(std::memory_order_relaxed);
++  while (n > 0 && !g_ge_net_keys.compare_exchange_weak(n, n - 1)) {}
++  REXKRNL_INFO("ge net: session key unregistered ({} registered)", n > 0 ? n - 1 : 0);
++  return 0;
++}
 +
  }  // namespace xam
  }  // namespace kernel
@@ -6405,7 +7310,7 @@ index 58e36a4..4651496 100644
  REX_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
  REX_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
  REX_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
-@@ -1030,25 +1333,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,25 +1378,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -7000,10 +7905,10 @@ index 2d13ac8..987ec24 100644
  
  bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
-index 306118e..71d9d02 100644
+index 306118e..ce1718f 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp
 +++ b/src/ui/d3d12/d3d12_presenter.cpp
-@@ -1155,9 +1155,51 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -1155,9 +1155,94 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
    // fullscreen is ever used in, the allow tearing flag must not be passed in
    // fullscreen, but DXGI fullscreen is largely unneeded with the flip
    // presentation model used in Direct3D 12).
@@ -7030,6 +7935,49 @@ index 306118e..71d9d02 100644
 +      LARGE_INTEGER now;
 +      QueryPerformanceCounter(&now);
 +      if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
++      // What the display actually showed (DXGI frame statistics): each newly
++      // displayed frame should take as many refreshes as presents went by. A
++      // frame held for an extra refresh is a repeat, two presents in one
++      // refresh a drop. On a ~60 Hz display at 60 FPS, a regular repeat or
++      // drop every few seconds is the game clock beating against the display.
++      {
++        static UINT last_present_count = 0, last_refresh_count = 0;
++        static uint64_t refreshes = 0, shown = 0, repeats = 0, drops = 0, events = 0;
++        static LARGE_INTEGER window_start{};
++        static std::string event_times;
++        DXGI_FRAME_STATISTICS fs;
++        if (SUCCEEDED(paint_context_.swap_chain->GetFrameStatistics(&fs)) && fs.PresentCount) {
++          if (!window_start.QuadPart) window_start = now;
++          if (last_present_count && fs.PresentCount != last_present_count) {
++            const int64_t dp = int64_t(fs.PresentCount) - int64_t(last_present_count);
++            const int64_t dr = int64_t(fs.PresentRefreshCount) - int64_t(last_refresh_count);
++            if (dp > 0 && dr >= 0 && dp < 1000 && dr < 1000) {
++              shown += uint64_t(dp);
++              refreshes += uint64_t(dr);
++              if (dr != dp) {
++                if (dr > dp) repeats += uint64_t(dr - dp); else drops += uint64_t(dp - dr);
++                if (++events <= 6) {
++                  event_times += fmt::format(
++                      " {}{:.2f}s", dr > dp ? "+" : "-",
++                      double(now.QuadPart - window_start.QuadPart) / double(freq.QuadPart));
++                }
++              }
++            }
++          }
++          if (fs.PresentCount != last_present_count) {
++            last_present_count = fs.PresentCount;
++            last_refresh_count = fs.PresentRefreshCount;
++          }
++          if (double(now.QuadPart - window_start.QuadPart) >= 10.0 * double(freq.QuadPart)) {
++            REXLOG_INFO("ge display: {} frames shown over {} refreshes, {} repeated, {} dropped{}{}",
++                        shown, refreshes, repeats, drops, events ? "; at" : "",
++                        events > 6 ? event_times + " ..." : event_times);
++            window_start = now;
++            refreshes = shown = repeats = drops = events = 0;
++            event_times.clear();
++          }
++        }
++      }
 +      if (prev.QuadPart) {
 +        const double ms = double(now.QuadPart - prev.QuadPart) * 1000.0 / double(freq.QuadPart);
 +        ++count;
@@ -7083,18 +8031,27 @@ index f270f3c..319674e 100644
      }
    }
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..074bc86 100644
+index 7360ed9..009b51c 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
-@@ -12,6 +12,7 @@
+@@ -12,12 +12,16 @@
  #include <algorithm>
  #include <atomic>
  #include <cctype>
 +#include <chrono>
  #include <utility>
++#include <cmath>
++#include <vector>
  
  #include <rex/assert.h>
-@@ -31,6 +32,12 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
++#include <rex/thread.h>
+ #include <rex/ui/presenter.h>
+ #include <rex/ui/window.h>
+ 
+@@ -31,6 +35,12 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
  
  REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                      "Enable letterboxing for non-native aspect ratios");
@@ -7107,7 +8064,237 @@ index 7360ed9..074bc86 100644
  
  REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
                       "Horizontal safe area percentage (0-100)")
-@@ -895,12 +902,19 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -81,6 +91,24 @@ REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
+                     "Enable output dithering in the final present pass")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++// ge: paced presentation (adapted from SVR2011-Recomp's frame pacing patch,
++// BSD-3-Clause, Martin Penkava). Without it each guest frame was presented the
++// moment the emulated GPU reached its swap, which varies by about +-1 ms from
++// frame to frame. On a display whose refresh is close to the game's 60 Hz,
++// that jitter decides at random, for every frame that lands near a display
++// refresh, whether it is shown on this refresh or the next: bursts of repeated
++// and dropped frames whenever the two clocks' phases cross (every 37 s at
++// 59.973 Hz), and single repeat/drop pairs in between. Presenting a fixed time
++// after the guest vblank removes the jitter.
++REXCVAR_DEFINE_BOOL(present_pace_to_guest_vblank, true, "UI/Presenter",
++                    "Present each guest frame a fixed time after its guest vblank (even "
++                    "spacing) instead of as soon as the emulated GPU reaches it")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(present_pacing_offset_us, 5000, "UI/Presenter",
++                     "Paced presentation: present this many microseconds after the guest "
++                     "vblank (frames arriving later wait for the next vblank)")
++    .range(0, 16000);
++
+ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
+                     "Allow overscan cutoff based on safe area settings")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -286,6 +314,7 @@ Presenter::~Presenter() {
+   // No intrusive lifetime management must be performed from UI drawers - defer
+   // it if needed.
+   assert_false(is_executing_ui_drawers_);
++  StopGuestOutputPacing();
+ 
+ #if REX_PLATFORM_WIN32
+   if (dxgi_ui_tick_thread_.joinable()) {
+@@ -613,6 +642,184 @@ bool Presenter::RefreshGuestOutput(
+     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
+   }
+ 
++  if (REXCVAR_GET(present_pace_to_guest_vblank)) {
++    {
++      std::lock_guard<std::mutex> lock(guest_output_pacing_mutex_);
++      if (!guest_output_pacing_thread_.joinable() && !guest_output_pacing_shutdown_) {
++        guest_output_pacing_thread_ = std::thread([this]() { GuestOutputPacingThread(); });
++      }
++    }
++    guest_output_paced_frame_arrival_.store(
++        std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
++    if (guest_output_paced_frame_pending_.exchange(true, std::memory_order_acq_rel)) {
++      guest_output_paced_frames_replaced_.fetch_add(1, std::memory_order_relaxed);
++    }
++    return is_active;
++  }
++  PresentLatestGuestOutput();
++  return is_active;
++}
++
++void Presenter::OnGuestVblank(std::chrono::steady_clock::time_point vblank_time) {
++  {
++    std::lock_guard<std::mutex> lock(guest_output_pacing_mutex_);
++    if (!guest_output_pacing_thread_.joinable()) {
++      return;
++    }
++    if (guest_output_pacing_vblank_count_++) {
++      auto period = vblank_time - guest_output_pacing_vblank_time_;
++      auto& current = guest_output_pacing_vblank_period_;
++      // Ignore gaps from missed ticks; a real rate change moves by less than half a period.
++      if (current <= decltype(period)::zero() ||
++          (period > current / 2 && period < current * 3 / 2)) {
++        current = period;
++      }
++    }
++    guest_output_pacing_vblank_time_ = vblank_time;
++  }
++  guest_output_pacing_condition_.notify_one();
++}
++
++void Presenter::StopGuestOutputPacing() {
++  std::thread thread;
++  {
++    std::lock_guard<std::mutex> lock(guest_output_pacing_mutex_);
++    guest_output_pacing_shutdown_ = true;
++    thread = std::move(guest_output_pacing_thread_);
++  }
++  guest_output_pacing_condition_.notify_one();
++  if (thread.joinable()) {
++    thread.join();
++  }
++}
++
++void Presenter::GuestOutputPacingThread() {
++  rex::thread::set_current_thread_name("Guest Output Pacing");
++  using Clock = std::chrono::steady_clock;
++  // Sleep on a high-resolution timer until shortly before the present moment,
++  // then yield-spin the rest. This is a host thread, not a guest one.
++  constexpr auto kWakeAhead = std::chrono::microseconds(700);
++#if REX_PLATFORM_WIN32
++  HANDLE sleep_timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */,
++                                              TIMER_ALL_ACCESS);
++#endif
++  auto precise_sleep = [&](Clock::duration d) {
++#if REX_PLATFORM_WIN32
++    if (sleep_timer) {
++      LARGE_INTEGER due;
++      due.QuadPart = -std::max<int64_t>(
++          1, std::chrono::duration_cast<std::chrono::nanoseconds>(d).count() / 100);
++      if (SetWaitableTimer(sleep_timer, &due, 0, nullptr, nullptr, FALSE)) {
++        WaitForSingleObject(sleep_timer, INFINITE);
++        return;
++      }
++    }
++#endif
++    std::this_thread::sleep_for(d);
++  };
++  Clock::time_point last_target{};
++  // vblank_timing_log: when frames arrive after their vblank, and pacing misses.
++  Clock::time_point window_start = Clock::now(), last_present{};
++  uint32_t presents = 0, empty_vblanks = 0, late_frames = 0;
++  double arrival_max_ms = 0.0, interval_sum = 0.0, interval_sq = 0.0, interval_max = 0.0;
++  std::vector<float> arrivals;
++  while (true) {
++    Clock::time_point vblank_time;
++    Clock::duration period;
++    {
++      std::unique_lock<std::mutex> lock(guest_output_pacing_mutex_);
++      guest_output_pacing_condition_.wait(lock, [&]() {
++        return guest_output_pacing_shutdown_ || guest_output_pacing_vblank_count_ >= 2;
++      });
++      if (guest_output_pacing_shutdown_) {
++        break;
++      }
++      vblank_time = guest_output_pacing_vblank_time_;
++      period = guest_output_pacing_vblank_period_;
++    }
++    if (period <= Clock::duration::zero()) {
++      continue;
++    }
++    Clock::duration offset = std::min<Clock::duration>(
++        std::chrono::microseconds(REXCVAR_GET(present_pacing_offset_us)), period);
++    if (offset <= Clock::duration::zero()) offset = period;
++    // The next present moment after the last one, anchored to the latest vblank.
++    Clock::time_point target = vblank_time + offset;
++    while (target <= last_target + period / 2) {
++      target += period;
++    }
++    Clock::time_point now = Clock::now();
++    if (target - now > period * 2) {
++      // The guest clock stalled or jumped; resynchronise on the next tick.
++      last_target = Clock::time_point{};
++      precise_sleep(std::chrono::milliseconds(1));
++      continue;
++    }
++    if (target - now > kWakeAhead) {
++      precise_sleep(target - now - kWakeAhead);
++    }
++    while (Clock::now() < target) {
++      std::this_thread::yield();
++    }
++    last_target = target;
++    if (!guest_output_paced_frame_pending_.exchange(false, std::memory_order_acq_rel)) {
++      ++empty_vblanks;
++      continue;
++    }
++    PresentLatestGuestOutput();
++    // The cvar lives in the GPU plugin, so read it by name now and then.
++    static uint32_t log_poll = 0;
++    static bool log_on = false;
++    if ((log_poll++ & 0x3F) == 0) log_on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
++    if (log_on) {
++      const Clock::time_point presented = Clock::now();
++      const Clock::time_point arrival{
++          Clock::duration(guest_output_paced_frame_arrival_.load(std::memory_order_relaxed))};
++      // Negative arrival: the frame came in before this present's vblank, i.e.
++      // it missed the previous present moment and waited a whole tick.
++      const double arrival_ms =
++          std::chrono::duration<double, std::milli>(arrival - (target - offset)).count();
++      if (arrival_ms < 0.0) ++late_frames;
++      arrivals.push_back(float(arrival_ms));
++      arrival_max_ms = std::max(arrival_max_ms, arrival_ms);
++      if (last_present != Clock::time_point{}) {
++        const double ms =
++            std::chrono::duration<double, std::milli>(presented - last_present).count();
++        interval_sum += ms;
++        interval_sq += ms * ms;
++        interval_max = std::max(interval_max, ms);
++        ++presents;
++      }
++      last_present = presented;
++      if (presented - window_start >= std::chrono::seconds(10) && presents) {
++        std::sort(arrivals.begin(), arrivals.end());
++        auto pct = [&](double q) {
++          return arrivals.empty() ? 0.0 : double(arrivals[size_t(q * (arrivals.size() - 1))]);
++        };
++        const double mean = interval_sum / presents;
++        REXLOG_INFO(
++            "ge pacing: {} presents, interval mean {:.3f} ms sd {:.3f} max {:.3f}; frames arrive "
++            "{:.2f} ms (median) / {:.2f} ms (p99) / {:.2f} ms (max) after vblank, offset {} us; "
++            "{} late, {} vblanks without a frame, {} frames replaced",
++            presents, mean, std::sqrt(std::max(0.0, interval_sq / presents - mean * mean)),
++            interval_max, pct(0.5), pct(0.99), arrival_max_ms,
++            REXCVAR_GET(present_pacing_offset_us), late_frames, empty_vblanks,
++            guest_output_paced_frames_replaced_.exchange(0, std::memory_order_relaxed));
++        window_start = presented;
++        presents = empty_vblanks = late_frames = 0;
++        arrival_max_ms = interval_sum = interval_sq = interval_max = 0.0;
++        arrivals.clear();
++      }
++    } else {
++      last_present = Clock::time_point{};
++    }
++  }
++#if REX_PLATFORM_WIN32
++  if (sleep_timer) CloseHandle(sleep_timer);
++#endif
++}
++
++void Presenter::PresentLatestGuestOutput() {
+   // Trigger the presentation on the host.
+   PaintResult paint_result = PaintResult::kNotPresented;
+   {
+@@ -645,8 +852,10 @@ bool Presenter::RefreshGuestOutput(
+       host_gpu_loss_callback_(false, false);
+     }
+   }
++}
+ 
+-  return is_active;
++void Presenter::ReloadGuestOutputPaintConfigFromCVarsFromUIThread() {
++  SetGuestOutputPaintConfigFromUIThread(BuildGuestOutputPaintConfigFromCVar());
+ }
+ 
+ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
+@@ -895,12 +1104,19 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                     old_scale);
    };
  
@@ -7129,7 +8316,7 @@ index 7360ed9..074bc86 100644
      // The window is wider that the source - crop along Y to preserve the aspect
      // ratio while stretching throughout the entire surface's width, then limit
      // the Y cropping via letterboxing or stretching along X.
-@@ -914,8 +928,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -914,8 +1130,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      // Scale the desired width by the H:W aspect ratio (inverse of W:H) to get
      // the height.
      output_height =
@@ -7140,7 +8327,7 @@ index 7360ed9..074bc86 100644
      bool letterbox = false;
      if (output_height * present_safe_area > surface_height_in_paint_connection_ * 100) {
        // Don't crop out more than the safe area margin - letterbox or stretch.
-@@ -924,8 +938,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -924,8 +1140,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      }
      if (letterbox && REXCVAR_GET(present_letterbox)) {
        output_width = rescale_unsigned(surface_height_in_paint_connection_ * 100,
@@ -7151,7 +8338,7 @@ index 7360ed9..074bc86 100644
        // output_width might have been rounded up already by rescale_unsigned, so
        // rounding down in this division.
        flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
-@@ -949,8 +963,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -949,8 +1165,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      }
      // Scale the desired height by the W:H aspect ratio to get the width.
      output_width =
@@ -7162,7 +8349,7 @@ index 7360ed9..074bc86 100644
      bool letterbox = false;
      if (output_width * present_safe_area > surface_width_in_paint_connection_ * 100) {
        // Don't crop out more than the safe area margin - letterbox or stretch.
-@@ -959,8 +973,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -959,8 +1175,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      }
      if (letterbox && REXCVAR_GET(present_letterbox)) {
        output_height = rescale_unsigned(surface_width_in_paint_connection_ * 100,
@@ -7173,7 +8360,17 @@ index 7360ed9..074bc86 100644
        // output_height might have been rounded up already by rescale_unsigned,
        // so rounding down in this division.
        flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
-@@ -1600,7 +1614,17 @@ void Presenter::WaitForUITickFromUIThread() {
+@@ -1313,7 +1529,8 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+   if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
+     return PaintMode::kUIThreadOnRequest;
+   }
+-  if (surface_paint_connection_has_implicit_vsync_) {
++  if (surface_paint_connection_has_implicit_vsync_ &&
++      !REXCVAR_GET(present_pace_to_guest_vblank)) {
+     // Don't be causing host vertical sync CPU waits in the thread generating
+     // the guest output.
+     return PaintMode::kUIThreadOnRequest;
+@@ -1600,7 +1817,17 @@ void Presenter::WaitForUITickFromUIThread() {
            std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
        return;
      }

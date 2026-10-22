@@ -23,6 +23,8 @@ GpuForScale DetectGpuForScale();
 // Real display mode height (not affected by Windows display scaling).
 int StartupDisplayHeight(int monitor_option);
 int WindowDisplayHeight(HWND__* window);
+// Exact refresh rate of the window's display (59.940 etc.), 0 if unknown.
+double DisplayRefreshHz(HWND__* window);
 // "2560x1440 @ 165 Hz" for the display the game opens on (log header).
 std::string StartupDisplayMode(int monitor_option);
 

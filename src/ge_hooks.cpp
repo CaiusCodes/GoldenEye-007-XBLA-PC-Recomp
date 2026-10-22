@@ -21,7 +21,9 @@
 #include <cstring>
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+#include "ge_gpu_detect.h"  // DisplayRefreshHz
 #include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
+#include <rex/kernel/xam/ge_online_control.h>  // GeNetworkGameActive
 #include <rex/ui/keybinds.h>     // ParseVirtualKey (keyboard rebinding)
 #include <rex/ui/virtual_key.h>
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
@@ -265,6 +267,51 @@ std::atomic<uint32_t> g_ge_device{0};   // device struct (dev) seen by ge_dbg_no
 std::atomic<uint32_t> g_ge_idblk{0};    // id-block (idblk) seen by ge_dbg_now
 std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
 
+// Game clock vs display. The game's clock is the 60 Hz guest vblank, but many
+// "60 Hz" displays really run at 59.94 Hz or 60.1 Hz. The two then drift
+// apart and every few seconds one frame is shown twice or skipped (a gap of
+// 0.12 Hz is one hitch every 8-9 s). The display's exact refresh rate is
+// logged (once, and when it changes) so a report shows it.
+// ge_match_display_refresh (on by default; held at 60 during LAN / online
+// games so every machine keeps the same clock): when the display
+// runs within 1% of 60 Hz (or of 120, 180 or 240), run the vblank at its exact
+// rate instead (a speed change of at most 1%, normally 0.1%). Other rates
+// (144 Hz, G-Sync / FreeSync screens reporting their maximum) keep 60.
+REXCVAR_DEFINE_BOOL(ge_match_display_refresh, true, "Video",
+                    "Run the game clock at a ~60 Hz display's exact refresh rate (off: always 60 Hz)");
+void ge_match_display_refresh() {
+  static double logged_hz = -1.0, applied = -1.0;
+  HWND hwnd = g_game_hwnd_for_resize();
+  const double hz = hwnd ? ge::DisplayRefreshHz(hwnd) : 0.0;
+  if (hz > 0.0 && std::fabs(hz - logged_hz) > 0.0005) {
+    logged_hz = hz;
+    REXKRNL_INFO("Display refresh: {:.3f} Hz", hz);
+  }
+  // Never during a LAN / online game: every machine in a match must run the
+  // same 60 Hz clock, whatever its display.
+  static bool logged_net = false;
+  const bool net_game = rex::kernel::xam::GeNetworkGameActive();
+  if (net_game != logged_net) {
+    logged_net = net_game;
+    REXKRNL_INFO("Network game {}: game clock {}", net_game ? "started" : "ended",
+                 net_game ? "held at 60 Hz" : "may follow the display again");
+  }
+  double rate = 0.0;
+  if (REXCVAR_GET(ge_match_display_refresh) && !net_game) {
+    const double n = std::round(hz / 60.0);
+    if (hz > 0.0 && n >= 1.0 && n <= 4.0 && std::fabs(hz / n - 60.0) <= 0.6) rate = hz / n;
+  }
+  if (std::fabs(rate - 60.0) < 0.0005) rate = 0.0;  // exactly 60: nothing to do
+  if (rate == applied) return;
+  applied = rate;
+  rex::cvar::SetFlagByName("vblank_rate_hz", fmt::format("{:.6f}", rate));
+  if (rate > 0.0) {
+    REXKRNL_INFO("Game clock follows the display: {:.3f} Hz", rate);
+  } else {
+    REXKRNL_INFO("Game clock: 60 Hz");
+  }
+}
+
 void ge_watchdog_thread() {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
@@ -272,8 +319,10 @@ void ge_watchdog_thread() {
   uint32_t stall = 0;
   bool logged = false;
   bool recover_fired = false;
+  uint32_t display_check = 0;
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    if ((display_check++ % 8) == 0) ge_match_display_refresh();  // every 2 s
     auto* cp = ge_cp();
     if (!cp) continue;
     uint32_t wpi = static_cast<CPProbe*>(cp)->wpi();
