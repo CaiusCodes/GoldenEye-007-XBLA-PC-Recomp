@@ -35,6 +35,8 @@ void LaunchSelfDetached();
 void ApplyRenderScale();
 void ApplyRenderScaleToGpu();
 void LogSessionHeader();
+void ApplyUpscaling();
+void SetUpscalingChangedHandler(std::function<void()> handler);
 void ApplyDiagnostics();
 // Windowed mode: resize the game window's client area (call on the UI thread).
 void ResizeGameWindow(int w, int h);
@@ -140,6 +142,7 @@ class GeApp : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
     ge::ApplyRenderScale();
+    ge::ApplyUpscaling();  // present_effect, read when the presenter starts
   }
 
   // Register the ESC pause-menu keybind and create the always-on Post-FX
@@ -162,6 +165,14 @@ class GeApp : public rex::ReXApp {
     ge::SetPcSettingsOpener([this] {
       app_context().CallInUIThreadDeferred([this] {
         if (!menu_) TogglePauseMenu();
+      });
+    });
+    // Upscaling changed on the Video page: the presenter re-reads its effect.
+    ge::SetUpscalingChangedHandler([this] {
+      app_context().CallInUIThreadDeferred([this] {
+        auto* gs = runtime() ? runtime()->graphics_system() : nullptr;
+        if (auto* presenter = gs ? gs->presenter() : nullptr)
+          presenter->ReloadGuestOutputPaintConfigFromCVarsFromUIThread();
       });
     });
     ge::SetWindowSizeHandler([this](int w, int h) {

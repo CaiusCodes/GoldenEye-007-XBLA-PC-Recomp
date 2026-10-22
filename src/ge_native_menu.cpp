@@ -51,6 +51,7 @@ namespace ge {
 void SetRebindCapturing(bool v);  // ge_hooks.cpp: swallow pad input while capturing
 std::string TakeWheelNotch();      // ge_hooks.cpp: "WheelUp"/"WheelDown" since last call
 void ApplyPlayerName(const std::string& name);  // ge_hooks.cpp
+void ApplyUpscaling();                          // below
 }
 
 namespace {
@@ -172,8 +173,12 @@ std::string GetS(const char* cvar) { return rex::cvar::GetFlagByName(cvar); }
 bool GetB(const char* cvar) { return GetS(cvar) == "true"; }
 // Online settings apply without a restart: the name goes straight to the
 // profile, and the online client reconnects with the new server on next use.
+std::function<void()> g_upscaling_changed;  // reloads the presenter's effect (UI thread)
 void ApplyLive(const char* cvar, const std::string& v) {
-  if (std::strcmp(cvar, "ge_username") == 0) {
+  if (std::strcmp(cvar, "ge_upscaling") == 0) {
+    ge::ApplyUpscaling();
+    if (g_upscaling_changed) g_upscaling_changed();
+  } else if (std::strcmp(cvar, "ge_username") == 0) {
     ge::ApplyPlayerName(v);
   } else if (std::strncmp(cvar, "ge_online_", 10) == 0) {
     rex::kernel::xam::GeOnlineReconnect();
@@ -441,6 +446,7 @@ std::vector<Row> BuildPage(Page page) {
               text += " - restarts";
             return text;
           });
+      AddChoice(rows, "Upscaling:", "ge_upscaling", {{"FSR", "on"}, {"Off", "off"}});
       AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
       AddAction(rows, "Done", [] {
         RestartIfRenderScaleChanged();
@@ -1231,6 +1237,9 @@ std::string ReadVersionText() {
 // (2x = 2560x1440). It is read once when the emulated GPU starts, so a change
 // applies by restarting the game (done for the player on leaving the Video
 // page). Auto: 1x on an integrated GPU (handhelds, laptops), else 2x.
+// Upscaling (see ge::ApplyUpscaling).
+REXCVAR_DEFINE_STRING(ge_upscaling, "on", "Video", "Upscaling: on (FSR 1 / CAS) or off (bilinear)")
+    .allowed({"on", "off"});
 REXCVAR_DEFINE_STRING(ge_render_scale, "auto", "Video",
                       "Render scale: auto (1x on integrated GPUs, else 2x), 1, 2 or 3")
     .allowed({"auto", "1", "2", "3"});
@@ -1338,6 +1347,18 @@ void LogSessionHeader() {
   REXLOG_INFO("Performance diagnostics: {}",
               GetB("performance_diagnostics") ? "on" : "off (set performance_diagnostics = true "
                                                        "in ge.toml for a detailed log)");
+}
+// Upscaling (ge_upscaling, on by default): AMD FidelityFX Super Resolution 1
+// when the game's picture is smaller than the window or screen (1x on a
+// 1080p or 1440p display), Contrast Adaptive Sharpening when it is the same
+// size or larger. One or two full-screen passes, at the final output only, so
+// the HUD and text are sharpened with the scene and our own overlays (FPS,
+// crosshair dot) are drawn after it. Off is the plain bilinear stretch.
+void ApplyUpscaling() {
+  rex::cvar::SetFlagByName("present_effect", GetS("ge_upscaling") == "off" ? "bilinear" : "fsr");
+}
+void SetUpscalingChangedHandler(std::function<void()> handler) {
+  g_upscaling_changed = std::move(handler);
 }
 void ApplyRenderScaleToGpu() {
   const std::string want = std::to_string(g_render_scale_active > 0 ? g_render_scale_active : 2);
