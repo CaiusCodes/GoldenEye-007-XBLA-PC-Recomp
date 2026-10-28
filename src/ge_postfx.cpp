@@ -13,13 +13,12 @@
 #include <rex/filesystem.h>
 #include <rex/ui/image_decode.h>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include <rex/platform.h>
+
+#include "ge_platform.h"
+
+#include <filesystem>
+#include <system_error>
 
 #include <imgui.h>
 
@@ -43,7 +42,7 @@ REXCVAR_DEFINE_DOUBLE(postfx_tint_b, 1.0, "PostFX", "Tint colour blue (0..1)").r
 REXCVAR_DEFINE_DOUBLE(postfx_tint, 0.0, "PostFX", "Tint strength (0..1)").range(0.0, 1.0);
 REXCVAR_DEFINE_DOUBLE(postfx_vignette, 0.0, "PostFX", "Vignette strength (0..1)").range(0.0, 1.0);
 REXCVAR_DEFINE_DOUBLE(postfx_scanlines, 0.0, "PostFX", "Scanline strength (0..1)").range(0.0, 1.0);
-// Shader colour-grade params (applied by the GPU grade pass in the D3D12 swap).
+// Shader colour-grade params (applied by the GPU grade pass in the D3D12 / Vulkan swap).
 REXCVAR_DEFINE_DOUBLE(postfx_contrast, 1.0, "PostFX", "Contrast (1=none)").range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(postfx_saturation, 1.0, "PostFX", "Saturation (1=none)").range(0.0, 2.0);
 REXCVAR_DEFINE_DOUBLE(postfx_vibrance, 0.0, "PostFX", "Vibrance (-1..1)").range(-1.0, 1.0);
@@ -154,7 +153,7 @@ void PostFxOverlay::OnDraw(ImGuiIO& io) {
 
   // NOTE: brightness / contrast / saturation / vibrance / temperature / gamma /
   // tint are all done per-pixel by the GPU grade shader (ge_grade.cs.hlsl) in
-  // the D3D12 swap. This overlay only adds the spatial effects ImGui can do:
+  // the D3D12 and Vulkan swap. This overlay only adds the spatial effects ImGui can do:
   // vignette and scanlines.
 
   // Vignette: four edge gradients (transparent inner -> dark edge) stack at the
@@ -196,8 +195,21 @@ void AddOverlayFont(ImFontAtlas* atlas) {
   static const ImWchar kRanges[] = {0x0020, 0x007E, 0};
   ImFontConfig config;
   config.OversampleH = config.OversampleV = 2;
-  for (const char* path : {"C:\\Windows\\Fonts\\segoeuib.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"}) {
-    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+#if REX_PLATFORM_WIN32
+  const char* const kFonts[] = {"C:\\Windows\\Fonts\\segoeuib.ttf",
+                                "C:\\Windows\\Fonts\\arialbd.ttf"};
+#else
+  const char* const kFonts[] = {"/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+                                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                                "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+                                "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+                                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                                "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+                                "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"};
+#endif
+  for (const char* path : kFonts) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) continue;
     g_overlay_font = atlas->AddFontFromFileTTF(path, 48.0f, &config, kRanges);
     if (g_overlay_font) return;
   }
@@ -240,7 +252,7 @@ void DrawFps(float W, float H) {
     last_ms = 0;
     return;
   }
-  const uint64_t now = GetTickCount64();
+  const uint64_t now = ge::platform::TicksMs();
   if (!last_ms || now - last_ms >= 500) {
     last_ms = now;
     std::vector<double> ms;

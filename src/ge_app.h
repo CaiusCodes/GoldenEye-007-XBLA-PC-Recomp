@@ -7,6 +7,7 @@
 #pragma once
 
 #include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/filesystem.h>
 #include <rex/system.h>
 #include <rex/rex_app.h>
@@ -103,7 +104,11 @@ class GeApp : public rex::ReXApp {
         rex::ShowSimpleMessageBox(
             rex::SimpleMessageBoxType::Error,
             "GoldenEye 007's game data has not been imported yet.\n\n"
+#if REX_PLATFORM_WIN32
             "Open \"GoldenEye 007.exe\" in the main GoldenEye 007 folder and select "
+#else
+            "Run \"GoldenEye 007\" in the main GoldenEye 007 folder and select "
+#endif
             "your Xbox 360 GoldenEye 007 package.");
       }
     }

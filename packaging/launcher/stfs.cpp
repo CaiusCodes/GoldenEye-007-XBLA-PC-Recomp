@@ -23,12 +23,21 @@
 // The game itself (resources\runtime) is a separate program and is not.
 #include "stfs.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
-#include <cwctype>
+#include <cstring>
 
 namespace stfs {
+namespace fs = std::filesystem;
+
 namespace {
 
 uint32_t BE32(const uint8_t* p) {
@@ -71,12 +80,18 @@ bool SafeName(const std::string& name) {
 Package::~Package() { Close(); }
 
 void Package::Close() {
+#ifdef _WIN32
   if (data_) UnmapViewOfFile(data_);
   if (mapping_) CloseHandle(mapping_);
   if (file_ && file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
-  data_ = nullptr;
   mapping_ = nullptr;
   file_ = nullptr;
+#else
+  if (data_) munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
+  if (file_fd_ >= 0) close(file_fd_);
+  file_fd_ = -1;
+#endif
+  data_ = nullptr;
   size_ = 0;
   entries_.clear();
 }
@@ -95,19 +110,20 @@ bool Package::NextBlock(uint32_t block, uint32_t* next) const {
   return true;
 }
 
-bool Package::Open(const std::wstring& path, std::wstring* error) {
+bool Package::Open(const fs::path& path, std::string* error) {
   Close();
+#ifdef _WIN32
   // Read access with read sharing only: the package is never modified.
   file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file_ == INVALID_HANDLE_VALUE) {
     file_ = nullptr;
-    *error = L"The package could not be opened. Check that it is not in use and that you can read it.";
+    *error = "The package could not be opened. Check that it is not in use and that you can read it.";
     return false;
   }
   LARGE_INTEGER size = {};
   if (!GetFileSizeEx(file_, &size) || size.QuadPart < 0xC000) {
-    *error = L"This file is too small to be an Xbox 360 package.";
+    *error = "This file is too small to be an Xbox 360 package.";
     Close();
     return false;
   }
@@ -115,16 +131,39 @@ bool Package::Open(const std::wstring& path, std::wstring* error) {
   mapping_ = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (mapping_) data_ = static_cast<const uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0));
   if (!data_) {
-    *error = L"The package could not be read (not enough memory to map it).";
+    *error = "The package could not be read (not enough memory to map it).";
     Close();
     return false;
   }
+#else
+  file_fd_ = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (file_fd_ < 0) {
+    *error = "The package could not be opened. Check that it is not in use and that you can read it.";
+    return false;
+  }
+  struct stat info = {};
+  if (fstat(file_fd_, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0xC000) {
+    *error = "This file is too small to be an Xbox 360 package.";
+    Close();
+    return false;
+  }
+  size_ = static_cast<uint64_t>(info.st_size);
+  void* map = mmap(nullptr, static_cast<size_t>(size_), PROT_READ, MAP_PRIVATE, file_fd_, 0);
+  if (map == MAP_FAILED) {
+    *error = "The package could not be read (not enough memory to map it).";
+    Close();
+    return false;
+  }
+  data_ = static_cast<const uint8_t*>(map);
+#endif
 
   if (memcmp(data_, "CON ", 4) != 0 && memcmp(data_, "LIVE", 4) != 0 && memcmp(data_, "PIRS", 4) != 0) {
-    *error = L"This is not an Xbox 360 package.";
+    *error = "This is not an Xbox 360 package.";
     Close();
     return false;
   }
+  content_type_ = BE32(data_ + 0x344);
+  title_id_ = BE32(data_ + 0x360);
   const uint32_t header_size = BE32(data_ + 0x340);
   first_hash_table_ = (uint64_t(header_size) + 0xFFF) & 0xFFFFF000ull;
   const uint8_t block_separation = data_[0x37B];
@@ -154,7 +193,7 @@ bool Package::Open(const std::wstring& path, std::wstring* error) {
       entry.parent = parent == 0xFFFF ? -1 : static_cast<int>(parent);
       entry.size = BE32(e + 0x34);
       if (!SafeName(entry.name)) {
-        *error = L"The package's file table holds an unexpected file name. The package may be damaged.";
+        *error = "The package's file table holds an unexpected file name. The package may be damaged.";
         Close();
         return false;
       }
@@ -165,15 +204,14 @@ bool Package::Open(const std::wstring& path, std::wstring* error) {
 
   // Full relative paths. A parent chain longer than the table is a loop.
   for (Entry& entry : entries_) {
-    std::wstring path(entry.name.begin(), entry.name.end());
+    fs::path path = entry.name;
     int parent = entry.parent;
     size_t guard = 0;
     while (parent >= 0 && parent < static_cast<int>(entries_.size()) && entries_[parent].directory) {
-      const std::string& name = entries_[parent].name;
-      path = std::wstring(name.begin(), name.end()) + L"\\" + path;
+      path = fs::path(entries_[parent].name) / path;
       parent = entries_[parent].parent;
       if (++guard > entries_.size()) {
-        *error = L"The package's folder table is damaged.";
+        *error = "The package's folder table is damaged.";
         Close();
         return false;
       }
@@ -181,16 +219,17 @@ bool Package::Open(const std::wstring& path, std::wstring* error) {
     entry.path = path;
   }
   if (entries_.empty()) {
-    *error = L"The package's file table is empty or damaged.";
+    *error = "The package's file table is empty or damaged.";
     Close();
     return false;
   }
   return true;
 }
 
-const Entry* Package::Find(const std::wstring& path) const {
+const Entry* Package::Find(const std::string& path) const {
+  const std::string wanted = fs::path(path).generic_string();
   for (const Entry& entry : entries_) {
-    if (!entry.directory && _wcsicmp(entry.path.c_str(), path.c_str()) == 0) return &entry;
+    if (!entry.directory && EqualsNoCase(entry.path.generic_string(), wanted)) return &entry;
   }
   return nullptr;
 }
@@ -204,18 +243,18 @@ uint64_t Package::total_file_bytes() const {
 }
 
 bool Package::Read(const Entry& entry, const std::function<bool(const uint8_t*, size_t)>& sink,
-                   std::wstring* error) const {
+                   std::string* error) const {
   uint64_t remaining = entry.size;
   uint32_t block = entry.first_block;
   for (uint32_t done = 0; remaining > 0; ++done) {
     if (done >= entry.blocks) {
-      *error = L"A file in the package is shorter than its size says. The package may be damaged.";
+      *error = "A file in the package is shorter than its size says. The package may be damaged.";
       return false;
     }
     const uint64_t at = BlockToAddress(block);
     const size_t take = static_cast<size_t>(std::min<uint64_t>(remaining, 0x1000));
     if (at + take > size_) {
-      *error = L"The package ends early. It may be incomplete or damaged.";
+      *error = "The package ends early. It may be incomplete or damaged.";
       return false;
     }
     if (!sink(data_ + at, take)) return false;
@@ -224,7 +263,7 @@ bool Package::Read(const Entry& entry, const std::function<bool(const uint8_t*, 
     if (entry.consecutive) {
       ++block;
     } else if (!NextBlock(block, &block)) {
-      *error = L"A file's block chain in the package is broken. The package may be damaged.";
+      *error = "A file's block chain in the package is broken. The package may be damaged.";
       return false;
     }
   }

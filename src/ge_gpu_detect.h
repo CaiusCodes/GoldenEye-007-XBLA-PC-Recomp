@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <string>
 
-struct HWND__;
+struct SDL_Window;
 
 namespace ge {
 
@@ -20,11 +20,11 @@ struct GpuForScale {
 };
 
 GpuForScale DetectGpuForScale();
-// Real display mode height (not affected by Windows display scaling).
+// Real display mode height (not affected by desktop display scaling).
 int StartupDisplayHeight(int monitor_option);
-int WindowDisplayHeight(HWND__* window);
+int WindowDisplayHeight(SDL_Window* window);
 // Exact refresh rate of the window's display (59.940 etc.), 0 if unknown.
-double DisplayRefreshHz(HWND__* window);
+double DisplayRefreshHz(SDL_Window* window);
 // "2560x1440 @ 165 Hz" for the display the game opens on (log header).
 std::string StartupDisplayMode(int monitor_option);
 // NVIDIA only (NVML from the driver, loaded on first use): the first GPU's

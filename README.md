@@ -1,6 +1,6 @@
 # GoldenEye 007 XBLA PC Recomp
 
-A native Windows PC version of **GoldenEye 007** based on the unreleased
+A native Windows and Linux PC version of **GoldenEye 007** based on the unreleased
 Xbox 360/XBLA remaster, created through static recompilation with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs at up to 4K with
 16:9 and 21:9 widescreen at a steady 60 FPS and switches between the original and enhanced graphics at the
@@ -30,6 +30,12 @@ projects, you can tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 - Your own GoldenEye 007 Xbox Live Arcade package (the Xbox 360 game file for
   Title ID `584108A9`)
 
+On Linux:
+
+- x86-64 CPU with AVX2 (the build targets `x86-64-v3`)
+- A Vulkan 1.1 or newer graphics driver (Mesa or NVIDIA)
+- X11 or Wayland, and PipeWire, PulseAudio or ALSA for sound
+
 ## Install and play
 
 1. Download the latest release ZIP from the
@@ -51,12 +57,29 @@ Coming from an older release with `Setup GoldenEye 007.exe` and a `Game`
 folder? Extract into or next to the old folder and setup imports straight
 from the old install, saves and settings included.
 
+On Linux:
+
+1. Download the latest `GoldenEye-007-XBLA-PC-Recomp-v<version>-linux-amd64.tar.gz`
+   from the Releases page and extract it with `tar -xzf` to a writable location.
+2. Run `GoldenEye 007` (double-click it, or `./"GoldenEye 007"` from a
+   terminal). The first time, the same setup window as on Windows opens: it
+   finds your package next to the launcher or in a `Game Package` folder, or
+   drop it onto the window / **Browse package**. Tick any extras, press
+   **Play**. Without a desktop (or with `--cli`) setup runs in the terminal:
+   `--package <file>`, `--extras fullscreen,shortcut,complete`,
+   `--unattended`, and `--setup` runs setup again. The shortcut extra writes a desktop entry to
+   `~/.local/share/applications`.
+3. Everything stays inside the extracted folder (`resources/assets`,
+   `resources/userdata/ge.toml`, logs in `resources/runtime/logs`).
+
+The screenshots above show the Windows setup window.
+
 Setup only reads your package and never changes it. It downloads nothing and
 neither setup nor the game contacts Xbox Live.
 
 ## Features
 
-- **Native Windows PC build**: no emulator, runs as a normal Windows program
+- **Native Windows and Linux PC build**: no emulator, runs as a normal program
 - **Up to 4K**: windowed sizes from 1024×768 to 3840×2160, or fullscreen at
   your screen's resolution, rendered at twice the original resolution
 - **Widescreen**: 16:9 and 21:9 (Screen Ratio in the game's options), with a
@@ -77,9 +100,10 @@ neither setup nor the game contacts Xbox Live.
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
   (display mode, window size, V-Sync, FPS counter, field of view,
   anti-aliasing, texture filtering, render scale, post-processing filter)
-  and Online Settings. The renderer is picked automatically: Direct3D 12 on
-  NVIDIA, Vulkan on AMD and other GPUs (Direct3D 12 crashes on AMD with this
-  game); `gpu = "d3d12"` or `gpu = "vulkan"` in `ge.toml` overrides it
+  and Online Settings. On Windows the renderer is picked automatically:
+  Direct3D 12 on NVIDIA, Vulkan on AMD and other GPUs (Direct3D 12 crashes on
+  AMD with this game); `gpu = "d3d12"` or `gpu = "vulkan"` in `ge.toml`
+  overrides it. On Linux it is always Vulkan.
   ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)
 - **Wider field of view** (10 degrees wider by default, adjustable from the
   original up to +30)
@@ -137,7 +161,8 @@ console.
 
 ## Known limitations
 
-- Windows only for now.
+- Linux: under Wayland, window centring and pointer warping may be limited
+  (the compositor decides); there is no vblank phase lock.
 - Only the GoldenEye 007 Xbox Live Arcade package with Title ID `584108A9`
   and the exact game program this port was recompiled from is supported;
   setup refuses other builds.
@@ -215,6 +240,52 @@ for example `ge_debug_menu_key = "F10"`).
 `packaging/launcher` by `packaging/Build-Launcher.ps1`), README, licences and
 `resources\runtime` (the game and its DLLs), and never any game data. The
 version comes from the `VERSION` file.
+
+### Building on Linux
+
+You need Git, CMake 3.25 or newer, Ninja, Clang 18 or newer with lld,
+Python 3, pkg-config and these development packages (Debian/Ubuntu names):
+
+```sh
+sudo apt install git cmake ninja-build clang lld python3 pkg-config \
+  libx11-xcb-dev libxss-dev libwayland-dev libwayland-bin wayland-protocols \
+  libxkbcommon-dev libdecor-0-dev libasound2-dev libpulse-dev \
+  libpipewire-0.3-dev libgtk-3-dev
+```
+
+On Arch the equivalents are `libx11 libxss wayland wayland-protocols
+libxkbcommon libdecor alsa-lib libpulse libpipewire gtk3`.
+
+```sh
+git clone --recurse-submodules --shallow-submodules https://github.com/Sojiroh/GoldenEye-007-XBLA-Linux-Recomp.git
+cd GoldenEye-007-XBLA-Linux-Recomp
+```
+
+Extract your package into `game/` with the launcher's `--extract` mode (the
+launcher is built as `out/build/linux-amd64-release/launcher/GoldenEye 007`
+by target `ge_launcher`, after the first configure) or any STFS extractor,
+then build:
+
+```sh
+cmake --preset linux-amd64-release
+cmake --build --preset linux-amd64-release --target ge_launcher
+"out/build/linux-amd64-release/launcher/GoldenEye 007" --extract <your package> game
+cmake --build --preset linux-amd64-release --target ge_codegen
+cmake --preset linux-amd64-release
+cmake --build --preset linux-amd64-release
+```
+
+To run from the build directory, link the extracted package in as `assets`:
+
+```sh
+ln -s "$PWD/game" out/build/linux-amd64-release/assets
+```
+
+`tools/make-release.sh` builds
+`out/release/GoldenEye-007-XBLA-PC-Recomp-v<version>-linux-amd64.tar.gz`
+(same layout as the Windows ZIP: launcher, README, licences and
+`resources/runtime` with the game and its `.so` libraries, never any game
+data).
 
 ## Licence and credits
 

@@ -82,7 +82,7 @@ index 2c14df1..d0ee072 100644
      endif()
      set(tag_major ${CMAKE_MATCH_1})
 diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
-index 41e6dce..8dfbb98 100644
+index 41e6dce..a7ca429 100644
 --- a/cmake/rexglue_helpers.cmake
 +++ b/cmake/rexglue_helpers.cmake
 @@ -81,6 +81,26 @@ function(rexglue_configure_target target_name)
@@ -112,6 +112,22 @@ index 41e6dce..8dfbb98 100644
      target_compile_definitions(${target_name} PRIVATE
          REXGLUE_BUILD_CONFIG="$<CONFIG>")
  
+@@ -109,10 +129,11 @@ function(rexglue_configure_target target_name)
+             COMMAND_EXPAND_LISTS
+             VERBATIM
+         )
+-    elseif(APPLE)
+-        # macOS: $<TARGET_RUNTIME_DLLS> does not resolve imported dylibs, so
+-        # stage the shared runtime libraries explicitly next to the executable
+-        # (paired with the @executable_path rpath above). Everything else the
++    elseif(UNIX)
++        # Linux/macOS: $<TARGET_RUNTIME_DLLS> does not resolve imported shared
++        # libraries, so stage the shared runtime libraries explicitly next to
++        # the executable (paired with the $ORIGIN rpath on Linux and the
++        # @executable_path rpath on macOS above). Everything else the
+         # runtime links (fmt, spdlog, SDL3, ...) is static. Target names
+         # differ between an in-tree build and an installed SDK import.
+         foreach(_rexglue_runtime_lib rex::runtime rexruntime rex::TracyClient TracyClient)
 diff --git a/include/rex/chrono/clock.h b/include/rex/chrono/clock.h
 index c19caea..4e3f876 100644
 --- a/include/rex/chrono/clock.h
@@ -396,7 +412,7 @@ index 4d85a2b..2f17f0f 100644
    std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
    uint32_t num_system_page_flags_ = 0;
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff48..4491a38 100644
+index 696ff48..ad32e8e 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -482,6 +482,10 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -422,7 +438,7 @@ index 696ff48..4491a38 100644
    bool frame_open_ = false;
    // Tracks whether any draw in the current frame used an async placeholder
    // graphics pipeline and may have produced incomplete output.
-@@ -666,6 +673,30 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -666,6 +673,48 @@ class VulkanCommandProcessor : public CommandProcessor {
    VkPipelineLayout swap_apply_gamma_pipeline_layout_ = VK_NULL_HANDLE;
    VkPipelineLayout swap_apply_gamma_compute_pipeline_layout_ = VK_NULL_HANDLE;
    VkPipelineLayout swap_fxaa_pipeline_layout_ = VK_NULL_HANDLE;
@@ -450,6 +466,24 @@ index 696ff48..4491a38 100644
 +  uint32_t backdrop_width_[2] = {0, 0};
 +  uint32_t backdrop_height_[2] = {0, 0};
 +  bool backdrop_load_tried_[2] = {false, false};
++  // ge: colour grade compute pass (in place over the guest output, after the
++  // backdrop), same 12-dword constants as the D3D12 GradeConstants.
++  struct GradeConstants {
++    uint32_t size[2];
++    float brightness;
++    float contrast;
++    float saturation;
++    float vibrance;
++    float temperature;
++    float gamma;
++    float tint_r;
++    float tint_g;
++    float tint_b;
++    float tint_strength;
++  };
++  VkPipelineLayout swap_grade_pipeline_layout_ = VK_NULL_HANDLE;
++  VkPipeline swap_grade_pipeline_ = VK_NULL_HANDLE;
++  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_descriptors_grade_destination_{};
    // Has no dependencies on specific pipeline stages on both ends to simplify
    // use in different scenarios with different pipelines - use explicit barriers
    // for synchronization.
@@ -1242,6 +1276,67 @@ index 1645848..2513717 100644
    // Rebuild all loggers with new sinks
    for (auto& entry : g_registry) {
      if (entry.name.empty())
+diff --git a/src/core/system_posix.cpp b/src/core/system_posix.cpp
+index 1655695..2693601 100644
+--- a/src/core/system_posix.cpp
++++ b/src/core/system_posix.cpp
+@@ -6,28 +6,55 @@
+  * @license     BSD 3-Clause License
+  */
+ 
++#include <dlfcn.h>
++
++#include <cstdint>
+ #include <cstdio>
++#include <string>
+ 
+ #include <rex/system.h>
+ 
+ namespace rex {
+ 
+-// TODO(tomc): add linux support for showing a native message box
++namespace {
++// rexcore is an object library absorbed into librexruntime, which statically contains SDL3 (and
++// exports its symbols). rexcore itself doesn't link SDL3 (tools such as the codegen link rexcore
++// only through rexruntime and must not gain a hard SDL dependency), so look the function up at
++// run time. SDL3 signature: bool SDL_ShowSimpleMessageBox(SDL_MessageBoxFlags flags,
++// const char* title, const char* message, SDL_Window* window).
++using SdlShowSimpleMessageBoxFn = bool (*)(uint32_t, const char*, const char*, void*);
++constexpr uint32_t kSdlMessageBoxError = 0x00000010u;
++constexpr uint32_t kSdlMessageBoxWarning = 0x00000020u;
++constexpr uint32_t kSdlMessageBoxInformation = 0x00000040u;
++}  // namespace
++
+ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
+   const char* level = "INFO";
++  uint32_t sdl_flags = kSdlMessageBoxInformation;
+   switch (type) {
+     case SimpleMessageBoxType::Help:
+       level = "INFO";
++      sdl_flags = kSdlMessageBoxInformation;
+       break;
+     case SimpleMessageBoxType::Warning:
+       level = "WARNING";
++      sdl_flags = kSdlMessageBoxWarning;
+       break;
+     case SimpleMessageBoxType::Error:
+       level = "ERROR";
++      sdl_flags = kSdlMessageBoxError;
+       break;
+   }
++  // Always log; the dialog is best-effort (no display, SDL missing, etc.).
+   std::fprintf(stderr, "[%s] %.*s\n", level, static_cast<int>(message.size()), message.data());
+   std::fflush(stderr);
++
++  auto show = reinterpret_cast<SdlShowSimpleMessageBoxFn>(
++      dlsym(RTLD_DEFAULT, "SDL_ShowSimpleMessageBox"));
++  if (show) {
++    const std::string text(message);
++    show(sdl_flags, "ReXGlue", text.c_str(), nullptr);
++  }
+ }
+ 
+ }  // namespace rex
 diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
 index 5cfea05..9e324b2 100644
 --- a/src/core/timer_queue.cpp
@@ -5162,7 +5257,7 @@ index ec0df7c..d90dfdd 100644
  }
  
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..b1e22d8 100644
+index 001f36b..32ee91e 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -21,7 +21,12 @@
@@ -5178,7 +5273,7 @@ index 001f36b..b1e22d8 100644
  #include <glslang/Public/ShaderLang.h>
  #include <rex/assert.h>
  #include <rex/cvar.h>
-@@ -182,6 +187,120 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+@@ -182,6 +187,180 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
      },
  };
  
@@ -5296,10 +5391,70 @@ index 001f36b..b1e22d8 100644
 +)";
 +}
 +
++// ge: colour-grade compute shader, the GLSL twin of ge_grade.cs.hlsl (in place
++// over the final output after the backdrop; neutral parameters = identity).
++// Mapping to the HLSL, line by line:
++//   cbuffer push_consts (12 dwords) -> push_constant block GradeConstants, same
++//     order: uvec2 size, brightness, contrast, saturation, vibrance,
++//     temperature, gamma, tint_r, tint_g, tint_b, tint_strength.
++//   RWTexture2D<float4> xe_dest -> layout(set 0, binding 0, rgb10_a2) image2D.
++//   [numthreads(8,8,1)] -> local_size 8x8x1; dispatch ceil(size / 8).
++//   lerp -> mix, saturate -> clamp(0,1), the chain order is identical:
++//   temperature, brightness, contrast, tint, saturation, vibrance, gamma.
++const char* GetSwapGradeComputeSource() {
++  return R"(#version 450
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++layout(push_constant) uniform GradeConstants {
++  uvec2 xe_grade_size;
++  float xe_brightness;
++  float xe_contrast;
++  float xe_saturation;
++  float xe_vibrance;
++  float xe_temperature;
++  float xe_gamma;
++  float xe_tint_r;
++  float xe_tint_g;
++  float xe_tint_b;
++  float xe_tint_strength;
++};
++layout(set = 0, binding = 0, rgb10_a2) uniform image2D xe_dest;
++
++void main() {
++  uvec2 id = gl_GlobalInvocationID.xy;
++  if (id.x >= xe_grade_size.x || id.y >= xe_grade_size.y) {
++    return;
++  }
++  ivec2 coord = ivec2(id);
++  vec3 c = imageLoad(xe_dest, coord).rgb;
++
++  c.r += xe_temperature * 0.10;
++  c.b -= xe_temperature * 0.10;
++
++  c += xe_brightness;
++  c = (c - 0.5) * xe_contrast + 0.5;
++
++  vec3 tint = vec3(xe_tint_r, xe_tint_g, xe_tint_b);
++  c = mix(c, c * tint, xe_tint_strength);
++
++  float luma = dot(max(c, 0.0), vec3(0.2126, 0.7152, 0.0722));
++  c = mix(vec3(luma), c, xe_saturation);
++
++  float mx = max(c.r, max(c.g, c.b));
++  float mn = min(c.r, min(c.g, c.b));
++  float sat = mx - mn;
++  c = mix(vec3(luma), c, 1.0 + xe_vibrance * (1.0 - clamp(sat, 0.0, 1.0)));
++
++  c = pow(max(c, vec3(0.0001)), vec3(1.0 / xe_gamma));
++
++  imageStore(xe_dest, coord, vec4(clamp(c, 0.0, 1.0), 1.0));
++}
++)";
++}
++
  const char* GetSwapFxaaComputeSource(bool extreme_quality) {
    return extreme_quality ? R"(#version 450
  layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
-@@ -1309,15 +1428,17 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1309,15 +1488,18 @@ bool VulkanCommandProcessor::SetupContext() {
          swap_descriptor_pool_sizes[swap_descriptor_pool_create_info.poolSizeCount++];
      swap_descriptor_pool_size_combined_image_sampler.type =
          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -5315,13 +5470,14 @@ index 001f36b..b1e22d8 100644
      swap_descriptor_pool_size_storage_image.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 -    swap_descriptor_pool_size_storage_image.descriptorCount = kMaxFramesInFlight * 2;
 -    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight * 2;
-+    // Apply-gamma and FXAA destinations, and (ge) the menu backdrop pass.
-+    swap_descriptor_pool_size_storage_image.descriptorCount = kMaxFramesInFlight * 3;
-+    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight * 3;
++    // Apply-gamma and FXAA destinations, and (ge) the menu backdrop and colour
++    // grade passes: 4 storage-image sets per frame (was 3).
++    swap_descriptor_pool_size_storage_image.descriptorCount = kMaxFramesInFlight * 4;
++    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight * 4;
    }
    // 256-entry table and PWL gamma ramps. If the gamma ramp buffer is
    // host-visible, for multiple frames.
-@@ -1388,6 +1509,23 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1388,6 +1570,32 @@ bool VulkanCommandProcessor::SetupContext() {
        return false;
      }
    }
@@ -5330,6 +5486,15 @@ index 001f36b..b1e22d8 100644
 +    if (dfn.vkAllocateDescriptorSets(device, &swap_descriptor_set_allocate_info,
 +                                     &swap_descriptors_backdrop_destination_[i]) != VK_SUCCESS) {
 +      REXGPU_ERROR("Failed to allocate the menu backdrop destination descriptor sets");
++      return false;
++    }
++  }
++  // ge: colour grade pass destination descriptors (guest output).
++  swap_descriptor_set_allocate_info.pSetLayouts = &swap_descriptor_set_layout_storage_image_;
++  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
++    if (dfn.vkAllocateDescriptorSets(device, &swap_descriptor_set_allocate_info,
++                                     &swap_descriptors_grade_destination_[i]) != VK_SUCCESS) {
++      REXGPU_ERROR("Failed to allocate the colour grade destination descriptor sets");
 +      return false;
 +    }
 +  }
@@ -5345,7 +5510,7 @@ index 001f36b..b1e22d8 100644
  
    // Gamma ramp descriptor sets.
    VkWriteDescriptorSet gamma_ramp_write_descriptor_set;
-@@ -1861,6 +1999,37 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1861,6 +2069,68 @@ bool VulkanCommandProcessor::SetupContext() {
      }
    }
  
@@ -5380,10 +5545,41 @@ index 001f36b..b1e22d8 100644
 +    }
 +  }
 +
++  // ge: colour grade compute pipeline (optional: without it the pass is
++  // skipped). One storage-image set (the guest output) + GradeConstants.
++  {
++    VkPushConstantRange grade_push_constant_range;
++    grade_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    grade_push_constant_range.offset = 0;
++    grade_push_constant_range.size = sizeof(GradeConstants);
++    VkPipelineLayoutCreateInfo grade_layout_create_info = {};
++    grade_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    grade_layout_create_info.setLayoutCount = 1;
++    grade_layout_create_info.pSetLayouts = &swap_descriptor_set_layout_storage_image_;
++    grade_layout_create_info.pushConstantRangeCount = 1;
++    grade_layout_create_info.pPushConstantRanges = &grade_push_constant_range;
++    std::vector<uint32_t> grade_spirv;
++    std::string grade_compile_error;
++    if (dfn.vkCreatePipelineLayout(device, &grade_layout_create_info, nullptr,
++                                   &swap_grade_pipeline_layout_) != VK_SUCCESS) {
++      REXGPU_WARN("ge: colour grade disabled (no pipeline layout)");
++    } else if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, GetSwapGradeComputeSource(),
++                                   grade_spirv, grade_compile_error)) {
++      REXGPU_WARN("ge: colour grade disabled (shader: {})", grade_compile_error);
++    } else {
++      swap_grade_pipeline_ = ui::vulkan::util::CreateComputePipeline(
++          vulkan_device, swap_grade_pipeline_layout_, grade_spirv.data(),
++          sizeof(uint32_t) * grade_spirv.size());
++      if (swap_grade_pipeline_ == VK_NULL_HANDLE) {
++        REXGPU_WARN("ge: colour grade disabled (no pipeline)");
++      }
++    }
++  }
++
    VkPipelineLayoutCreateInfo resolve_downscale_layout_create_info = {};
    resolve_downscale_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
    VkDescriptorSetLayout resolve_downscale_set_layout =
-@@ -1952,6 +2121,10 @@ void VulkanCommandProcessor::ShutdownContext() {
+@@ -1952,6 +2222,13 @@ void VulkanCommandProcessor::ShutdownContext() {
                                             swap_framebuffer.framebuffer);
    }
    DestroySwapFxaaSourceImage();
@@ -5391,10 +5587,13 @@ index 001f36b..b1e22d8 100644
 +  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_backdrop_pipeline_);
 +  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
 +                                         swap_backdrop_pipeline_layout_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_grade_pipeline_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
++                                         swap_grade_pipeline_layout_);
  
    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                           swap_fxaa_extreme_pipeline_);
-@@ -2430,6 +2603,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2430,6 +2707,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
          bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
                          swap_post_effect == SwapPostEffect::kFxaaExtreme;
  
@@ -5421,7 +5620,7 @@ index 001f36b..b1e22d8 100644
          // This is according to D3D::InitializePresentationParameters from a
          // game executable, which initializes the 256-entry table gamma ramp for
          // 8_8_8_8 output and the PWL gamma ramp for 2_10_10_10.
-@@ -2752,6 +2945,95 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2752,6 +3049,150 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
              deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
            }
  
@@ -5514,10 +5713,65 @@ index 001f36b..b1e22d8 100644
 +                                                   (guest_output_height + 7) / 8, 1);
 +          }
 +
++          // ge: colour grade, in place over the final output (after the
++          // backdrop), as in the D3D12 command processor: runs whenever
++          // postfx_enabled is true (D3D12 has no neutral-parameter shortcut).
++          if (swap_grade_pipeline_ != VK_NULL_HANDLE &&
++              rex::cvar::GetFlagByName("postfx_enabled") == "true") {
++            // Previous pass (gamma / FXAA / backdrop) writes -> grade reads and
++            // writes.
++            PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_ACCESS_SHADER_WRITE_BIT,
++                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
++                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
++            SubmitBarriers(true);
++            VkDescriptorImageInfo grade_dest_info;
++            grade_dest_info.sampler = VK_NULL_HANDLE;
++            grade_dest_info.imageView = vulkan_context.image_view();
++            grade_dest_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++            VkWriteDescriptorSet grade_write = {};
++            grade_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++            grade_write.dstSet = swap_descriptors_grade_destination_[swap_frame_index];
++            grade_write.dstBinding = 0;
++            grade_write.descriptorCount = 1;
++            grade_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++            grade_write.pImageInfo = &grade_dest_info;
++            dfn.vkUpdateDescriptorSets(device, 1, &grade_write, 0, nullptr);
++            deferred_command_buffer_.CmdVkBindDescriptorSets(
++                VK_PIPELINE_BIND_POINT_COMPUTE, swap_grade_pipeline_layout_, 0, 1,
++                &swap_descriptors_grade_destination_[swap_frame_index], 0, nullptr);
++            auto grade_f = [](const char* name, float def) {
++              std::string v = rex::cvar::GetFlagByName(name);
++              return v.empty() ? def : float(std::atof(v.c_str()));
++            };
++            GradeConstants grade_constants;
++            grade_constants.size[0] = guest_output_width;
++            grade_constants.size[1] = guest_output_height;
++            grade_constants.brightness = grade_f("postfx_brightness", 0.0f);
++            grade_constants.contrast = grade_f("postfx_contrast", 1.0f);
++            grade_constants.saturation = grade_f("postfx_saturation", 1.0f);
++            grade_constants.vibrance = grade_f("postfx_vibrance", 0.0f);
++            grade_constants.temperature = grade_f("postfx_temperature", 0.0f);
++            grade_constants.gamma = grade_f("postfx_gamma", 1.0f);
++            grade_constants.tint_r = grade_f("postfx_tint_r", 1.0f);
++            grade_constants.tint_g = grade_f("postfx_tint_g", 1.0f);
++            grade_constants.tint_b = grade_f("postfx_tint_b", 1.0f);
++            grade_constants.tint_strength = grade_f("postfx_tint", 0.0f);
++            deferred_command_buffer_.CmdVkPushConstants(swap_grade_pipeline_layout_,
++                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                                        sizeof(grade_constants), &grade_constants);
++            BindExternalComputePipeline(swap_grade_pipeline_);
++            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 7) / 8,
++                                                   (guest_output_height + 7) / 8, 1);
++          }
++
            // Insert the release barrier.
            PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-@@ -5652,6 +5934,153 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
+@@ -5652,6 +6093,153 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
    swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
  }
  
@@ -5954,10 +6208,10 @@ index 2b222da..a8ef2f3 100644
      }
 diff --git a/src/kernel/xam/ge_lan.cpp b/src/kernel/xam/ge_lan.cpp
 new file mode 100644
-index 0000000..7ee2ded
+index 0000000..91e3427
 --- /dev/null
 +++ b/src/kernel/xam/ge_lan.cpp
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,262 @@
 +#if defined(_WIN32)
 +#include <winsock2.h>
 +#include <ws2tcpip.h>
@@ -5968,6 +6222,8 @@ index 0000000..7ee2ded
 +#include <cerrno>
 +#include <chrono>
 +#include <mutex>
++#include <cstring>
++#include <vector>
 +
 +#include <rex/cvar.h>
 +#include <rex/logging.h>
@@ -6016,15 +6272,34 @@ index 0000000..7ee2ded
 +#else
 +  ifaddrs* list = nullptr;
 +  if (getifaddrs(&list) == 0) {
++    // Adapters that can broadcast (real LAN/Wi-Fi/Ethernet, bridged VPNs) are listed before
++    // point-to-point ones; LocalAddress() takes the front.
++    std::vector<AdapterAddress> no_broadcast;
 +    for (ifaddrs* it = list; it; it = it->ifa_next) {
 +      if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) continue;
-+      if (!(it->ifa_flags & IFF_UP) || (it->ifa_flags & IFF_LOOPBACK)) continue;
++      const unsigned flags = it->ifa_flags;
++      if ((flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING) || (flags & IFF_LOOPBACK)) {
++        continue;
++      }
++      const char* name = it->ifa_name ? it->ifa_name : "";
++      if (std::strncmp(name, "docker", 6) == 0 || std::strncmp(name, "br-", 3) == 0 ||
++          std::strncmp(name, "virbr", 5) == 0 || std::strncmp(name, "veth", 4) == 0 ||
++          std::strncmp(name, "lo", 2) == 0) {
++        continue;
++      }
 +      const uint32_t addr = ntohl(reinterpret_cast<sockaddr_in*>(it->ifa_addr)->sin_addr.s_addr);
++      if (addr == 0 || (addr >> 16) == 0xA9FE) continue;  // none / link-local 169.254
 +      const uint32_t mask =
 +          it->ifa_netmask ? ntohl(reinterpret_cast<sockaddr_in*>(it->ifa_netmask)->sin_addr.s_addr)
 +                          : 0xFFFFFF00u;
-+      out.push_back({addr, (addr & mask) | ~mask});
++      const AdapterAddress adapter{addr, (addr & mask) | ~mask};
++      if (flags & IFF_BROADCAST) {
++        out.push_back(adapter);
++      } else {
++        no_broadcast.push_back(adapter);
++      }
 +    }
++    out.insert(out.end(), no_broadcast.begin(), no_broadcast.end());
 +    freeifaddrs(list);
 +  }
 +#endif
@@ -6252,10 +6527,10 @@ index 0000000..c803e9c
 +}  // namespace rex::kernel::xam::lan
 diff --git a/src/kernel/xam/ge_online.cpp b/src/kernel/xam/ge_online.cpp
 new file mode 100644
-index 0000000..15659aa
+index 0000000..f3dbf00
 --- /dev/null
 +++ b/src/kernel/xam/ge_online.cpp
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,377 @@
 +// GoldenEye recomp — online multiplayer client. See ge_online.h.
 +
 +#include "ge_online.h"
@@ -6269,6 +6544,8 @@ index 0000000..15659aa
 +#include <rex/system/xsocket.h>
 +
 +#include <chrono>
++#include <cerrno>
++#include <cstdint>
 +#include <cstdlib>
 +#include <cstring>
 +#include <string>
@@ -6276,7 +6553,49 @@ index 0000000..15659aa
 +#if REX_PLATFORM_WIN32
 +#include <winsock2.h>
 +#include <ws2tcpip.h>
++#else
++#include <arpa/inet.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
 +#endif
++
++namespace {
++// Thin Winsock/BSD-socket shims so the client below is a single implementation.
++#if REX_PLATFORM_WIN32
++using socket_t = SOCKET;
++constexpr socket_t kInvalidSocket = INVALID_SOCKET;
++constexpr int kSocketError = SOCKET_ERROR;
++constexpr int kSendFlags = 0;
++inline void CloseSocket(socket_t s) { closesocket(s); }
++inline int LastSocketError() { return WSAGetLastError(); }
++inline uint32_t GetPid() { return static_cast<uint32_t>(GetCurrentProcessId()); }
++inline uint64_t NowMs() { return static_cast<uint64_t>(GetTickCount64()); }
++#else
++using socket_t = int;
++constexpr socket_t kInvalidSocket = -1;
++constexpr int kSocketError = -1;
++#ifdef MSG_NOSIGNAL
++constexpr int kSendFlags = MSG_NOSIGNAL;
++#else
++constexpr int kSendFlags = 0;
++#endif
++inline void CloseSocket(socket_t s) {
++  // shutdown() wakes a thread blocked in recv() on this socket; close() alone doesn't on Linux.
++  shutdown(s, SHUT_RDWR);
++  close(s);
++}
++inline int LastSocketError() { return errno; }
++inline uint32_t GetPid() { return static_cast<uint32_t>(getpid()); }
++inline uint64_t NowMs() {
++  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                   std::chrono::steady_clock::now().time_since_epoch())
++                                   .count());
++}
++#endif
++}  // namespace
 +
 +REXCVAR_DEFINE_BOOL(ge_online_enable, false, "Online",
 +                    "Route GoldenEye System Link multiplayer through the matchmaker/relay "
@@ -6317,15 +6636,14 @@ index 0000000..15659aa
 +}
 +
 +void OnlineClient::EnsureStarted() {
-+#if REX_PLATFORM_WIN32
 +  {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    if (started_) {
 +      return;
 +    }
-+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-+    if (s == INVALID_SOCKET) {
-+      REXLOG_ERROR("[ge-online] control socket() failed: {}", WSAGetLastError());
++    socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    if (s == kInvalidSocket) {
++      REXLOG_ERROR("[ge-online] control socket() failed: {}", LastSocketError());
 +      return;
 +    }
 +    sockaddr_in srv{};
@@ -6363,14 +6681,13 @@ index 0000000..15659aa
 +      }
 +      REXLOG_INFO("[ge-online] server {}:{}", host, port);
 +    }
-+    if (connect(s, reinterpret_cast<sockaddr*>(&srv), sizeof(srv)) == SOCKET_ERROR) {
-+      REXLOG_ERROR("[ge-online] control connect() failed: {}", WSAGetLastError());
-+      closesocket(s);
++    if (connect(s, reinterpret_cast<sockaddr*>(&srv), sizeof(srv)) == kSocketError) {
++      REXLOG_ERROR("[ge-online] control connect() failed: {}", LastSocketError());
++      CloseSocket(s);
 +      return;
 +    }
 +    control_sock_ = static_cast<uintptr_t>(s);
-+    session_id_ = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
-+                  (GetTickCount64() & 0xFFFFFFFFull) ^ 0x474531234ull;
++    session_id_ = (static_cast<uint64_t>(GetPid()) << 32) ^ (NowMs() & 0xFFFFFFFFull) ^ 0x474531234ull;
 +    started_ = true;
 +    run_ = true;
 +  }
@@ -6384,35 +6701,28 @@ index 0000000..15659aa
 +    SendRegister(hosting_);
 +  }
 +  REXLOG_INFO("[ge-online] client started, session={:016X}", session_id_);
-+#endif
 +}
 +
 +void OnlineClient::Shutdown() {
-+#if REX_PLATFORM_WIN32
 +  run_ = false;
 +  {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    if (control_sock_ != ~uintptr_t(0)) {
-+      closesocket(static_cast<SOCKET>(control_sock_));  // unblocks RecvLoop
++      CloseSocket(static_cast<socket_t>(control_sock_));  // unblocks RecvLoop
 +      control_sock_ = ~uintptr_t(0);
 +    }
 +    started_ = false;
 +  }
 +  if (recv_thread_.joinable()) recv_thread_.join();
 +  if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
-+#endif
 +}
 +
 +bool OnlineClient::SendRaw(const void* data, int len) {
-+#if REX_PLATFORM_WIN32
 +  if (control_sock_ == ~uintptr_t(0)) {
 +    return false;
 +  }
-+  return send(static_cast<SOCKET>(control_sock_), reinterpret_cast<const char*>(data), len, 0) ==
-+         len;
-+#else
-+  return false;
-+#endif
++  return send(static_cast<socket_t>(control_sock_), reinterpret_cast<const char*>(data), len,
++              kSendFlags) == len;
 +}
 +
 +void OnlineClient::SendRegister(bool is_host) {
@@ -6479,7 +6789,6 @@ index 0000000..15659aa
 +}
 +
 +void OnlineClient::SendRelay(uint32_t dest_vip, uint16_t port, const uint8_t* data, uint16_t len) {
-+#if REX_PLATFORM_WIN32
 +  if (len > kMaxInner) {
 +    len = kMaxInner;
 +  }
@@ -6495,25 +6804,27 @@ index 0000000..15659aa
 +  rm->inner_len = len;
 +  std::memcpy(buf + sizeof(RelayMsg), data, len);
 +  SendRaw(buf, static_cast<int>(sizeof(RelayMsg) + len));
-+#endif
 +}
 +
 +void OnlineClient::RecvLoop() {
-+#if REX_PLATFORM_WIN32
 +  uint8_t buf[sizeof(RelayMsg) + kMaxInner + 64];
 +  while (run_) {
-+    SOCKET s;
++    socket_t s;
 +    {
 +      std::lock_guard<std::mutex> lock(mutex_);
 +      if (control_sock_ == ~uintptr_t(0)) {
 +        break;
 +      }
-+      s = static_cast<SOCKET>(control_sock_);
++      s = static_cast<socket_t>(control_sock_);
 +    }
-+    int n = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
++    int n = static_cast<int>(recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0));
 +    if (n < static_cast<int>(sizeof(MsgHeader))) {
 +      if (n <= 0 && !run_) {
 +        break;
++      }
++      if (n < 0) {
++        // e.g. ICMP "connection refused" while the server is down; don't spin.
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
 +      }
 +      continue;
 +    }
@@ -6562,11 +6873,9 @@ index 0000000..15659aa
 +        break;
 +    }
 +  }
-+#endif
 +}
 +
 +void OnlineClient::HeartbeatLoop() {
-+#if REX_PLATFORM_WIN32
 +  while (run_) {
 +    for (int i = 0; i < 50 && run_; ++i) {
 +      std::this_thread::sleep_for(std::chrono::milliseconds(100));  // ~5s
@@ -6591,7 +6900,6 @@ index 0000000..15659aa
 +      SendRaw(&msg, sizeof(msg));
 +    }
 +  }
-+#endif
 +}
 +
 +void GeOnlineReconnect() {
@@ -6840,10 +7148,10 @@ index 1fb1e16..86c4353 100644
      // This may have just been a size query.
      if (buffer_ptr) {
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 58e36a4..81d93a4 100644
+index 58e36a4..30d49ee 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
-@@ -12,13 +12,20 @@
+@@ -12,13 +12,21 @@
  // Disable warnings about unused parameters for kernel functions
  #pragma GCC diagnostic ignored "-Wunused-parameter"
  
@@ -6855,7 +7163,9 @@ index 58e36a4..81d93a4 100644
 +#include <thread>
 +#include <vector>
  
- #if REX_PLATFORM_MAC
+-#if REX_PLATFORM_MAC
++#if !REX_PLATFORM_WIN32
++#include <sys/socket.h>
  #include <sys/select.h>
  #endif
  
@@ -6864,7 +7174,7 @@ index 58e36a4..81d93a4 100644
  #include <rex/kernel/xam/module.h>
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
-@@ -33,6 +40,34 @@
+@@ -33,6 +41,34 @@
  #include <rex/system/xthread.h>
  #include <rex/system/xtypes.h>
  
@@ -6899,7 +7209,7 @@ index 58e36a4..81d93a4 100644
  #if REX_PLATFORM_WIN32
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
-@@ -295,22 +330,103 @@ u32 NetDll_WSAGetLastError_entry() {
+@@ -295,22 +331,103 @@ u32 NetDll_WSAGetLastError_entry() {
    return XThread::GetLastError();
  }
  
@@ -7015,7 +7325,7 @@ index 58e36a4..81d93a4 100644
    return -1;
  }
  
-@@ -346,7 +462,60 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+@@ -346,7 +463,60 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
    }
  
    N_XSOCKADDR_IN native_to(to_ptr);
@@ -7077,7 +7387,7 @@ index 58e36a4..81d93a4 100644
  
    // TODO: Instantly complete overlapped
  
-@@ -377,7 +546,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+@@ -377,7 +547,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
  }
  
  u32 NetDll_WSACreateEvent_entry() {
@@ -7086,7 +7396,7 @@ index 58e36a4..81d93a4 100644
    ev->Initialize(true, false);
    return ev->handle();
  }
-@@ -436,9 +605,25 @@ struct XnAddrStatus {
+@@ -436,9 +606,25 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -7115,7 +7425,7 @@ index 58e36a4..81d93a4 100644
    addr_ptr->wPortOnline = 0;
  
    // TODO(gibbed): A proper mac address.
-@@ -453,6 +638,9 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+@@ -453,6 +639,9 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
    // "Mac address is a poor solution because you can't have multiple connections
    // from the same system"
    std::memset(addr_ptr->abEnet, 0xCC, 6);
@@ -7125,7 +7435,7 @@ index 58e36a4..81d93a4 100644
  
    std::memset(addr_ptr->abOnline, 0, 20);
  
-@@ -473,28 +661,55 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
+@@ -473,28 +662,55 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
  
  void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                       u32 string_size) {
@@ -7189,7 +7499,7 @@ index 58e36a4..81d93a4 100644
  
  // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
  struct XEthernetStatus {
-@@ -534,6 +749,8 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
+@@ -534,6 +750,8 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
  }
  
  u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
@@ -7198,7 +7508,7 @@ index 58e36a4..81d93a4 100644
    // Set pqos as some games will try accessing it despite non-successful result
    if (pqos) {
      auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
-@@ -559,7 +776,14 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+@@ -559,7 +777,14 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
  
  u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                 u32 flags) {
@@ -7214,7 +7524,7 @@ index 58e36a4..81d93a4 100644
  }
  
  u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
-@@ -579,13 +803,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,13 +804,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -7230,7 +7540,7 @@ index 58e36a4..81d93a4 100644
  
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
      XThread::SetLastError(error);
-@@ -603,6 +827,14 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+@@ -603,6 +828,14 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
      return -1;
    }
  
@@ -7245,7 +7555,7 @@ index 58e36a4..81d93a4 100644
    // TODO: Absolutely delete this object. It is no longer valid after calling
    // closesocket.
    socket->Close();
-@@ -670,12 +902,39 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+@@ -670,12 +903,48 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
    }
  
    N_XSOCKADDR_IN native_name(name);
@@ -7263,6 +7573,15 @@ index 58e36a4..81d93a4 100644
 +    int yes = 1;
 +    setsockopt(static_cast<SOCKET>(socket->native_handle()), SOL_SOCKET, SO_REUSEADDR,
 +               reinterpret_cast<char*>(&yes), sizeof(yes));
++  }
++#else
++  if (OnlineClient::Enabled()) {
++    // Same as Windows: two local instances share the system-link port. POSIX
++    // needs SO_REUSEPORT as well for UDP sockets to coexist.
++    int yes = 1;
++    int fd = static_cast<int>(socket->native_handle());
++    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
++    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
 +  }
 +#endif
 +  if (!OnlineClient::Enabled()) {
@@ -7286,7 +7605,7 @@ index 58e36a4..81d93a4 100644
    return 0;
  }
  
-@@ -763,7 +1022,10 @@ struct host_set {
+@@ -763,7 +1032,10 @@ struct host_set {
        }
        // Convert from Xenia -> native
        auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
@@ -7298,7 +7617,7 @@ index 58e36a4..81d93a4 100644
        this->sockets[i] = socket;
      }
    }
-@@ -933,11 +1195,97 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
+@@ -933,11 +1205,97 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
    XThread::SetLastError(error_code);
  }
  
@@ -7396,7 +7715,7 @@ index 58e36a4..81d93a4 100644
  REX_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
  REX_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
  REX_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
-@@ -1030,25 +1378,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,25 +1388,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -7928,10 +8247,38 @@ index c24fbd1..d8d2395 100644
    REXSYS_DEBUG("XEvent {:08X} ({})", handle(), manual_reset_ ? "manual" : "auto");
    SaveObject(stream);
 diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
-index 2d13ac8..987ec24 100644
+index 2d13ac8..6abb7fa 100644
 --- a/src/system/xsocket.cpp
 +++ b/src/system/xsocket.cpp
-@@ -61,7 +61,12 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
+@@ -10,10 +10,13 @@
+  */
+ 
+ #include <cstring>
++#include <mutex>
++#include <set>
+ 
+ #include <rex/kernel/xam/module.h>
+ #include <rex/platform.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/logging.h>
+ #include <rex/system/xsocket.h>
+ // #include <rex/system/xnet.h>
+ 
+@@ -26,9 +29,13 @@
+ #include <WS2tcpip.h>
+ #else
+ #include <arpa/inet.h>
++#include <fcntl.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <sys/ioctl.h>
+ #include <sys/socket.h>
++#include <sys/time.h>
+ #endif
+ 
+ namespace rex::system {
+@@ -61,7 +68,12 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
  }
  
  X_STATUS XSocket::Close() {
@@ -7944,7 +8291,169 @@ index 2d13ac8..987ec24 100644
    if (ret != 0) {
      return X_STATUS_UNSUCCESSFUL;
    }
-@@ -163,28 +168,30 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+@@ -69,6 +81,153 @@ X_STATUS XSocket::Close() {
+   return X_STATUS_SUCCESS;
+ }
+ 
++#if !REX_PLATFORM_WIN32
++namespace {
++// The guest is big-endian and passes WinSock constants/values; translate them to the host's.
++// WinSock values from winsock2.h: SOL_SOCKET 0xFFFF, SO_REUSEADDR 0x0004, SO_KEEPALIVE 0x0008,
++// SO_BROADCAST 0x0020, SO_LINGER 0x0080, SO_SNDBUF 0x1001, SO_RCVBUF 0x1002, SO_SNDTIMEO 0x1005,
++// SO_RCVTIMEO 0x1006, TCP_NODELAY 0x0001, FIONBIO 0x8004667E, FIONREAD 0x4004667F.
++constexpr uint32_t kWsaSolSocket = 0xFFFF;
++constexpr uint32_t kWsaIpprotoIp = 0;
++constexpr uint32_t kWsaIpprotoTcp = 6;
++constexpr uint32_t kWsaSoReuseAddr = 0x0004;
++constexpr uint32_t kWsaSoKeepAlive = 0x0008;
++constexpr uint32_t kWsaSoBroadcast = 0x0020;
++constexpr uint32_t kWsaSoLinger = 0x0080;
++constexpr uint32_t kWsaSoSndBuf = 0x1001;
++constexpr uint32_t kWsaSoRcvBuf = 0x1002;
++constexpr uint32_t kWsaSoSndTimeo = 0x1005;
++constexpr uint32_t kWsaSoRcvTimeo = 0x1006;
++constexpr uint32_t kWsaTcpNoDelay = 0x0001;
++constexpr uint32_t kWsaFionbio = 0x8004667E;
++constexpr uint32_t kWsaFionread = 0x4004667F;
++
++uint32_t LoadBE32(const void* p) {
++  uint32_t v;
++  std::memcpy(&v, p, sizeof(v));
++  return __builtin_bswap32(v);
++}
++
++uint16_t LoadBE16(const void* p) {
++  uint16_t v;
++  std::memcpy(&v, p, sizeof(v));
++  return __builtin_bswap16(v);
++}
++
++void StoreBE32(void* p, uint32_t v) {
++  v = __builtin_bswap32(v);
++  std::memcpy(p, &v, sizeof(v));
++}
++
++void WarnUnsupportedOnce(const char* what, uint32_t a, uint32_t b) {
++  static std::mutex mutex;
++  static std::set<uint64_t> seen;
++  std::lock_guard<std::mutex> lock(mutex);
++  if (seen.insert((uint64_t(a) << 32) | b).second) {
++    REXKRNL_WARN("XSocket: unsupported {} {:#x}/{:#x}; ignored", what, a, b);
++  }
++}
++}  // namespace
++
++X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen) {
++  if (level == kWsaSolSocket && (optname == 0x5801 || optname == 0x5802)) {
++    // Disable socket encryption
++    secure_ = false;
++    return X_STATUS_SUCCESS;
++  }
++
++  const int fd = static_cast<int>(native_handle_);
++  int ret = 0;
++  if (level == kWsaIpprotoIp) {
++    ret = setsockopt(fd, IPPROTO_IP, static_cast<int>(optname), optval_ptr, optlen);
++  } else if (level == kWsaIpprotoTcp) {
++    if (optname != kWsaTcpNoDelay) {
++      WarnUnsupportedOnce("TCP option", level, optname);
++      return X_STATUS_SUCCESS;
++    }
++    int v = (optlen >= 4 ? LoadBE32(optval_ptr) : 0) != 0;
++    ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof(v));
++  } else if (level == kWsaSolSocket) {
++    switch (optname) {
++      case kWsaSoReuseAddr:
++      case kWsaSoKeepAlive:
++      case kWsaSoBroadcast:
++      case kWsaSoSndBuf:
++      case kWsaSoRcvBuf: {
++        int host_opt = optname == kWsaSoReuseAddr    ? SO_REUSEADDR
++                       : optname == kWsaSoKeepAlive  ? SO_KEEPALIVE
++                       : optname == kWsaSoBroadcast  ? SO_BROADCAST
++                       : optname == kWsaSoSndBuf     ? SO_SNDBUF
++                                                     : SO_RCVBUF;
++        int v = static_cast<int>(optlen >= 4 ? LoadBE32(optval_ptr) : 0);
++        ret = setsockopt(fd, SOL_SOCKET, host_opt, &v, sizeof(v));
++        break;
++      }
++      case kWsaSoLinger: {
++        // WinSock linger: { u_short l_onoff; u_short l_linger; }
++        linger l{};
++        if (optlen >= 4) {
++          l.l_onoff = LoadBE16(optval_ptr);
++          l.l_linger = LoadBE16(static_cast<const uint8_t*>(optval_ptr) + 2);
++        }
++        ret = setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
++        break;
++      }
++      case kWsaSoSndTimeo:
++      case kWsaSoRcvTimeo: {
++        // WinSock takes a DWORD of milliseconds.
++        uint32_t ms = optlen >= 4 ? LoadBE32(optval_ptr) : 0;
++        timeval tv{};
++        tv.tv_sec = ms / 1000;
++        tv.tv_usec = (ms % 1000) * 1000;
++        ret = setsockopt(fd, SOL_SOCKET, optname == kWsaSoSndTimeo ? SO_SNDTIMEO : SO_RCVTIMEO, &tv,
++                         sizeof(tv));
++        break;
++      }
++      default:
++        WarnUnsupportedOnce("socket option", level, optname);
++        return X_STATUS_SUCCESS;
++    }
++  } else {
++    WarnUnsupportedOnce("option level", level, optname);
++    return X_STATUS_SUCCESS;
++  }
++  if (ret < 0) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++
++  // SO_BROADCAST
++  if (level == kWsaSolSocket && optname == kWsaSoBroadcast) {
++    broadcast_socket_ = true;
++  }
++
++  return X_STATUS_SUCCESS;
++}
++
++X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
++  const int fd = static_cast<int>(native_handle_);
++  if (cmd == kWsaFionbio) {
++    const bool on = arg_ptr && LoadBE32(arg_ptr) != 0;
++    int flags = fcntl(fd, F_GETFL, 0);
++    if (flags < 0 || fcntl(fd, F_SETFL, on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) < 0) {
++      return X_STATUS_UNSUCCESSFUL;
++    }
++    return X_STATUS_SUCCESS;
++  }
++  if (cmd == kWsaFionread) {
++    int n = 0;
++    if (ioctl(fd, FIONREAD, &n) < 0) {
++      return X_STATUS_UNSUCCESSFUL;
++    }
++    if (arg_ptr) {
++      StoreBE32(arg_ptr, static_cast<uint32_t>(n));
++    }
++    return X_STATUS_SUCCESS;
++  }
++  WarnUnsupportedOnce("ioctl", 0, cmd);
++  return X_STATUS_UNSUCCESSFUL;
++}
++#else
+ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen) {
+   if (level == 0xFFFF && (optname == 0x5801 || optname == 0x5802)) {
+     // Disable socket encryption
+@@ -99,6 +258,7 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+ 
+   return X_STATUS_SUCCESS;
+ }
++#endif
+ 
+ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
+   int ret = connect(native_handle_, (sockaddr*)name, name_len);
+@@ -163,28 +323,30 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
  
  int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
                        uint32_t* from_len) {
@@ -7987,7 +8496,7 @@ index 2d13ac8..987ec24 100644
  
    sockaddr_in nfrom;
    socklen_t nfromlen = sizeof(sockaddr_in);
-@@ -192,8 +199,8 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+@@ -192,8 +354,8 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
                       (sockaddr*)&nfrom, &nfromlen);
    if (from) {
      from->sin_family = nfrom.sin_family;
@@ -7998,7 +8507,7 @@ index 2d13ac8..987ec24 100644
      std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
    }
  
-@@ -221,15 +228,17 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+@@ -221,15 +383,17 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
    }
    */
  
@@ -8577,10 +9086,10 @@ index 7360ed9..009b51c 100644
  #endif  // XE_PLATFORM
  }
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index b94fe9e..7e78f14 100644
+index b94fe9e..1bb74b5 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
-@@ -44,8 +44,76 @@
+@@ -44,8 +44,84 @@
  
  #include <algorithm>
  #include <filesystem>
@@ -8642,11 +9151,19 @@ index b94fe9e..7e78f14 100644
 +
 +std::string ResolveGpuBackend() {
 +  const std::string choice = REXCVAR_GET(gpu);
++#if !REX_PLATFORM_WIN32
++  // Direct3D 12 only exists on Windows; every other value resolves to Vulkan.
++  if (choice == "d3d12") {
++    REXLOG_WARN("gpu = d3d12 is not available on this platform; using vulkan");
++  }
++  return "vulkan";
++#else
 +  if (choice == "d3d12" || choice == "vulkan") return choice;
 +  const uint32_t vendor = PrimaryGpuVendorId();
 +  const std::string backend = vendor == 0x10DEu ? "d3d12" : "vulkan";
 +  REXLOG_INFO("gpu = auto: GPU vendor {:04X} -> {}", vendor, backend);
 +  return backend;
++#endif
 +}
 +}  // namespace
 +
@@ -8657,7 +9174,7 @@ index b94fe9e..7e78f14 100644
  REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                        "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                        "GPU emulation")
-@@ -201,27 +269,39 @@ bool ReXApp::SetupEnvironment() {
+@@ -201,27 +277,39 @@ bool ReXApp::SetupEnvironment() {
  }
  
  bool ReXApp::ConstructRuntime(const PathConfig& paths) {
@@ -8703,7 +9220,7 @@ index b94fe9e..7e78f14 100644
                                       paths.update_data_root, paths.cache_root, paths.metadata_root);
    runtime_->set_app_context(&app_context());
  
-@@ -252,6 +332,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -252,6 +340,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
      if (input_sys) {
        input_sys->SetActiveCallback([this]() {
@@ -8715,7 +9232,7 @@ index b94fe9e..7e78f14 100644
          if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
            return true;
          return !imgui_drawer_->GetIO().WantCaptureMouse;
-@@ -274,7 +359,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -274,7 +367,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      }
      std::string host_tail{tail};
      std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
@@ -8727,7 +9244,7 @@ index b94fe9e..7e78f14 100644
      if (!std::filesystem::is_regular_file(xex_host)) {
        auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
        REXLOG_ERROR("{}", msg);
-@@ -314,7 +402,7 @@ bool ReXApp::SetupPresentation() {
+@@ -314,7 +410,7 @@ bool ReXApp::SetupPresentation() {
    OnPreSetup(config_);
  
    if (!config_.graphics && !config_.gpu_plugin.empty()) {
@@ -8736,7 +9253,7 @@ index b94fe9e..7e78f14 100644
      if (!config_.graphics) {
        // Fatal by design: no silent headless fallback.
        auto msg =
-@@ -333,8 +421,14 @@ bool ReXApp::SetupPresentation() {
+@@ -333,8 +429,14 @@ bool ReXApp::SetupPresentation() {
      }
    }
  
@@ -8753,7 +9270,7 @@ index b94fe9e..7e78f14 100644
    if (!window_) {
      REXLOG_ERROR("Failed to create window");
      return false;
-@@ -350,10 +444,17 @@ bool ReXApp::SetupPresentation() {
+@@ -350,10 +452,17 @@ bool ReXApp::SetupPresentation() {
    if (REXCVAR_GET(fullscreen)) {
      window_->SetFullscreen(true);
    }
@@ -8774,7 +9291,7 @@ index b94fe9e..7e78f14 100644
    });
    window_->Open();
  
-@@ -394,35 +495,40 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+@@ -394,35 +503,40 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
    // gated eager font upload in SetImmediateDrawer is skipped (font uploads
    // lazily on the first Draw instead).
    imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
@@ -8844,7 +9361,7 @@ index b94fe9e..7e78f14 100644
  
    OnCreateDialogs(imgui_drawer_.get());
  }
-@@ -613,4 +719,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
+@@ -613,4 +727,10 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
    }
  }
  
@@ -8916,3 +9433,31 @@ index b4e045f..d850ca4 100644
    PropagateEventThroughInputListeners(
        [&e](auto listener) {
          listener->OnKeyDown(e);
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..6b7ff95 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -251,7 +251,9 @@ set(SDL_TEST OFF CACHE BOOL "" FORCE)
+ set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+ 
+ # Video provides the windowing/event layer; presenters create their own
+-# D3D12/Vulkan surfaces from native handles, so SDL_RENDER stays off.
++# D3D12/Vulkan surfaces from native handles, so SDL_RENDER stays off, except
++# on Linux, where the GoldenEye setup window (packaging/launcher) draws with
++# SDL_Renderer (Vulkan, or the software renderer without a GPU driver).
+ set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+ if(APPLE)
+     # macOS uses SDL for windowing + Metal/Vulkan surface creation.
+@@ -267,7 +269,11 @@ else()
+         set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+     endif()
+ endif()
+-set(SDL_RENDER OFF CACHE BOOL "" FORCE)
++if(UNIX AND NOT APPLE)
++    set(SDL_RENDER ON CACHE BOOL "" FORCE)
++else()
++    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
++endif()
+ set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+ set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+ set(SDL_POWER OFF CACHE BOOL "" FORCE)

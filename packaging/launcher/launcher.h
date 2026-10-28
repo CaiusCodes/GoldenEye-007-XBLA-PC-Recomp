@@ -1,17 +1,25 @@
-// GoldenEye 007 XBLA PC Recomp - the launcher ("GoldenEye 007.exe" in the release root).
+// GoldenEye 007 XBLA PC Recomp - the launcher ("GoldenEye 007.exe" / "GoldenEye 007"
+// in the release root).
 //
 // Release folder:
-//   GoldenEye 007.exe     this program: starts the game, or shows setup first
-//   README.txt, licenses\
-//   resources\
-//     runtime\            the game (GoldenEye 007.exe, DLLs, the port's pictures), logs\
-//     assets\             imported once from the player's own Xbox 360 package
-//     userdata\           saves, caches and ge.toml (settings)
+//   GoldenEye 007[.exe]   this program: starts the game, or sets it up first
+//   README.txt, licenses/
+//   resources/
+//     runtime/            the game (GoldenEye 007[.exe], its libraries, the port's pictures), logs/
+//     assets/             imported once from the player's own Xbox 360 package
+//     userdata/           saves, caches and ge.toml (settings)
 //
-// Everything is found relative to this exe, so the folder can be moved.
+// Everything is found relative to this program, so the folder can be moved.
+//
+// Windows: a GUI program (main.cpp + setup_window.cpp). Linux: main_cli.cpp, a
+// command-line program that opens setup_window_sdl.cpp's window when setup is
+// needed on a desktop. Everything else (core.cpp, stfs.cpp) is shared, works
+// with fs::path and UTF-8 std::string, and must stay C++17.
 #pragma once
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -26,35 +34,50 @@ namespace ge {
 
 struct Paths {
   fs::path root;       // the folder holding this launcher
-  fs::path launcher;   // root\GoldenEye 007.exe
-  fs::path resources;  // root\resources
-  fs::path runtime;    // resources\runtime
-  fs::path game_exe;   // runtime\GoldenEye 007.exe
-  fs::path assets;     // resources\assets
-  fs::path userdata;   // resources\userdata
-  fs::path config;     // userdata\ge.toml
-  fs::path logs;       // runtime\logs (the game's own logs go there too)
-  fs::path staging;    // resources\.import        (an import in progress)
-  fs::path previous;   // resources\.assets-previous (the old copy during the swap)
+  fs::path launcher;   // root/GoldenEye 007[.exe]
+  fs::path resources;  // root/resources
+  fs::path runtime;    // resources/runtime
+  fs::path game_exe;   // runtime/GoldenEye 007[.exe]
+  fs::path assets;     // resources/assets
+  fs::path userdata;   // resources/userdata
+  fs::path config;     // userdata/ge.toml
+  fs::path logs;       // runtime/logs (the game's own logs go there too)
+  fs::path staging;    // resources/.import        (an import in progress)
+  fs::path previous;   // resources/.assets-previous (the old copy during the swap)
 };
 Paths MakePaths();
 
-extern const wchar_t* const kVersion;  // VERSION, set by the build
-extern const char* const kMarkerName;  // assets\<marker> is written last by a good import
+extern const char* const kVersion;     // VERSION, set by the entry point's build (UTF-8)
+extern const char* const kMarkerName;  // assets/<marker> is written last by a good import
+
+// ---------------------------------------------------------------- utils --
+// Host paths <-> UTF-8 text (messages, logs, the desktop entry). On Windows
+// fs::path is UTF-16 inside, on Linux the bytes are used as they are.
+std::string Utf8(const fs::path& path);
+fs::path PathFromUtf8(const std::string& text);
+std::string FormatMB(uint64_t bytes);  // "1,234 MB"
+bool SameFile(const fs::path& a, const fs::path& b);
+#ifdef _WIN32
+std::wstring Widen(const std::string& s);   // UTF-8 -> UTF-16
+std::string Narrow(const std::wstring& s);  // UTF-16 -> UTF-8
+#endif
 
 // ------------------------------------------------------------------ log --
 void LogTo(const fs::path& logs_dir);
-void Log(const std::wstring& line);
+void Log(const std::string& line);  // UTF-8; written to <logs>/setup.log once LogTo was called
+#ifdef _WIN32
+inline void Log(const std::wstring& line) { Log(Narrow(line)); }
+#endif
 
 // --------------------------------------------------------------- state --
 // Cheap checks only (no hashing): the runtime files and a finished import.
 // *missing names the first missing file.
-bool IsInstalled(const Paths& p, std::wstring* missing);
-// Puts back resources\assets from .assets-previous if an import was cut off
+bool IsInstalled(const Paths& p, std::string* missing);
+// Puts back resources/assets from .assets-previous if an import was cut off
 // in the middle of swapping the folders. Safe to call any time.
 void RecoverInterruptedSwap(const Paths& p);
-// True while the game from this folder is running (its exe cannot be opened
-// for writing then).
+// True while the game from this folder is running (its program cannot be
+// replaced / is found among the running processes).
 bool GameRunning(const Paths& p);
 
 // -------------------------------------------------------------- sources --
@@ -64,11 +87,11 @@ struct Source {
   fs::path path;        // the package file, or a previous install's Game folder
   uint64_t bytes = 0;   // package size, or the size of the previous install's assets
 };
-std::wstring Describe(const Source& s);  // one line for the window
+std::string Describe(const Source& s);  // one line for the player (UTF-8)
 
 // Header check of one file: an Xbox 360 package of the GoldenEye 007 XBLA game.
 // *why gets a sentence for the player when it is not.
-bool CheckPackageHeader(const fs::path& file, std::wstring* why, uint64_t* bytes);
+bool CheckPackageHeader(const fs::path& file, std::string* why, uint64_t* bytes);
 // A previous release's Game folder (or a release folder holding one) with the
 // game data in it.
 bool CheckPreviousInstall(const fs::path& folder, fs::path* game_dir, uint64_t* bytes);
@@ -76,7 +99,7 @@ bool CheckPreviousInstall(const fs::path& folder, fs::path* game_dir, uint64_t* 
 // What a file or folder the player chose (or dropped) contains. Folders are
 // searched a few levels deep. Returns the usable sources; *why explains an
 // empty result.
-std::vector<Source> SourcesIn(const fs::path& chosen, std::wstring* why);
+std::vector<Source> SourcesIn(const fs::path& chosen, std::string* why);
 // Automatic detection beside the launcher: the root's files, "Game Package"
 // and the other folders beside the launcher (a few levels deep), and previous
 // releases' Game folders here or in sibling folders. Never wider than that.
@@ -85,17 +108,18 @@ std::vector<Source> DetectSources(const Paths& p);
 fs::path FindPreviousInstall(const Paths& p);
 
 // --------------------------------------------------------------- import --
-using Report = std::function<void(int percent, const std::wstring& phase, const std::wstring& detail)>;
+// percent 0-100, a short upper-case phase title and a detail line (UTF-8).
+using Report = std::function<void(int percent, const std::string& phase, const std::string& detail)>;
 struct ImportResult {
   bool ok = false;
   bool cancelled = false;
-  std::wstring message;    // why it failed
-  std::wstring migrated;   // what was carried over from a previous install
+  std::string message;    // why it failed
+  std::string migrated;   // what was carried over from a previous install
 };
 // Validates the source against the build this port was compiled from, then
-// imports the game data into resources\assets through a staging folder. The
+// imports the game data into resources/assets through a staging folder. The
 // source is only ever read. saves_from: a previous Game folder whose saves and
-// settings are copied into resources\userdata where none exist yet (may be empty).
+// settings are copied into resources/userdata where none exist yet (may be empty).
 ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_from,
                     const std::atomic<bool>& cancel, const Report& report);
 
@@ -113,35 +137,39 @@ struct Extras {
   bool shortcut = false;
   bool complete = false;  // 100% game completion
 };
+// shortcut_folder: where the shortcut / desktop entry lives; empty = the
+// desktop (Windows) or $XDG_DATA_HOME/applications (Linux).
 Extras CurrentExtras(const Paths& p, const fs::path& shortcut_folder);
 // Applies only what differs from `was`. ask_replace is asked before an
-// existing desktop shortcut that is not ours is replaced (nullptr: never).
+// existing shortcut that is not ours is replaced (nullptr: never).
 // Returns a note for the player when something could not be done.
-std::wstring ApplyExtras(const Paths& p, const Extras& want, const Extras& was,
-                         const fs::path& shortcut_folder,
-                         const std::function<bool(const fs::path&)>& ask_replace);
-// Points our desktop shortcut at this folder again after the folder moved.
+std::string ApplyExtras(const Paths& p, const Extras& want, const Extras& was,
+                        const fs::path& shortcut_folder,
+                        const std::function<bool(const fs::path&)>& ask_replace);
+// Points our shortcut at this folder again after the folder moved.
 void RepairShortcut(const Paths& p, const fs::path& shortcut_folder);
 
 // ----------------------------------------------------------------- game --
-// Starts the game from resources\runtime. args are passed on unchanged.
-bool LaunchGame(const Paths& p, const std::wstring& args, std::wstring* error);
+// Starts the game from resources/runtime; args are passed on unchanged and
+// the game is not waited for. On failure *error gets a sentence.
+bool LaunchGame(const Paths& p, const std::vector<std::string>& args, std::string* error);
 
 // ------------------------------------------------------------------- UI --
 struct SetupOptions {
-  fs::path package;          // preselected (--package)
-  fs::path shortcut_folder;  // where the desktop shortcut goes (--shortcut-folder, testing)
-  std::wstring game_args;    // passed to the game on Play
-  bool forced = false;       // --setup on a complete install
-  std::wstring reason;       // why setup opened (a missing file), for the log
+  fs::path package;                    // preselected (--package)
+  fs::path shortcut_folder;            // where the shortcut goes (--shortcut-folder, testing)
+  std::vector<std::string> game_args;  // passed to the game on Play (UTF-8)
+  bool forced = false;                 // --setup on a complete install
+  std::string reason;                  // why setup opened (a missing file), for the log
 };
+#ifdef _WIN32
 int RunSetupWindow(HINSTANCE instance, const Paths& p, const SetupOptions& options);
-
-// ---------------------------------------------------------------- utils --
-std::wstring FormatMB(uint64_t bytes);
-std::wstring Quote(const std::wstring& s);
-std::wstring Widen(const std::string& s);   // UTF-8 -> UTF-16
-std::string Narrow(const std::wstring& s);  // UTF-16 -> UTF-8
-bool SameFile(const fs::path& a, const fs::path& b);
+#else
+// The SDL3 + Dear ImGui setup window (setup_window_sdl.cpp). Returns the process
+// exit code (0: closed, or the game was started), or -1 when the window could not
+// be created (the caller falls back to the terminal). SDL_Init(SDL_INIT_VIDEO)
+// must have succeeded.
+int RunSetupWindow(const Paths& p, const SetupOptions& options);
+#endif
 
 }  // namespace ge

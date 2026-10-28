@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <thread>
@@ -27,6 +29,9 @@
 
 #include "ge_gpu_detect.h"
 #include "ge_init.h"  // PPCRegister/PPCContext + generated function decls
+#include "ge_platform.h"
+
+#include <SDL3/SDL.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -38,14 +43,6 @@
 #include <rex/ui/virtual_key.h>
 #include <rex/kernel/xam/ge_online_control.h>
 #include <rex/system/xam/user_profile.h>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 
 namespace ge {
 void SetRebindCapturing(bool v);  // ge_hooks.cpp: swallow pad input while capturing
@@ -209,18 +206,14 @@ int AutoRenderScale(int display_height) {
 // monitor the game window is on, windowed the chosen window height. Cached for
 // half a second (the Video page asks every frame).
 int CurrentDisplayHeight() {
-  static ULONGLONG last = 0;
+  static uint64_t last = 0;
   static int cached = 0;
-  const ULONGLONG now = GetTickCount64();
+  const uint64_t now = ge::platform::TicksMs();
   if (cached && now - last < 500) return cached;
   last = now;
   int h = 0;
   if (GetB("fullscreen")) {
-    if (HWND w = GetForegroundWindow()) {
-      DWORD pid = 0;
-      GetWindowThreadProcessId(w, &pid);
-      if (pid == GetCurrentProcessId()) h = ge::WindowDisplayHeight(w);
-    }
+    if (ge::platform::GameHasFocus()) h = ge::WindowDisplayHeight(ge::platform::GameWindow());
     if (h <= 0) h = ge::StartupDisplayHeight(std::atoi(GetS("monitor").c_str()));
   } else {
     h = std::atoi(GetS("ge_window_height").c_str());
@@ -418,17 +411,19 @@ std::vector<Row> BuildPage(Page page) {
           },
           [] {
             if (GetB("fullscreen")) {  // the size of the screen the game is on
-              MONITORINFO mi{sizeof(mi)};
-              HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
-              if (mon && GetMonitorInfoW(mon, &mi))
-                return std::to_string(mi.rcMonitor.right - mi.rcMonitor.left) + "x" +
-                       std::to_string(mi.rcMonitor.bottom - mi.rcMonitor.top) + " (screen)";
+              SDL_DisplayID display =
+                  ge::platform::GameWindow() ? SDL_GetDisplayForWindow(ge::platform::GameWindow()) : 0;
+              if (!display) display = SDL_GetPrimaryDisplay();
+              SDL_Rect bounds{};
+              if (display && SDL_GetDisplayBounds(display, &bounds))
+                return std::to_string(bounds.w) + "x" + std::to_string(bounds.h) + " (screen)";
               return std::string("Screen size");
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
           });
-      // No Graphics API row: Auto picks it (NVIDIA -> Direct3D 12, other GPUs
-      // -> Vulkan); gpu = "d3d12" / "vulkan" in ge.toml still overrides it.
+      // No Graphics API row: Auto picks it (Windows: NVIDIA -> Direct3D 12, other
+      // GPUs -> Vulkan; Linux: always Vulkan); gpu = "d3d12" / "vulkan" in
+      // ge.toml still overrides it.
       AddAction(
           rows, "Render Scale:",
           [] {
@@ -636,7 +631,7 @@ std::string CaptureKey() {
   if (!wheel.empty()) return wheel;
   // Shift/Ctrl/Alt come back as the generic keys; their L/R forms have no names.
   for (int vk = 1; vk <= 0xFE; ++vk) {
-    if (GetAsyncKeyState(vk) & 0x8000) {
+    if (ge::platform::KeyDown(vk)) {
       std::string name = rex::ui::VirtualKeyToString(static_cast<rex::ui::VirtualKey>(vk));
       if (!name.empty()) return name;
     }
@@ -646,7 +641,7 @@ std::string CaptureKey() {
 
 bool AnyKeyDown() {
   for (int vk = 1; vk <= 0xFE; ++vk)
-    if (GetAsyncKeyState(vk) & 0x8000) return true;
+    if (ge::platform::KeyDown(vk)) return true;
   return false;
 }
 
@@ -664,7 +659,7 @@ void UpdateCapture() {
     return;
   }
   if (!g_capture_text) {
-    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {  // Esc cancels, bind unchanged
+    if (ge::platform::KeyDown(ge::platform::vk::kEscape)) {  // Esc cancels, bind unchanged
       EndCapture();
       g_capture_armed = false;
       return;
@@ -680,29 +675,31 @@ void UpdateCapture() {
   // Text entry: letters, digits, . - _ and space; Backspace; Enter or Esc ends.
   static bool was_down[256] = {};
   for (int vk = 1; vk <= 0xFE; ++vk) {
-    const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    const bool down = ge::platform::KeyDown(vk);
     const bool edge = down && !was_down[vk];
     was_down[vk] = down;
     if (!edge) continue;
-    if (vk == VK_RETURN || vk == VK_ESCAPE) {
-      if (vk == VK_RETURN) SetS(g_capture_cvar, g_text_buffer);
+    if (vk == ge::platform::vk::kReturn || vk == ge::platform::vk::kEscape) {
+      if (vk == ge::platform::vk::kReturn) SetS(g_capture_cvar, g_text_buffer);
       EndCapture();
       g_capture_armed = false;
       std::memset(was_down, 0, sizeof(was_down));
       return;
     }
-    if (vk == VK_BACK) {
+    if (vk == ge::platform::vk::kBack) {
       if (!g_text_buffer.empty()) g_text_buffer.pop_back();
       continue;
     }
     char c = 0;
-    const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool shift = ge::platform::KeyDown(ge::platform::vk::kShift);
     if (vk >= 'A' && vk <= 'Z') c = static_cast<char>(shift ? vk : vk + 32);
     else if (vk >= '0' && vk <= '9') c = static_cast<char>(vk);
-    else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) c = static_cast<char>('0' + vk - VK_NUMPAD0);
-    else if (vk == VK_OEM_PERIOD || vk == VK_DECIMAL) c = '.';
-    else if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) c = shift ? '_' : '-';
-    else if (vk == VK_SPACE) c = ' ';
+    else if (vk >= ge::platform::vk::kNumpad0 && vk <= ge::platform::vk::kNumpad9)
+      c = static_cast<char>('0' + vk - ge::platform::vk::kNumpad0);
+    else if (vk == ge::platform::vk::kOemPeriod || vk == ge::platform::vk::kDecimal) c = '.';
+    else if (vk == ge::platform::vk::kOemMinus || vk == ge::platform::vk::kSubtract)
+      c = shift ? '_' : '-';
+    else if (vk == ge::platform::vk::kSpace) c = ' ';
     if (c && static_cast<int>(g_text_buffer.size()) < g_capture_max) g_text_buffer.push_back(c);
   }
 }
@@ -1216,18 +1213,13 @@ bool LanRefreshHover(uint8_t* base, float y, int w) {
 // show nothing. Called by the main menu's row draw (ge_f2_driver).
 namespace {
 std::string ReadVersionText() {
-  wchar_t path[MAX_PATH];
-  const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) return {};
-  std::wstring dir(path, n);
-  dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
-  for (const std::wstring& file : {dir + L"resources\\version.txt", dir + L"version.txt"}) {
-    FILE* f = _wfopen(file.c_str(), L"rb");
+  const std::filesystem::path dir = ge::platform::ExeDir();
+  for (const std::filesystem::path& file : {dir / "resources" / "version.txt", dir / "version.txt"}) {
+    std::ifstream f(file, std::ios::binary);
     if (!f) continue;
     char buf[32] = {};
-    const size_t got = std::fread(buf, 1, sizeof(buf) - 1, f);
-    std::fclose(f);
-    std::string v(buf, got);
+    f.read(buf, sizeof(buf) - 1);
+    std::string v(buf, static_cast<size_t>(f.gcount()));
     while (!v.empty() && (v.back() == '\r' || v.back() == '\n' || v.back() == ' ')) v.pop_back();
     if (!v.empty()) return "v" + v;
   }
@@ -1283,60 +1275,33 @@ void ApplyDiagnostics() {
     spdlog::flush_every(std::chrono::seconds(2));
   }
   // Keep the 20 newest session logs (each run starts a new ge_NNN.log).
-  wchar_t exe[MAX_PATH];
-  const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) return;
-  std::wstring dir(exe, n);
-  dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"logs\\";
-  std::vector<std::pair<int, std::wstring>> logs;
-  WIN32_FIND_DATAW fd;
-  HANDLE find = FindFirstFileW((dir + L"ge_*.log").c_str(), &fd);
-  if (find == INVALID_HANDLE_VALUE) return;
-  do {
-    const int seq = _wtoi(fd.cFileName + 3);
-    if (seq > 0) logs.emplace_back(seq, fd.cFileName);
-  } while (FindNextFileW(find, &fd));
-  FindClose(find);
+  const std::filesystem::path dir = ge::platform::ExeDir() / "logs";
+  std::vector<std::pair<int, std::filesystem::path>> logs;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    // u8string() never throws (string() may, on Windows, for non-ANSI names).
+    const auto u8 = it->path().filename().u8string();
+    const std::string name(u8.begin(), u8.end());
+    if (name.size() <= 7 || name.compare(0, 3, "ge_") != 0 ||
+        name.compare(name.size() - 4, 4, ".log") != 0)
+      continue;
+    const int seq = std::atoi(name.c_str() + 3);
+    if (seq > 0) logs.emplace_back(seq, it->path());
+  }
   if (logs.size() <= 20) return;
   std::sort(logs.begin(), logs.end());
-  for (size_t i = 0; i + 20 < logs.size(); ++i) DeleteFileW((dir + logs[i].second).c_str());
+  for (size_t i = 0; i + 20 < logs.size(); ++i) std::filesystem::remove(logs[i].second, ec);
 }
 
 // The top of every log: what a bug report needs to know about the player's
 // PC and settings, once at start-up (nothing runs per frame).
 void LogSessionHeader() {
-  std::string windows = "unknown";
-  if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
-    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
-    if (auto rtl_get_version =
-            reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"))) {
-      RTL_OSVERSIONINFOW vi{};
-      vi.dwOSVersionInfoSize = sizeof(vi);
-      if (rtl_get_version(&vi) == 0) {
-        windows = std::to_string(vi.dwMajorVersion) + "." + std::to_string(vi.dwMinorVersion) +
-                  " build " + std::to_string(vi.dwBuildNumber);
-      }
-    }
-  }
-  std::string cpu = "unknown";
-  {
-    wchar_t name[128] = {};
-    DWORD size = sizeof(name);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
-                     L"ProcessorNameString", RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS) {
-      char utf8[256] = {};
-      WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
-      cpu = utf8;
-      while (!cpu.empty() && cpu.back() == ' ') cpu.pop_back();
-    }
-  }
-  MEMORYSTATUSEX mem{};
-  mem.dwLength = sizeof(mem);
-  GlobalMemoryStatusEx(&mem);
+  const std::string os = ge::platform::OsVersionString();
+  const std::string cpu = ge::platform::CpuNameString();
   const std::string version = ReadVersionText();
   REXLOG_INFO("==== GoldenEye 007 XBLA PC Recomp {} ====", version.empty() ? "dev build" : version);
-  REXLOG_INFO("PC: Windows {}; {} ({} threads); {} GB RAM", windows, cpu,
-              std::thread::hardware_concurrency(), (mem.ullTotalPhys + (512ull << 20)) >> 30);
+  REXLOG_INFO("PC: {}; {} ({} threads); {} GB RAM", os, cpu, std::thread::hardware_concurrency(),
+              (static_cast<uint64_t>(SDL_GetSystemRAM()) + 512) >> 10);
   REXLOG_INFO("GPU: {} ({}, {} MB video memory), driver {}",
               g_scale_gpu.name.empty() ? "unknown" : g_scale_gpu.name,
               g_scale_gpu.integrated ? "integrated" : "dedicated", g_scale_gpu.video_memory_mb,
@@ -1572,26 +1537,7 @@ void ge_controller_tick() {
   static int countdown = 0;
   if (--countdown > 0) return;
   countdown = 60;
-  typedef DWORD(WINAPI * GetStateFn)(DWORD, void*);
-  static GetStateFn get_state = [] {
-    HMODULE m = LoadLibraryW(L"xinput1_4.dll");
-    if (!m) m = LoadLibraryW(L"xinput9_1_0.dll");
-    return m ? reinterpret_cast<GetStateFn>(GetProcAddress(m, "XInputGetState")) : nullptr;
-  }();
-  if (!get_state) return;  // cannot tell: leave the icons alone
-  bool connected = false;
-  alignas(8) unsigned char state[16] = {};
-  for (DWORD i = 0; i < 4 && !connected; ++i) connected = get_state(i, state) == ERROR_SUCCESS;
-  // Testing aid: a file named fakepad.txt beside the exe stands for a controller.
-  if (!connected) {
-    wchar_t exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) {
-      std::wstring dir(exe, n);
-      dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"fakepad.txt";
-      connected = GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
-  }
+  const bool connected = ge::platform::GamepadConnected();
   static int last = -1;
   if (last == static_cast<int>(connected)) return;
   last = static_cast<int>(connected);
@@ -1990,7 +1936,7 @@ int CountdownSeconds(PPCContext& ctx, uint8_t* base, bool host) {
     if (!began && hp && PlayerReady(base, hp)) return 1;  // counted down; the match is starting
     if (!began) g_match_track = -1;
   } else if (hp && PlayerReady(base, hp)) {
-    if (!g_countdown_seen_ms) g_countdown_seen_ms = GetTickCount64();
+    if (!g_countdown_seen_ms) g_countdown_seen_ms = ge::platform::TicksMs();
     began = g_countdown_seen_ms;
     const uint32_t sent = LD32(base, hp + kTrackVar + 12u);
     if (sent != 0 && sent < 1000u && g_match_track != static_cast<int>(sent) - 1) {
@@ -2002,7 +1948,7 @@ int CountdownSeconds(PPCContext& ctx, uint8_t* base, bool host) {
     g_match_track = -1;
   }
   if (!began) return 0;
-  const uint64_t elapsed = GetTickCount64() - began;
+  const uint64_t elapsed = ge::platform::TicksMs() - began;
   return elapsed >= kCountdownMs ? 1 : static_cast<int>((kCountdownMs - elapsed + 999) / 1000);
 }
 
@@ -2078,10 +2024,10 @@ bool ge_lobby_host_start(PPCRegister& r17) {
       CancelCountdown(*ctx, base, "not enough players");
     } else if (PlayersNotReady(*ctx, base) > 0) {
       CancelCountdown(*ctx, base, "a player is no longer ready");
-    } else if (g_track_sent && GetTickCount64() - g_countdown_ms >= kCountdownMs - 1000) {
+    } else if (g_track_sent && ge::platform::TicksMs() - g_countdown_ms >= kCountdownMs - 1000) {
       SetTrackVar(*ctx, base, 0);  // the others have it; the match starts with the number as it was
       g_track_sent = false;
-    } else if (GetTickCount64() - g_countdown_ms >= kCountdownMs) {
+    } else if (ge::platform::TicksMs() - g_countdown_ms >= kCountdownMs) {
       g_countdown_ms = 0;  // the session may start the match now (ge_session_start_gate)
       REXKRNL_INFO("GELOBBY countdown over: starting the match");
     }
@@ -2104,8 +2050,8 @@ bool ge_lobby_start_request() {
   }
   int tracks = 0;
   while (tracks < 250 && LD16(base, kRandomMusicList + tracks * 2u) != 0) ++tracks;
-  g_match_track = tracks > 0 ? static_cast<int>(GetTickCount64() % static_cast<uint64_t>(tracks)) : -1;
-  g_countdown_ms = GetTickCount64();
+  g_match_track = tracks > 0 ? static_cast<int>(ge::platform::TicksMs() % static_cast<uint64_t>(tracks)) : -1;
+  g_countdown_ms = ge::platform::TicksMs();
   SetHostReady(*ctx, base, true);
   if (g_match_track >= 0) {
     SetTrackVar(*ctx, base, static_cast<uint32_t>(g_match_track) + 1u);
@@ -2223,7 +2169,7 @@ void ge_lobby_draw_extras() {
 // The session's match start (sub_8217FAF0 entry): held back while the host's
 // countdown runs; true jumps to its return (0x8217FB74).
 bool ge_session_start_gate() {
-  return g_countdown_ms != 0 && GetTickCount64() - g_countdown_ms < kCountdownMs;
+  return g_countdown_ms != 0 && ge::platform::TicksMs() - g_countdown_ms < kCountdownMs;
 }
 
 // A multiplayer level's music (sub_821453C0, at its random pick 0x82145438:

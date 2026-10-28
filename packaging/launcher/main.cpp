@@ -18,13 +18,11 @@
 #include <objbase.h>
 #include <shellapi.h>
 
-#define GE_WIDEN2(x) L##x
-#define GE_WIDEN(x) GE_WIDEN2(x)
 #define GE_STRINGIZE2(x) #x
 #define GE_STRINGIZE(x) GE_STRINGIZE2(x)
 
 namespace ge {
-const wchar_t* const kVersion = GE_WIDEN(GE_STRINGIZE(GE_VERSION));
+const char* const kVersion = GE_STRINGIZE(GE_VERSION);
 }
 
 namespace {
@@ -34,15 +32,15 @@ using namespace ge;
 int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstring& extras) {
   Log(L"Unattended setup");
   std::vector<Source> found;
-  std::wstring why;
+  std::string why;
   if (!options.package.empty()) {
     found = SourcesIn(options.package, &why);
   } else {
     found = DetectSources(p);
-    why = L"no package found";
+    why = "no package found";
   }
   if (found.size() != 1) {
-    Log(L"Unattended: " + (found.empty() ? why : std::to_wstring(found.size()) + L" candidates, pass --package"));
+    Log("Unattended: " + (found.empty() ? why : std::to_string(found.size()) + " candidates, pass --package"));
     return found.empty() ? 3 : 2;
   }
   std::atomic<bool> cancel{false};
@@ -54,8 +52,8 @@ int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstrin
   want.shortcut = extras.find(L"shortcut") != std::wstring::npos;
   want.complete = extras.find(L"complete") != std::wstring::npos;
   // As on a first setup: unticked extras change nothing; never replace a shortcut that is not ours.
-  const std::wstring note = ApplyExtras(p, want, Extras{}, options.shortcut_folder, nullptr);
-  if (!note.empty()) Log(L"Unattended: " + note);
+  const std::string note = ApplyExtras(p, want, Extras{}, options.shortcut_folder, nullptr);
+  if (!note.empty()) Log("Unattended: " + note);
   return 0;
 }
 
@@ -80,7 +78,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     } else if (arg == L"--shortcut-folder" && i + 1 < argc) {
       options.shortcut_folder = argv[++i];
     } else {
-      options.game_args += (options.game_args.empty() ? L"" : L" ") + Quote(arg);
+      options.game_args.push_back(Narrow(arg));
     }
   }
   if (argv) LocalFree(argv);
@@ -89,7 +87,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
   // The normal case: everything is in place, so start the game at once.
-  std::wstring missing;
+  std::string missing;
   bool installed = IsInstalled(p, &missing);
   if (!installed) {
     RecoverInterruptedSwap(p);
@@ -101,12 +99,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       EnsureSettings(p);
     }
     RepairShortcut(p, options.shortcut_folder);
-    std::wstring error;
+    std::string error;
     int code = 0;
     if (!LaunchGame(p, options.game_args, &error)) {
       LogTo(p.logs);
-      Log(L"FAILED to start the game: " + error);
-      MessageBoxW(nullptr, error.c_str(), L"GoldenEye 007", MB_OK | MB_ICONERROR);
+      Log("FAILED to start the game: " + error);
+      MessageBoxW(nullptr, Widen(error).c_str(), L"GoldenEye 007", MB_OK | MB_ICONERROR);
       code = 1;
     }
     CoUninitialize();
@@ -130,7 +128,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
   LogTo(p.logs);
   options.forced = installed;
-  options.reason = installed ? L"--setup" : L"missing " + missing;
+  options.reason = installed ? "--setup" : "missing " + missing;
   const int code = unattended ? RunUnattended(p, options, extras) : RunSetupWindow(instance, p, options);
   if (mutex) {
     ReleaseMutex(mutex);

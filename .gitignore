@@ -29,6 +29,11 @@ out/
 /cmake-build-*/
 *.zip
 *.7z
+*.tar.gz
+*.tar.xz
+*.so
+*.a
+/packaging/GoldenEye 007
 *.pdb
 *.exe
 *.ilk

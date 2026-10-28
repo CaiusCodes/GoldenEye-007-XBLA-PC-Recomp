@@ -5,10 +5,10 @@
   "system": "Xbox 360",
   "type": "recomp",
   "status": "released",
-  "targets": ["Windows"],
+  "targets": ["Windows", "Linux"],
   "toolchain": "ReXGlue",
   "original": {
     "serial": "584108A9"
   },
-  "notes": "Native Windows PC port of the unreleased GoldenEye 007 XBLA remaster. Supports 4K, widescreen, keyboard and mouse, and LAN multiplayer. Requires your own game package."
+  "notes": "Native Windows and Linux PC port of the unreleased GoldenEye 007 XBLA remaster. Supports 4K, widescreen, keyboard and mouse, and LAN multiplayer. Requires your own game package."
 }

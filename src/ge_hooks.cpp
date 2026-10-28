@@ -22,12 +22,14 @@
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
 #include "ge_gpu_detect.h"  // DisplayRefreshHz
+#include "ge_platform.h"    // window / pointer / keyboard / time services (Win32 or SDL)
 #include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
 #include <rex/kernel/xam/ge_online_control.h>  // GeNetworkGameActive
 #include <rex/ui/keybinds.h>     // ParseVirtualKey (keyboard rebinding)
 #include <rex/ui/virtual_key.h>
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
 #include <rex/runtime.h>
+#include <rex/memory/utils.h>  // QueryProtect (readable extent of host memory)
 #include <rex/system/xmemory.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/command_processor.h>
@@ -35,14 +37,6 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <cstdio>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
 #include <string>
 
 // Replaces the unsupported `bc 20,lt,0x820F285C` at 0x820F2838. BO=20 makes
@@ -54,28 +48,26 @@ void ge_fix_mp_menu_branch() {
   }
 }
 
-// The game window (found when it has focus); defined with the mouse code.
-HWND g_game_hwnd_for_resize();
 namespace ge { void ApplyPlayerName(const std::string& requested); }
 namespace ge { void PersistSettings(); }  // ge_native_menu.cpp: save ge.toml
 namespace ge { void TestEnterText(const std::string& text); }  // ge_native_menu.cpp
 namespace ge { void TestToggleReady(); void LobbyPollTick(uint8_t* base, uint32_t menu); }  // ge_native_menu.cpp
 namespace { void ge_rename_tick(PPCContext& ctx, uint8_t* base); }  // below: a new player name
 namespace {
-// Last controller poll in the multiplayer lobby (GetTickCount64 ms, 0 = not there).
+// Last controller poll in the multiplayer lobby (TicksMs, 0 = not there).
 std::atomic<uint64_t> g_lobby_poll_ms{0};
 // When this machine's players were last marked ready to start (sub_8217D900(1):
 // once by the host's START, every lobby frame on a client), 0 = never.
 std::atomic<uint64_t> g_match_ready_ms{0};
 // Guest presents so far (the game's own frames), for the Show FPS counter.
 std::atomic<uint32_t> g_guest_presents{0};
-// Host time (QueryPerformanceCounter) of the last kPresentRing guest presents,
+// Host time (PerfCounter) of the last kPresentRing guest presents,
 // slot = present number % kPresentRing, for Show FPS frame times.
 constexpr uint32_t kPresentRing = 1024;
 std::atomic<int64_t> g_present_qpc[kPresentRing];
 }  // namespace
 void ge_match_ready(PPCRegister& r3) {
-  if (r3.u32 & 0xFF) g_match_ready_ms.store(GetTickCount64(), std::memory_order_relaxed);
+  if (r3.u32 & 0xFF) g_match_ready_ms.store(ge::platform::TicksMs(), std::memory_order_relaxed);
 }
 namespace ge {
 // A multiplayer match is loading: the last poll was in the lobby and polls have
@@ -84,7 +76,7 @@ bool MatchStarting() {
   const uint64_t last = g_lobby_poll_ms.load(std::memory_order_relaxed);
   const uint64_t ready = g_match_ready_ms.load(std::memory_order_relaxed);
   if (!last || !ready) return false;
-  const uint64_t now = GetTickCount64();
+  const uint64_t now = ge::platform::TicksMs();
   return now - last > 500 && now - last < 30000 && now - ready < 30000;
 }
 // Frames the game has presented since boot (Show FPS divides the change by time).
@@ -93,18 +85,17 @@ uint32_t GuestPresentCount() { return g_guest_presents.load(std::memory_order_re
 // newest last. Lock-free and approximate: a slot being rewritten is skipped.
 void GuestFrameTimes(double window_ms, std::vector<double>& out) {
   out.clear();
-  LARGE_INTEGER freq, now;
-  QueryPerformanceFrequency(&freq);
-  QueryPerformanceCounter(&now);
+  const int64_t freq = ge::platform::PerfFrequency();
+  const int64_t now = ge::platform::PerfCounter();
   const uint32_t n = g_guest_presents.load(std::memory_order_acquire);
-  const int64_t oldest = now.QuadPart - int64_t(window_ms * double(freq.QuadPart) / 1000.0);
+  const int64_t oldest = now - int64_t(window_ms * double(freq) / 1000.0);
   std::vector<double> rev;
   for (uint32_t k = 1; k + 1 < kPresentRing && k < n; ++k) {
     const int64_t t1 = g_present_qpc[(n - k) % kPresentRing].load(std::memory_order_relaxed);
     const int64_t t0 = g_present_qpc[(n - k - 1) % kPresentRing].load(std::memory_order_relaxed);
     if (t0 < oldest) break;
     if (t1 <= t0) continue;
-    rev.push_back(double(t1 - t0) * 1000.0 / double(freq.QuadPart));
+    rev.push_back(double(t1 - t0) * 1000.0 / double(freq));
   }
   out.assign(rev.rbegin(), rev.rend());
 }
@@ -120,59 +111,36 @@ namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
 // pause-menu tab's "Save & Restart": the new instance reads the just-written
 // ge.toml (new username / server / online-enable) at boot, then the caller tears
-// the current process down. Launching a second instance of a running exe is fine
-// on Windows -- the image file is opened share-read.
-void LaunchSelfDetached() {
-  wchar_t exe_path[MAX_PATH];
-  DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) {
-    return;  // can't resolve our own path; skip relaunch (caller still quits)
-  }
-  // Start it from the exe's own directory so a normal boot's relative paths hold.
-  std::wstring full(exe_path, exe_path + n);
-  size_t slash = full.find_last_of(L"\\/");
-  std::wstring workdir = (slash == std::wstring::npos) ? std::wstring() : full.substr(0, slash);
-  ShellExecuteW(nullptr, L"open", exe_path, nullptr,
-                workdir.empty() ? nullptr : workdir.c_str(), SW_SHOWNORMAL);
-}
+// the current process down.
+void LaunchSelfDetached() { ge::platform::RelaunchDetached(); }
+
+// Windowed mode: make the game window's client area w x h, keeping the window
+// centred where it was (on the same monitor, inside its work area, and no
+// bigger than it).
+void ResizeGameWindow(int w, int h) { ge::platform::ResizeClient(w, h); }
 
 // A normal shutdown (TerminateTitle + quit) could stall and leave the old
 // window hanging next to the new one, so the old process ends immediately once
 // the new one is launched. Settings are saved by the caller; game saves are
 // written as they happen.
-// Windowed mode: make the game window's client area w x h, keeping the window
-// centred where it was (on the same monitor, inside its work area, and no
-// bigger than it).
-void ResizeGameWindow(int w, int h) {
-  HWND hwnd = g_game_hwnd_for_resize();
-  if (!hwnd || w <= 0 || h <= 0) return;
-  const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
-  const DWORD exstyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
-  if (!(style & WS_CAPTION)) return;  // fullscreen: the display size applies
-  if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-  RECT want{0, 0, w, h};
-  AdjustWindowRectEx(&want, style, FALSE, exstyle);
-  int ww = want.right - want.left, wh = want.bottom - want.top;
-  RECT cur;
-  GetWindowRect(hwnd, &cur);
-  MONITORINFO mi{sizeof(mi)};
-  GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-  const RECT wa = mi.rcWork;
-  ww = std::min<int>(ww, wa.right - wa.left);
-  wh = std::min<int>(wh, wa.bottom - wa.top);
-  const int cx = (cur.left + cur.right) / 2, cy = (cur.top + cur.bottom) / 2;
-  const int x = std::clamp<int>(cx - ww / 2, wa.left, std::max<int>(wa.left, wa.right - ww));
-  const int y = std::clamp<int>(cy - wh / 2, wa.top, std::max<int>(wa.top, wa.bottom - wh));
-  SetWindowPos(hwnd, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
 void RestartSelf() {
   LaunchSelfDetached();
-  TerminateProcess(GetCurrentProcess(), 0);
-  for (;;) {
-  }
+  ge::platform::HardExit();
 }
 }  // namespace ge
+
+// End of the readable host memory run containing `p` (== p when it is not readable):
+// the guest stack dumps below must never read past the committed pages.
+inline uint8_t* ge_readable_end(uint8_t* p) {
+  const uintptr_t mask = static_cast<uintptr_t>(rex::memory::page_size()) - 1;
+  const uintptr_t page = reinterpret_cast<uintptr_t>(p) & ~mask;
+  size_t length = 0;
+  rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
+  if (!rex::memory::QueryProtect(reinterpret_cast<void*>(page), length, access) ||
+      access == rex::memory::PageAccess::kNoAccess)
+    return p;
+  return reinterpret_cast<uint8_t*>(page + length);
+}
 
 // Probe to read CommandProcessor's protected ring read pointer (legal: a
 // derived class may touch protected base members; we only reinterpret an
@@ -312,8 +280,8 @@ void ge_log_gpu_clock_changes() {
 
 void ge_match_display_refresh() {
   static double logged_hz = -1.0, applied = -1.0;
-  HWND hwnd = g_game_hwnd_for_resize();
-  const double hz = hwnd ? ge::DisplayRefreshHz(hwnd) : 0.0;
+  SDL_Window* window = ge::platform::GameWindow();
+  const double hz = window ? ge::DisplayRefreshHz(window) : 0.0;
   if (hz > 0.0 && std::fabs(hz - logged_hz) > 0.0005) {
     logged_hz = hz;
     REXKRNL_INFO("Display refresh: {:.3f} Hz", hz);
@@ -473,12 +441,8 @@ void ge_watchdog_thread() {
               uint32_t sp = c->r1.u32;
               if (sp >= 0x10000u && sp < 0xC0000000u) {
                 uint8_t* hsp = base + sp;
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                    mbi.State == MEM_COMMIT &&
-                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) {
-                  uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+                uint8_t* rend = ge_readable_end(hsp);
+                if (rend > hsp) {
                   uint8_t* send = hsp + 0x2400u;
                   if (send > rend) send = rend;  // never read past the committed page
                   char sbuf[500];
@@ -566,10 +530,8 @@ void ge_watchdog_thread() {
                   int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
                   if (sp >= 0x10000u && sp < 0xC0000000u) {
                     uint8_t* hsp = base + sp;
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                        mbi.State == MEM_COMMIT) {
-                      uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+                    uint8_t* rend = ge_readable_end(hsp);
+                    if (rend > hsp) {
                       uint8_t* send = hsp + 0x2800u;
                       if (send > rend) send = rend;
                       for (uint8_t* pp = hsp; pp + 4 <= send && fo < 580; pp += 4) {
@@ -614,15 +576,14 @@ void ge_stall_sampler_thread() {
   int samples = 0;
   uint32_t flag_poll = 0;
   bool on = false;
-  LARGE_INTEGER freq;
-  QueryPerformanceFrequency(&freq);
+  const int64_t freq = ge::platform::PerfFrequency();
   for (;;) {
-    Sleep(1);
+    ge::platform::SleepMs(1);
     if ((flag_poll++ % 500) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
     if (!on) {
       // Diagnostics off: check again in half a second instead of waking up a
       // thousand times a second for nothing.
-      Sleep(500);
+      ge::platform::SleepMs(500);
       flag_poll = 0;
       continue;
     }
@@ -641,16 +602,15 @@ void ge_stall_sampler_thread() {
     // guest return addresses (lr) sampled once a millisecond.
     {
       static std::vector<std::pair<uint32_t, uint32_t>> hist;
-      static LARGE_INTEGER hist_start{};
-      LARGE_INTEGER t;
-      QueryPerformanceCounter(&t);
-      if (!hist_start.QuadPart) hist_start = t;
+      static int64_t hist_start = 0;
+      const int64_t t = ge::platform::PerfCounter();
+      if (!hist_start) hist_start = t;
       const uint32_t lr_now = static_cast<uint32_t>(main_ctx->lr);
       bool found = false;
       for (auto& e : hist)
         if (e.first == lr_now) { ++e.second; found = true; break; }
       if (!found && hist.size() < 256) hist.push_back({lr_now, 1});
-      if (t.QuadPart - hist_start.QuadPart >= 10 * freq.QuadPart) {
+      if (t - hist_start >= 10 * freq) {
         std::sort(hist.begin(), hist.end(),
                   [](const auto& x, const auto& y) { return x.second > y.second; });
         uint32_t total = 0;
@@ -675,10 +635,9 @@ void ge_stall_sampler_thread() {
       samples = 0;
     }
     if (samples >= 3) continue;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
+    const int64_t now = ge::platform::PerfCounter();
     const int64_t last = g_present_qpc[(n - 1) % kPresentRing].load(std::memory_order_relaxed);
-    const double age_ms = double(now.QuadPart - last) * 1000.0 / double(freq.QuadPart);
+    const double age_ms = double(now - last) * 1000.0 / double(freq);
     if (age_ms < 28.0 + 25.0 * samples || age_ms > 2000.0) continue;
     ++samples;
     const uint32_t lr = static_cast<uint32_t>(main_ctx->lr);
@@ -687,11 +646,10 @@ void ge_stall_sampler_thread() {
     int off = 0;
     buf[0] = 0;
     if (sp >= 0x10000u && sp < 0xC0000000u) {
-      MEMORY_BASIC_INFORMATION mbi;
       uint8_t* hsp = base + sp;
-      if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT) {
-        uint8_t* end = std::min(hsp + 0x1800u,
-                                static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize);
+      uint8_t* rend = ge_readable_end(hsp);
+      if (rend > hsp) {
+        uint8_t* end = std::min(hsp + 0x1800u, rend);
         int found = 0;
         for (uint8_t* pp = hsp; pp + 4 <= end && found < 14 && off < 360; pp += 4) {
           uint32_t v;
@@ -821,9 +779,9 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   }
   static thread_local uint32_t s_wait_start = 0;
   static thread_local bool s_waiting = false;
-  static thread_local LARGE_INTEGER s_wait_qpc{};
+  static thread_local int64_t s_wait_qpc = 0;
   if (!drawn) {
-    if (!s_waiting) { s_waiting = true; s_wait_start = t; QueryPerformanceCounter(&s_wait_qpc); }
+    if (!s_waiting) { s_waiting = true; s_wait_start = t; s_wait_qpc = ge::platform::PerfCounter(); }
     // The six GPU-completion waits poll this routine in a TIGHT busy spin. With
     // dozens of guest threads that oversubscribes the cores and starves the
     // rexglue CP worker thread -- which is the very thread that must advance the
@@ -840,26 +798,16 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
       if ((uint32_t)(t - s_wait_start) < 25000u) {  // ~0.5 ms @49.875MHz
         std::this_thread::yield();
       } else {
-        static thread_local HANDLE s_wait_timer =
-            CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */,
-                                   TIMER_ALL_ACCESS);
-        LARGE_INTEGER due;
-        due.QuadPart = -5000;  // 0.5 ms in 100 ns units
-        if (s_wait_timer && SetWaitableTimer(s_wait_timer, &due, 0, nullptr, nullptr, FALSE)) {
-          WaitForSingleObject(s_wait_timer, INFINITE);
-        } else {
-          std::this_thread::yield();
-        }
+        ge::platform::SleepPreciseUs(500);
       }
     }
   }
   if (drawn && s_waiting) {
     // vblank_timing_log: how long the game waited for the GPU this frame.
     s_waiting = false;
-    LARGE_INTEGER now, freq;
-    QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&freq);
-    const uint64_t us = uint64_t((now.QuadPart - s_wait_qpc.QuadPart) * 1000000 / freq.QuadPart);
+    const int64_t now = ge::platform::PerfCounter();
+    const int64_t freq = ge::platform::PerfFrequency();
+    const uint64_t us = uint64_t((now - s_wait_qpc) * 1000000 / freq);
     g_hitch_gpu_wait_us.fetch_add(us, std::memory_order_relaxed);
     uint64_t prev = g_hitch_gpu_wait_max_us.load(std::memory_order_relaxed);
     while (us > prev && !g_hitch_gpu_wait_max_us.compare_exchange_weak(prev, us)) {}
@@ -895,10 +843,9 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
   g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
   {
-    LARGE_INTEGER qpc;
-    QueryPerformanceCounter(&qpc);
+    const int64_t qpc = ge::platform::PerfCounter();
     const uint32_t slot = g_guest_presents.load(std::memory_order_relaxed) % kPresentRing;
-    g_present_qpc[slot].store(qpc.QuadPart, std::memory_order_relaxed);
+    g_present_qpc[slot].store(qpc, std::memory_order_relaxed);
     g_guest_presents.fetch_add(1, std::memory_order_release);
     // vblank_timing_log: the game's own frame times every 10 seconds.
     static uint32_t poll = 0;
@@ -915,10 +862,9 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
       const uint32_t n = g_guest_presents.load(std::memory_order_relaxed);
       if (log_on && last_counter && counter - last_counter >= 2 && counter - last_counter < 4 &&
           n >= 2) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
+        const int64_t f = ge::platform::PerfFrequency();
         const int64_t prev = g_present_qpc[(n - 2) % kPresentRing].load(std::memory_order_relaxed);
-        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(f.QuadPart);
+        const double ms = double(qpc - prev) * 1000.0 / double(f);
         if (prev && ms < 20.0) ++double_steps;
       }
       last_counter = counter;
@@ -932,10 +878,9 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
       const uint32_t watchdog = g_hitch_watchdog.exchange(0, std::memory_order_relaxed);
       const uint32_t n = g_guest_presents.load(std::memory_order_relaxed);
       if (log_on && n >= 2) {
-        LARGE_INTEGER freq;
-        QueryPerformanceFrequency(&freq);
+        const int64_t freq = ge::platform::PerfFrequency();
         const int64_t prev = g_present_qpc[(n - 2) % kPresentRing].load(std::memory_order_relaxed);
-        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(freq.QuadPart);
+        const double ms = double(qpc - prev) * 1000.0 / double(freq);
         if (prev && ms > 25.0 && ms < 1000.0) {
           REXKRNL_INFO("ge slow frame: {:.1f} ms; GPU wait {:.1f} ms (longest {:.1f}){}; stage {}",
                        ms, wait_us / 1000.0, wait_max_us / 1000.0,
@@ -944,10 +889,9 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
       }
     }
     if (log_on) {
-      LARGE_INTEGER freq;
-      QueryPerformanceFrequency(&freq);
-      if (!log_start) log_start = qpc.QuadPart;
-      if (qpc.QuadPart - log_start >= 10 * freq.QuadPart) {
+      const int64_t freq = ge::platform::PerfFrequency();
+      if (!log_start) log_start = qpc;
+      if (qpc - log_start >= 10 * freq) {
         std::vector<double> ms;
         ge::GuestFrameTimes(10000.0, ms);
         if (!ms.empty()) {
@@ -966,7 +910,7 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
                        double_steps);
           double_steps = 0;
         }
-        log_start = qpc.QuadPart;
+        log_start = qpc;
       }
     } else {
       log_start = 0;
@@ -975,26 +919,26 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     // frames that missed a 60 Hz tick and the worst one. A few counters per
     // frame, no allocation; the stage number says where the player was.
     {
-      static LARGE_INTEGER freq{};
+      static int64_t freq = 0;
       static int64_t minute_start = 0, prev = 0;
       static uint32_t frames = 0, slow = 0, very_slow = 0;
       static double worst = 0.0;
-      if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+      if (!freq) freq = ge::platform::PerfFrequency();
       if (prev) {
-        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(freq.QuadPart);
+        const double ms = double(qpc - prev) * 1000.0 / double(freq);
         ++frames;
         if (ms > 25.0) ++slow;
         if (ms > 100.0) ++very_slow;
         if (ms < 5000.0) worst = std::max(worst, ms);
       }
-      prev = qpc.QuadPart;
-      if (!minute_start) minute_start = qpc.QuadPart;
-      const double elapsed = double(qpc.QuadPart - minute_start) / double(freq.QuadPart);
+      prev = qpc;
+      if (!minute_start) minute_start = qpc;
+      const double elapsed = double(qpc - minute_start) / double(freq);
       if (elapsed >= 60.0) {
         REXKRNL_INFO("ge minute: {:.1f} fps; {} frames over 25 ms ({} over 100 ms); worst {:.0f} ms; "
                      "stage {}",
                      frames / elapsed, slow, very_slow, worst, LD32(base, 0x82423E00u));
-        minute_start = qpc.QuadPart;
+        minute_start = qpc;
         frames = slow = very_slow = 0;
         worst = 0.0;
       }
@@ -1058,13 +1002,10 @@ bool ge_debug_gate(PPCRegister& r30, PPCRegister& r31) {
   if (r31.u32 != 0u) return true;
   static bool was_down = false;
   bool down = false;
-  if (HWND fg = GetForegroundWindow()) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
+  if (ge::platform::GameHasFocus()) {
     const rex::ui::VirtualKey vk =
         rex::ui::ParseVirtualKey(rex::cvar::GetFlagByName("ge_debug_menu_key"));
-    down = pid == GetCurrentProcessId() && vk != rex::ui::VirtualKey::kNone &&
-           (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+    down = vk != rex::ui::VirtualKey::kNone && ge::platform::KeyDown(static_cast<int>(vk));
   }
   const bool pressed = down && !was_down;
   was_down = down;
@@ -1223,8 +1164,8 @@ std::atomic<int> g_mouse_dx{0};
 std::atomic<int> g_mouse_dy{0};
 std::atomic<bool> g_mouselook_suppressed{false};  // set true while the pause menu is open
 // Mouse-wheel notches waiting to be turned into button presses (see
-// ge_wheel_tick). GetAsyncKeyState cannot see the wheel, so the raw-input
-// thread counts notches and each one becomes a short press of whatever is bound
+// ge_wheel_tick). KeyDown cannot see the wheel, so the mouse input counts
+// notches and each one becomes a short press of whatever is bound
 // to "WheelUp" / "WheelDown".
 std::atomic<int> g_wheel_up_queue{0};
 std::atomic<int> g_wheel_down_queue{0};
@@ -1239,59 +1180,21 @@ std::atomic<bool> g_rebind_capturing{false};
 // and free there so its tabs and rows can be clicked (ge_watch_mouse).
 std::atomic<bool> g_watch_open{false};
 
-// Cursor-capture state (touched from the mouse thread + SetMouselookSuppressed).
-HWND g_game_hwnd = nullptr;
-HCURSOR g_arrow_cursor = nullptr;
-HCURSOR g_blank_cursor = nullptr;
-bool g_captured = false;
-
 bool ge_mouselook_on() { return REXCVAR_GET(ge_mouselook_enable); }
-}  // namespace
-HWND g_game_hwnd_for_resize() {
-  if (g_game_hwnd) return g_game_hwnd;
-  // Not focused yet: take this process's visible captioned top-level window.
-  HWND found = nullptr;
-  EnumWindows(
-      [](HWND h, LPARAM out) -> BOOL {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
-        if (pid == GetCurrentProcessId() && IsWindowVisible(h) &&
-            (GetWindowLongPtrW(h, GWL_STYLE) & WS_CAPTION)) {
-          *reinterpret_cast<HWND*>(out) = h;
-          return FALSE;
-        }
-        return TRUE;
-      },
-      reinterpret_cast<LPARAM>(&found));
-  return found;
-}
-namespace {
 
-bool ge_game_has_focus() {
-  HWND fg = GetForegroundWindow();
-  if (!fg) return false;
-  DWORD pid = 0;
-  GetWindowThreadProcessId(fg, &pid);
-  return pid == GetCurrentProcessId();
-}
-
-// The visible game window (the foreground window while it's ours). Cached so we
-// can still restore the cursor after focus has moved elsewhere.
-HWND ge_game_window() {
-  HWND fg = GetForegroundWindow();
-  if (fg) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
-    if (pid == GetCurrentProcessId()) g_game_hwnd = fg;
-  }
-  return g_game_hwnd;
+// The game window's client area in pixels (left = top = 0).
+struct ClientRect { int right, bottom; };
+struct ClientPt { int x, y; };
+// False without a window or an empty client area.
+bool ge_client_rect(ClientRect& rc) {
+  return ge::platform::ClientSize(rc.right, rc.bottom) && rc.right > 0 && rc.bottom > 0;
 }
 
 // The part of the client area the game picture fills. The presenter fits the
 // display shape (16:9, or present_aspect_x:y when set) inside the window and
 // fills the rest with bars.
 struct PictureRect { float x, y, w, h; };
-PictureRect ge_picture_rect(const RECT& client) {
+PictureRect ge_picture_rect(const ClientRect& client) {
   float ax = static_cast<float>(std::atoi(rex::cvar::GetFlagByName("present_aspect_x").c_str()));
   float ay = static_cast<float>(std::atoi(rex::cvar::GetFlagByName("present_aspect_y").c_str()));
   if (ax <= 0.f || ay <= 0.f) { ax = 16.f; ay = 9.f; }
@@ -1308,7 +1211,7 @@ PictureRect ge_picture_rect(const RECT& client) {
 // TV and, with Screen Ratio 16:9 or 21:9, draws them as a 4:3 box in the
 // middle of the wider picture (the sides show the folder background). With
 // 4:3 the box is the whole picture.
-PictureRect ge_menu_rect(const RECT& client) {
+PictureRect ge_menu_rect(const ClientRect& client) {
   PictureRect pic = ge_picture_rect(client);
   const float box_w = pic.h * 4.f / 3.f;
   if (box_w < pic.w) {
@@ -1322,141 +1225,29 @@ PictureRect ge_menu_rect(const RECT& client) {
 // collection and cursor capture.
 bool ge_mouse_active() {
   return ge_mouselook_on() && !g_mouselook_suppressed.load(std::memory_order_relaxed) &&
-         !g_watch_open.load(std::memory_order_relaxed) && ge_game_has_focus();
+         !g_watch_open.load(std::memory_order_relaxed) && ge::platform::GameHasFocus();
 }
 
-HCURSOR ge_make_blank_cursor() {
-  // 32x32 fully transparent cursor (AND=1 / XOR=0 == transparent everywhere).
-  BYTE and_mask[32 * 32 / 8];
-  BYTE xor_mask[32 * 32 / 8];
-  std::memset(and_mask, 0xFF, sizeof(and_mask));
-  std::memset(xor_mask, 0x00, sizeof(xor_mask));
-  return CreateCursor(GetModuleHandleW(nullptr), 0, 0, 32, 32, and_mask, xor_mask);
+// Mouse sink for the platform layer (ge_platform.cpp): relative motion and wheel
+// notches from the raw-input thread / SDL event watch.
+void ge_mouse_delta(int dx, int dy) {
+  g_mouse_dx.fetch_add(dx, std::memory_order_relaxed);
+  g_mouse_dy.fetch_add(dy, std::memory_order_relaxed);
 }
-
-// Capture (hide + confine) the cursor during play; release it in menus, when
-// unfocused, or when mouse-look is off. Hiding is done by swapping the game
-// window's class cursor (works cross-thread, unlike ShowCursor). Safe to call
-// from any thread.
-// True while Windows is moving or sizing the game window (title bar or border
-// drag), or a button is held with the pointer outside the client area (the
-// click that starts such a drag). Confining the pointer then would pull it into
-// the window and drag the window down with it.
-bool ge_window_drag_active(HWND hwnd) {
-  GUITHREADINFO gti{};
-  gti.cbSize = sizeof(gti);
-  if (GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, nullptr), &gti) &&
-      (gti.flags & GUI_INMOVESIZE))
-    return true;
-  const bool button_down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ||
-                           (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
-  if (!button_down) return false;
-  POINT pt;
-  RECT rc;
-  if (!GetCursorPos(&pt) || !GetClientRect(hwnd, &rc)) return false;
-  ScreenToClient(hwnd, &pt);
-  return !PtInRect(&rc, pt);
-}
-
-void ge_update_mouse_capture() {
-  HWND hwnd = ge_game_window();
-  const bool want = ge_mouse_active() && hwnd != nullptr && !ge_window_drag_active(hwnd);
-  if (want) {
-    if (!g_captured) {
-      g_captured = true;
-      if (g_blank_cursor) SetClassLongPtrW(hwnd, GCLP_HCURSOR, (LONG_PTR)g_blank_cursor);
-      REXKRNL_INFO("GEMOUSE capture ON  hwnd={}", (void*)hwnd);
-    }
-    RECT rc;
-    if (GetClientRect(hwnd, &rc)) {
-      POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
-      ClientToScreen(hwnd, &tl);
-      ClientToScreen(hwnd, &br);
-      RECT screen{tl.x, tl.y, br.x, br.y};
-      ClipCursor(&screen);  // re-confine each tick (window may move/resize)
-    }
-  } else if (g_captured) {
-    g_captured = false;
-    if (hwnd && g_arrow_cursor) SetClassLongPtrW(hwnd, GCLP_HCURSOR, (LONG_PTR)g_arrow_cursor);
-    ClipCursor(nullptr);
+void ge_mouse_wheel(int notches) {
+  std::atomic<int>& queue = notches > 0 ? g_wheel_up_queue : g_wheel_down_queue;
+  if (notches != 0 && queue.load(std::memory_order_relaxed) < 4) {
+    queue.fetch_add(1, std::memory_order_relaxed);
   }
 }
-
-LRESULT CALLBACK GeRawWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-  if (msg == WM_INPUT) {
-    RAWINPUT ri;
-    UINT sz = sizeof(ri);
-    if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
-        ri.header.dwType == RIM_TYPEMOUSE &&
-        (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
-      static std::atomic<bool> logged{false};
-      bool exp = false;
-      if (logged.compare_exchange_strong(exp, true))
-        REXKRNL_INFO("GEMOUSE first WM_INPUT dx={} dy={} active={}", ri.data.mouse.lLastX,
-                     ri.data.mouse.lLastY, ge_mouse_active());
-      // Only collect while active, so deltas don't queue while alt-tabbed/paused
-      // and snap the view on return.
-      if (ge_mouse_active()) {
-        g_mouse_dx.fetch_add(ri.data.mouse.lLastX, std::memory_order_relaxed);
-        g_mouse_dy.fetch_add(ri.data.mouse.lLastY, std::memory_order_relaxed);
-      }
-    }
-    if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
-        ri.header.dwType == RIM_TYPEMOUSE && (ri.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) &&
-        !g_mouselook_suppressed.load(std::memory_order_relaxed) && ge_game_has_focus()) {
-      const short delta = static_cast<short>(ri.data.mouse.usButtonData);
-      std::atomic<int>& queue = delta > 0 ? g_wheel_up_queue : g_wheel_down_queue;
-      if (delta != 0 && queue.load(std::memory_order_relaxed) < 4) {
-        queue.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-    return 0;
-  }
-  if (msg == WM_TIMER) {
-    ge_update_mouse_capture();
-    return 0;
-  }
-  return DefWindowProcW(h, msg, wp, lp);
+bool ge_wheel_wanted() {
+  return !g_mouselook_suppressed.load(std::memory_order_relaxed) && ge::platform::GameHasFocus();
 }
 
-// Dedicated thread: own a message-only window + RIDEV_INPUTSINK raw mouse so we
-// get true mouse deltas without touching the SDK's window/message loop. A timer
-// drives the cursor capture/release each ~15ms.
-void ge_mouse_thread() {
-  g_arrow_cursor = LoadCursorA(nullptr, IDC_ARROW);  // IDC_ARROW is an ANSI int-resource
-  g_blank_cursor = ge_make_blank_cursor();
-  WNDCLASSEXW wc{};
-  wc.cbSize = sizeof(wc);
-  wc.lpfnWndProc = GeRawWndProc;
-  wc.hInstance = GetModuleHandleW(nullptr);
-  wc.lpszClassName = L"GeRawMouseWnd";
-  RegisterClassExW(&wc);
-  HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
-                              wc.hInstance, nullptr);
-  if (!hwnd) return;
-  RAWINPUTDEVICE rid{};
-  rid.usUsagePage = 0x01;  // generic desktop
-  rid.usUsage = 0x02;      // mouse
-  rid.dwFlags = RIDEV_INPUTSINK;
-  rid.hwndTarget = hwnd;
-  BOOL reg = RegisterRawInputDevices(&rid, 1, sizeof(rid));
-  REXKRNL_INFO("GEMOUSE thread up: hwnd={} rawinput_register={} (err={})",
-               (void*)hwnd, reg ? "OK" : "FAIL", reg ? 0u : GetLastError());
-  if (!reg) return;
-  SetTimer(hwnd, 1, 15, nullptr);  // ~60Hz capture-state poll
-  MSG m;
-  while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-    TranslateMessage(&m);
-    DispatchMessageW(&m);
-  }
-}
-
+// Raw mouse deltas + cursor capture (hide + confine during play, released in menus,
+// when unfocused, or when mouse-look is off); the platform layer starts it once.
 void ge_start_mouse_once() {
-  static std::atomic<bool> started{false};
-  bool expected = false;
-  if (started.compare_exchange_strong(expected, true)) {
-    std::thread(ge_mouse_thread).detach();
-  }
+  ge::platform::StartMouse({ge_mouse_delta, ge_mouse_wheel, ge_mouse_active, ge_wheel_wanted});
 }
 
 int ge_take_mouse_dx() { return g_mouse_dx.exchange(0, std::memory_order_relaxed); }
@@ -1482,7 +1273,7 @@ void SetMouselookSuppressed(bool v) {
     g_rebind_capturing.store(false, std::memory_order_relaxed);  // never stick on close
     g_wait_for_key_release.store(true, std::memory_order_relaxed);
   }
-  ge_update_mouse_capture();  // release the cursor immediately when the menu opens
+  ge::platform::UpdateMouseCapture();  // release the cursor immediately when the menu opens
 }
 
 // Called by the rebind menu while it is waiting for a key. While true, all slot-0
@@ -2108,9 +1899,8 @@ float g_test_pointer_x = 0.f, g_test_pointer_y = 0.f;
 // pointer's own limits mapped into menu units. Without a window (or on a pad)
 // the view stays the limit as before.
 static bool ge_menu_cursor_limits(float& min_x, float& max_x, float& min_y, float& max_y) {
-  HWND hwnd = g_game_hwnd_for_resize();
-  RECT rc;
-  if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return false;
+  ClientRect rc;
+  if (!ge_client_rect(rc)) return false;
   const PictureRect box = ge_menu_rect(rc);
   if (box.w < 1.f || box.h < 1.f) return false;
   min_x = 440.f * (0.f - box.x + 0.5f) / box.w;
@@ -2147,32 +1937,24 @@ void ge_menu_cursor_clamp_y() {
 // the pointer is not confined to the window (unfocused, mouse-look off) or a
 // mission is running.
 bool ge_menu_cursor_from_pointer(uint8_t* base) {
-  static POINT last{-1, -1};
+  static ClientPt last{-1, -1};
   static float last_x = -1e9f, last_y = -1e9f;  // crosshair as we last left it
   // Follow the pointer whenever the game has focus in the front-end menus,
   // whatever state the in-mission mouse capture was left in (after Abort
   // Mission it could stay released, so the crosshair stopped moving).
-  HWND hwnd = g_game_hwnd_for_resize();
   const bool test = g_test_pointer;
-  if ((!test && (!hwnd || !ge_game_has_focus() || !REXCVAR_GET(ge_mouselook_enable) ||
+  if ((!test && (!ge::platform::GameWindow() || !ge::platform::GameHasFocus() ||
+                 !REXCVAR_GET(ge_mouselook_enable) ||
                  g_mouselook_suppressed.load(std::memory_order_relaxed))) ||
       LD32(base, GE_CURRENT_STAGE) != GE_TITLE_STAGE) {
     last = {-1, -1};  // front-end menus only
     return false;
   }
-  {
-    static int n = 0;
-    if (!test && !g_captured && (n++ % 120) == 0)
-      REXKRNL_INFO("GEMENUMOUSE menus without capture: watch_open {} hwnd {}",
-                   g_watch_open.load(), (void*)hwnd);
-  }
   // Fixed menu space: after a split-screen match the current view is a
   // player's viewport (half the screen or less), not the menu rectangle.
   constexpr float vx = 0.f, vy = 0.f, vw = 440.f, vh = 330.f;
-  RECT rc{0, 0, 1280, 720};
-  if (!(vw > 1.f && vh > 1.f) ||
-      (!test && (!GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0)))
-    return false;
+  ClientRect rc{1280, 720};
+  if (!(vw > 1.f && vh > 1.f) || (!test && !ge_client_rect(rc))) return false;
   static int logged = 0;
   if (logged < 3) {
     ++logged;
@@ -2181,16 +1963,15 @@ bool ge_menu_cursor_from_pointer(uint8_t* base) {
   }
   const float cx = LDF32(base, GE_MENU_XY);
   const float cy = LDF32(base, GE_MENU_XY + 4);
-  POINT pt;
+  ClientPt pt;
   if (test) {
-    pt = {static_cast<LONG>(g_test_pointer_x), static_cast<LONG>(g_test_pointer_y)};
+    pt = {static_cast<int>(g_test_pointer_x), static_cast<int>(g_test_pointer_y)};
   } else {
-    if (!GetCursorPos(&pt)) return false;
-    ScreenToClient(hwnd, &pt);
+    if (!ge::platform::CursorPosInClient(pt.x, pt.y)) return false;
     // Leave the pointer alone while it is outside the picture or the window is
     // being moved: pulling it onto the crosshair then dragged the window down
     // with it (a click on the title bar starts a move).
-    if (ge_window_drag_active(hwnd) || pt.x < 0 || pt.y < 0 || pt.x >= rc.right ||
+    if (ge::platform::WindowDragActive() || pt.x < 0 || pt.y < 0 || pt.x >= rc.right ||
         pt.y >= rc.bottom)
       return true;
   }
@@ -2213,17 +1994,15 @@ bool ge_menu_cursor_from_pointer(uint8_t* base) {
   if (last.x < 0 || jump > 0.5f) {
     // Put the pointer on the crosshair.
     const PictureRect pic = ge_menu_rect(rc);
-    POINT to{static_cast<LONG>(pic.x + (cx - vx) / vw * pic.w),
-             static_cast<LONG>(pic.y + (cy - vy) / vh * pic.h)};
-    to.x = std::clamp<LONG>(to.x, 0, rc.right - 1);
-    to.y = std::clamp<LONG>(to.y, 0, rc.bottom - 1);
+    ClientPt to{static_cast<int>(pic.x + (cx - vx) / vw * pic.w),
+                static_cast<int>(pic.y + (cy - vy) / vh * pic.h)};
+    to.x = std::clamp<int>(to.x, 0, rc.right - 1);
+    to.y = std::clamp<int>(to.y, 0, rc.bottom - 1);
     if (test) {
       g_test_pointer_x = static_cast<float>(to.x);
       g_test_pointer_y = static_cast<float>(to.y);
     } else {
-      POINT screen = to;
-      ClientToScreen(hwnd, &screen);
-      SetCursorPos(screen.x, screen.y);
+      ge::platform::WarpCursorInClient(to.x, to.y);
     }
     last = to;
     last_x = cx;
@@ -2612,9 +2391,8 @@ void ge_screen_ratio_tick(uint8_t* base) {
   countdown = 30;
   const uint32_t profile = LD32(base, 0x83088228u);
   if (!profile || base[profile + 1358u] == 0) return;
-  HWND hwnd = g_game_hwnd_for_resize();
-  RECT rc;
-  if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return;
+  ClientRect rc;
+  if (!ge_client_rect(rc)) return;
   const float aspect = static_cast<float>(rc.right) / static_cast<float>(rc.bottom);
   int ratio = aspect < 1.55f ? 0 : aspect >= 2.2f ? 2 : 1;  // 0 4:3, 1 16:9, 2 21:9
   // The game's own 21:9 front-end squeezes the menus into part of the frame
@@ -2805,7 +2583,7 @@ void ge_script_read_new_lines() {
           continue;
         }
         if (word.rfind("STALL=", 0) == 0) {  // test: hold the game thread, like a level load
-          Sleep(static_cast<DWORD>(std::atoi(word.c_str() + 6)));
+          ge::platform::SleepMs(static_cast<uint32_t>(std::atoi(word.c_str() + 6)));
           continue;
         }
         if (word.rfind("TEXT=", 0) == 0) {  // test: type into the text field being edited
@@ -2949,13 +2727,13 @@ void ge_wheel_tick() {
 
 bool ge_any_key_down() {
   for (int vk = 0x01; vk <= 0xFE; ++vk) {
-    if (GetAsyncKeyState(vk) & 0x8000) return true;
+    if (ge::platform::KeyDown(vk)) return true;
   }
   return false;
 }
 
 bool ge_input_active() {  // keyboard counts only when focused + not in the menu
-  if (g_mouselook_suppressed.load(std::memory_order_relaxed) || !ge_game_has_focus()) {
+  if (g_mouselook_suppressed.load(std::memory_order_relaxed) || !ge::platform::GameHasFocus()) {
     return false;
   }
   if (g_wait_for_key_release.load(std::memory_order_relaxed)) {
@@ -2997,7 +2775,7 @@ bool ge_key_down(const char* name) {
       rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(one);
       if (vk != rex::ui::VirtualKey::kNone && !(g_menu_back_keys && ge_is_menu_back_key(vk)) &&
           !(g_watch_mouse_keys && ge_is_mouse_button(vk)) &&
-          (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0)
+          ge::platform::KeyDown(static_cast<int>(vk)))
         return true;
     }
     if (comma == std::string::npos) break;
@@ -3030,7 +2808,7 @@ int g_watch_phase = 0;               // >0 holding, <0 gap
 uint32_t g_watch_current = 0;
 int g_watch_slider = -1;             // options row being dragged (0 music, 1 FX)
 bool g_watch_lmb = false, g_watch_rmb = false;
-POINT g_watch_last{-1, -1};
+ClientPt g_watch_last{-1, -1};
 
 void ge_watch_press(uint32_t press, int times = 1) {
   for (int i = 0; i < times; ++i) g_watch_queue.push_back(press);
@@ -3202,8 +2980,8 @@ void ge_watch_mouse(uint8_t* base) {
     g_watch_slider = -1;
     g_watch_last = {-1, -1};
     // Ignore a button that was already down as the watch opened.
-    g_watch_lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    g_watch_rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    g_watch_lmb = ge::platform::KeyDown(ge::platform::vk::kLButton);
+    g_watch_rmb = ge::platform::KeyDown(ge::platform::vk::kRButton);
   }
   g_watch_mouse_keys = open;
   ge_watch_keyboard_page_tick(tab);
@@ -3264,19 +3042,16 @@ void ge_watch_mouse(uint8_t* base) {
   }
   if (g_watch_phase > 0) out |= g_watch_current;
 
-  HWND hwnd = g_game_hwnd;
-  POINT pt;
-  RECT rc;
+  ClientPt pt{0, 0};
+  ClientRect rc{0, 0};
   const bool test = g_test_click;
   g_test_click = false;
-  if (test || (hwnd && ge_game_has_focus() && GetCursorPos(&pt) && GetClientRect(hwnd, &rc) &&
-               rc.right > 0 && rc.bottom > 0)) {
+  if (test || (ge::platform::GameWindow() && ge::platform::GameHasFocus() &&
+               ge::platform::CursorPosInClient(pt.x, pt.y) && ge_client_rect(rc))) {
     if (test) {
-      rc = {0, 0, 1280, 720};
-      pt = {static_cast<LONG>(g_test_click_x), static_cast<LONG>(g_test_click_y)};
+      rc = {1280, 720};
+      pt = {static_cast<int>(g_test_click_x), static_cast<int>(g_test_click_y)};
       g_watch_lmb = false;  // every test click is a fresh press
-    } else {
-      ScreenToClient(hwnd, &pt);
     }
     const PictureRect pic = ge_picture_rect(rc);
     // The layout below was measured with the watch stretched to fill a 16:9
@@ -3288,8 +3063,8 @@ void ge_watch_mouse(uint8_t* base) {
     const float y = (static_cast<float>(pt.y) - pic.y) * 720.f / pic.h;
     const bool moved = pt.x != g_watch_last.x || pt.y != g_watch_last.y;
     g_watch_last = pt;
-    const bool lmb = test || (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    const bool rmb = !test && (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const bool lmb = test || ge::platform::KeyDown(ge::platform::vk::kLButton);
+    const bool rmb = !test && ge::platform::KeyDown(ge::platform::vk::kRButton);
     const bool click = lmb && !g_watch_lmb;
     const bool rclick = rmb && !g_watch_rmb;
     g_watch_lmb = lmb;
@@ -3425,7 +3200,7 @@ void ge_charsel_tick(uint8_t* base) {
   g_charsel_active = true;
   const int idx = static_cast<int32_t>(LD32(base, kIndex));
   const bool confirmed = LD32(base, kConfirmed) != 0;
-  const bool lmb = ge_game_has_focus() && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+  const bool lmb = ge::platform::GameHasFocus() && ge::platform::KeyDown(ge::platform::vk::kLButton);
   if (orig < 0) {
     orig = idx;
     b_was = true;
@@ -3440,8 +3215,8 @@ void ge_charsel_tick(uint8_t* base) {
   };
   uint16_t buttons = LD16(base, GE_PAD0);
   const bool b = (buttons & BTN_B) != 0 ||
-                 (ge_game_has_focus() && ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) ||
-                                          (GetAsyncKeyState(VK_RBUTTON) & 0x8000)));
+                 (ge::platform::GameHasFocus() && (ge::platform::KeyDown(ge::platform::vk::kEscape) ||
+                                          ge::platform::KeyDown(ge::platform::vk::kRButton)));
   if (!confirmed) {
     if (b) ST16(base, GE_PAD0, static_cast<uint16_t>(buttons & ~BTN_B));
     if (b && !b_was && goal < 0) {
@@ -3566,7 +3341,7 @@ bool MigrateKeymap() {
 }
 
 // Key capture in the Keyboard & Mouse page: a wheel notch since the last call,
-// as "WheelUp" / "WheelDown" (GetAsyncKeyState cannot see the wheel).
+// as "WheelUp" / "WheelDown" (KeyDown cannot see the wheel).
 std::string TakeWheelNotch() {
   if (g_wheel_up_queue.exchange(0, std::memory_order_relaxed) > 0) {
     g_wheel_down_queue.store(0, std::memory_order_relaxed);
@@ -3597,7 +3372,7 @@ static void ge_watch_kbd_input(uint8_t* base) {
     return;
   }
   uint16_t buttons = LD16(base, GE_PAD0);
-  if (ge_game_has_focus() && (GetAsyncKeyState(VK_RETURN) & 0x8000)) {
+  if (ge::platform::GameHasFocus() && ge::platform::KeyDown(ge::platform::vk::kReturn)) {
     buttons = static_cast<uint16_t>((buttons & ~BTN_START) | BTN_A);
   }
   const int16_t ly = static_cast<int16_t>(LD16(base, GE_PAD0 + 6));
@@ -3614,7 +3389,7 @@ static void ge_watch_kbd_input(uint8_t* base) {
   // The page's own pad input is off (ge_watch_keyboard_page_input); Start from Enter too.
   ST16(base, GE_PAD0, static_cast<uint16_t>(LD16(base, GE_PAD0) &
                                             ~(BTN_A | BTN_DPAD_UP | BTN_DPAD_DOWN |
-                                              ((GetAsyncKeyState(VK_RETURN) & 0x8000) ? BTN_START : 0))));
+                                              (ge::platform::KeyDown(ge::platform::vk::kReturn) ? BTN_START : 0))));
 }
 
 // Keyboard and mouse buttons -> the slot-0 pad (ge_inject_keyboard, focused only).
@@ -3622,7 +3397,7 @@ static void ge_keyboard_buttons(uint8_t* base) {
   g_menu_back_keys = LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE;
   uint16_t add = 0;
   if (g_menu_back_keys &&
-      ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000)))
+      (ge::platform::KeyDown(ge::platform::vk::kEscape) || ge::platform::KeyDown(ge::platform::vk::kRButton)))
     add |= BTN_B;
   if (ge_key_down("ge_key_a")) add |= BTN_A;
   if (ge_key_down("ge_key_b")) add |= BTN_B;
@@ -3643,12 +3418,12 @@ static void ge_keyboard_buttons(uint8_t* base) {
   // like Escape, and the Up/Down arrows move like W/S (below).
   const bool debug_menu = base[0x82F0CB98u] != 0;
   if (debug_menu) {
-    if (GetAsyncKeyState(VK_RETURN) & 0x8000) {
+    if (ge::platform::KeyDown(ge::platform::vk::kReturn)) {
       add |= BTN_A;
-      if (!(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) add &= static_cast<uint16_t>(~BTN_START);
+      if (!ge::platform::KeyDown(ge::platform::vk::kEscape)) add &= static_cast<uint16_t>(~BTN_START);
     }
     // Exactly what Escape does here: B on the front end, Start in a mission.
-    if (GetAsyncKeyState(VK_BACK) & 0x8000) add |= g_menu_back_keys ? BTN_B : BTN_START;
+    if (ge::platform::KeyDown(ge::platform::vk::kBack)) add |= g_menu_back_keys ? BTN_B : BTN_START;
   }
   if (add) ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | add);
 
@@ -3660,8 +3435,8 @@ static void ge_keyboard_buttons(uint8_t* base) {
   if (ge_key_down("ge_key_mv_right")) lx = 32767;
   if (ge_key_down("ge_key_mv_up")) ly = 32767;
   if (ge_key_down("ge_key_mv_down")) ly = -32767;
-  if (debug_menu && (GetAsyncKeyState(VK_UP) & 0x8000)) ly = 32767;
-  if (debug_menu && (GetAsyncKeyState(VK_DOWN) & 0x8000)) ly = -32767;
+  if (debug_menu && ge::platform::KeyDown(ge::platform::vk::kUp)) ly = 32767;
+  if (debug_menu && ge::platform::KeyDown(ge::platform::vk::kDown)) ly = -32767;
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 
@@ -3762,29 +3537,28 @@ void ge_frigate_mp_doors(uint8_t* base) {
 // (it runs on the game thread, so its cost comes out of the frame).
 namespace {
 struct PollTimer {
-  LARGE_INTEGER t0;
-  PollTimer() { QueryPerformanceCounter(&t0); }
+  int64_t t0;
+  PollTimer() : t0(ge::platform::PerfCounter()) {}
   ~PollTimer() {
     static uint32_t poll = 0;
     static bool on = false;
     if ((poll++ & 0x3F) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
     if (!on) return;
-    static LARGE_INTEGER freq{}, start{};
+    static int64_t freq = 0, start = 0;
     static uint64_t count = 0;
     static double sum_us = 0.0, max_us = 0.0;
-    LARGE_INTEGER t1;
-    QueryPerformanceCounter(&t1);
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    if (!start.QuadPart) start = t1;
-    const double us = double(t1.QuadPart - t0.QuadPart) * 1e6 / double(freq.QuadPart);
+    const int64_t t1 = ge::platform::PerfCounter();
+    if (!freq) freq = ge::platform::PerfFrequency();
+    if (!start) start = t1;
+    const double us = double(t1 - t0) * 1e6 / double(freq);
     ++count;
     sum_us += us;
     max_us = std::max(max_us, us);
-    if (t1.QuadPart - start.QuadPart >= 10 * freq.QuadPart) {
-      const double secs = double(t1.QuadPart - start.QuadPart) / double(freq.QuadPart);
+    if (t1 - start >= 10 * freq) {
+      const double secs = double(t1 - start) / double(freq);
       REXKRNL_INFO("ge input poll: {:.1f}/s, hook {:.1f} us avg, {:.1f} us max, {:.2f} ms/s total, focus {}",
                    double(count) / secs, sum_us / double(count), max_us, sum_us / 1000.0 / secs,
-                   ge_game_has_focus());
+                   ge::platform::GameHasFocus());
       start = t1;
       count = 0;
       sum_us = max_us = 0.0;
@@ -3846,7 +3620,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // "STARTING MATCH" notice can show while the match loads (no polls then).
   {
     const uint32_t menu = LD32(base, 0x8272B35Cu);
-    g_lobby_poll_ms.store(menu == 31u || menu == 37u ? GetTickCount64() : 0, std::memory_order_relaxed);
+    g_lobby_poll_ms.store(menu == 31u || menu == 37u ? ge::platform::TicksMs() : 0, std::memory_order_relaxed);
     ge::LobbyPollTick(base, menu);
   }
 
@@ -3905,7 +3679,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   }
   ge_watch_kbd_input(base);
   // Character select: left click is not Fire there (see ge_charsel_tick).
-  if (g_charsel_active && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) base[GE_PAD0 + 3] = 0;
+  if (g_charsel_active && ge::platform::KeyDown(ge::platform::vk::kLButton)) base[GE_PAD0 + 3] = 0;
 }
 
 // ===========================================================================

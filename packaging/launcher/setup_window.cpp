@@ -386,7 +386,7 @@ void SetupWindow::Paint(HDC dc) {
 
     // Heading.
     PaintText(g, L"GOLDENEYE 007", brand_.get(), ink::Text, RectF(164, 64, 400, 48));
-    PaintText(g, std::wstring(L"PC CONVERSION  ") + kDot + L"  V" + kVersion, tag_.get(), ink::Muted,
+    PaintText(g, std::wstring(L"PC CONVERSION  ") + kDot + L"  V" + Widen(kVersion), tag_.get(), ink::Muted,
               RectF(170, 114, 340, 20));
     const wchar_t* title = mode_ == Mode::Ready      ? L"RE: READY FOR DUTY"
                            : mode_ == Mode::Importing ? L"RE: IMPORTING YOUR GAME"
@@ -409,7 +409,7 @@ void SetupWindow::Paint(HDC dc) {
         const Source& s = candidates_[i];
         std::wstring text = (s.kind == SourceKind::PreviousInstall ? L"Previous install  " : L"") + s.path.wstring();
         PaintText(g, text, small_.get(), ink::Text, RectF(r.x + 28, r.y + 5, r.w - 120, 22));
-        PaintText(g, FormatMB(s.bytes), small_.get(), ink::Muted, RectF(r.x + r.w - 92, r.y + 5, 88, 22),
+        PaintText(g, Widen(FormatMB(s.bytes)), small_.get(), ink::Muted, RectF(r.x + r.w - 92, r.y + 5, 88, 22),
                   StringAlignmentFar);
       }
     } else {
@@ -479,7 +479,7 @@ void SetupWindow::Paint(HDC dc) {
 
 // ---------------------------------------------------------------- flow --
 void SetupWindow::Start() {
-  std::wstring missing;
+  std::string missing;
   installed_ = IsInstalled(p_, &missing);
   // The extras start unticked on a first setup, where an unticked box changes
   // nothing. Reopened with --setup they show what is set, and unticking one
@@ -563,13 +563,13 @@ void SetupWindow::SelectPath(const fs::path& path) {
   detail_.clear();
   show_bar_ = false;
   SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-  std::wstring why;
+  std::string why;
   std::vector<Source> found = SourcesIn(path, &why);
   if (found.empty()) {
-    Log(L"Rejected " + path.wstring() + L": " + why);
+    Log(L"Rejected " + path.wstring() + L": " + Widen(why));
     if (mode_ == Mode::Choosing) mode_ = Mode::Idle;
     if (installed_) mode_ = Mode::Ready;
-    status_ = why;
+    status_ = Widen(why);
     status_color_ = ink::Red;
     Invalidate();
     return;
@@ -589,13 +589,13 @@ void SetupWindow::StartImport(Source source) {
   if (worker_.joinable()) worker_.join();
   mode_ = Mode::Importing;
   candidates_.clear();
-  path_text_ = Describe(source);
+  path_text_ = Widen(Describe(source));
   path_set_ = true;
   heading_ = L"Importing your game data";
   hint_ = L"Your package is only read, never changed. Nothing is installed outside this folder.";
   status_ = L"✓  GoldenEye 007  " + std::wstring(kDot) + L"  " +
             (source.kind == SourceKind::PreviousInstall ? L"previous install" : L"Xbox LIVE Arcade package") +
-            L"  " + kDot + L"  " + FormatMB(source.bytes);
+            L"  " + kDot + L"  " + Widen(FormatMB(source.bytes));
   status_color_ = ink::Ok;
   phase_ = L"PREPARING";
   phase_color_ = ink::Phase;
@@ -608,8 +608,8 @@ void SetupWindow::StartImport(Source source) {
   const fs::path saves_from = source.kind == SourceKind::PreviousInstall ? source.path : FindPreviousInstall(p_);
   HWND hwnd = hwnd_;
   worker_ = std::thread([this, hwnd, source, saves_from]() {
-    ImportResult* result = new ImportResult(Import(p_, source, saves_from, cancel_, [hwnd](int percent, const std::wstring& phase, const std::wstring& detail) {
-      PostMessageW(hwnd, WM_APP_PROGRESS, 0, reinterpret_cast<LPARAM>(new ProgressMsg{percent, phase, detail}));
+    ImportResult* result = new ImportResult(Import(p_, source, saves_from, cancel_, [hwnd](int percent, const std::string& phase, const std::string& detail) {
+      PostMessageW(hwnd, WM_APP_PROGRESS, 0, reinterpret_cast<LPARAM>(new ProgressMsg{percent, Widen(phase), Widen(detail)}));
     }));
     PostMessageW(hwnd, WM_APP_DONE, 0, reinterpret_cast<LPARAM>(result));
   });
@@ -637,7 +637,7 @@ void SetupWindow::OnDone(ImportResult* result) {
     progress_ = 100;
     phase_ = L"READY FOR DUTY";
     phase_color_ = ink::Ok;
-    detail_ = result->migrated.empty() ? L"Game data imported into resources\\assets." : result->migrated;
+    detail_ = result->migrated.empty() ? std::wstring(L"Game data imported into resources\\assets.") : Widen(result->migrated);
     status_ = L"✓  Imported and verified. Press Play when you are ready.";
     status_color_ = ink::Ok;
     if (GetForegroundWindow() != hwnd_) {
@@ -649,7 +649,7 @@ void SetupWindow::OnDone(ImportResult* result) {
     show_bar_ = false;
     phase_ = result->cancelled ? L"IMPORT CANCELLED" : L"IMPORT DID NOT COMPLETE";
     phase_color_ = ink::Red;
-    status_ = result->message;
+    status_ = Widen(result->message);
     status_color_ = result->cancelled ? ink::Muted : ink::Red;
     detail_ = result->cancelled ? L"" : L"Your package was not changed. Details: resources\\runtime\\logs\\setup.log";
     heading_ = installed_ ? L"GoldenEye 007 is installed in this folder" : L"Select your Xbox 360 GoldenEye 007 package";
@@ -662,17 +662,17 @@ void SetupWindow::OnDone(ImportResult* result) {
 }
 
 void SetupWindow::Play() {
-  const std::wstring note = ApplyExtras(p_, want_, was_, options_.shortcut_folder, [this](const fs::path& link) {
+  const std::string note = ApplyExtras(p_, want_, was_, options_.shortcut_folder, [this](const fs::path& link) {
     const std::wstring text = L"There is already a GoldenEye 007 shortcut on your desktop that opens a different copy:\n\n" +
                               link.wstring() + L"\n\nReplace it with one for this folder?";
     return MessageBoxW(hwnd_, text.c_str(), L"GoldenEye 007", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
   });
   was_ = want_;
-  if (!note.empty()) MessageBoxW(hwnd_, note.c_str(), L"GoldenEye 007", MB_OK | MB_ICONINFORMATION);
-  std::wstring error;
+  if (!note.empty()) MessageBoxW(hwnd_, Widen(note).c_str(), L"GoldenEye 007", MB_OK | MB_ICONINFORMATION);
+  std::string error;
   if (!LaunchGame(p_, options_.game_args, &error)) {
-    Log(L"FAILED to start the game: " + error);
-    MessageBoxW(hwnd_, error.c_str(), L"GoldenEye 007", MB_OK | MB_ICONERROR);
+    Log("FAILED to start the game: " + error);
+    MessageBoxW(hwnd_, Widen(error).c_str(), L"GoldenEye 007", MB_OK | MB_ICONERROR);
     return;
   }
   Log(L"Play: game started.");
@@ -852,7 +852,7 @@ int SetupWindow::Run(HINSTANCE instance) {
 }  // namespace
 
 int RunSetupWindow(HINSTANCE instance, const Paths& p, const SetupOptions& options) {
-  Log(L"Setup opened" + (options.reason.empty() ? std::wstring() : L" (" + options.reason + L")"));
+  Log(L"Setup opened" + (options.reason.empty() ? std::wstring() : L" (" + Widen(options.reason) + L")"));
   SetupWindow window(p, options);
   return window.Run(instance);
 }

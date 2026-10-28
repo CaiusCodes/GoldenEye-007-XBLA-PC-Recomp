@@ -2,7 +2,7 @@ GOLDENEYE 007 XBLA PC RECOMP
 ============================
 Version @VERSION@
 
-A native Windows PC version of GoldenEye 007, based on the unreleased Xbox
+A native Windows and Linux PC version of GoldenEye 007, based on the unreleased Xbox
 360 / Xbox LIVE Arcade remaster, created through static recompilation with
 ReXGlue. It builds on the GoldenEye Recomp project and the GoldenEye Recomp
 community fixes.
@@ -24,6 +24,10 @@ Requirements:
   Windows 10 or 11 (64-bit) and a DirectX 12 capable graphics card.
   Nothing else needs installing: the Microsoft Visual C++ runtime the game
   uses is included.
+  Linux (64-bit x86-64): a CPU with AVX2 (any made since about 2013-2015), a
+  Vulkan 1.1 or newer graphics driver, an X11 or Wayland desktop and
+  PipeWire, PulseAudio or ALSA for sound. Nothing else needs installing
+  beyond the usual system libraries of a desktop distribution.
 
 FIRST-TIME SETUP
 ----------------
@@ -47,6 +51,40 @@ Setup only reads your package; it never changes, moves or deletes it, and
 it is not needed again. Nothing is installed outside this folder and no
 administrator rights are needed. It does not download anything and does
 not contact Xbox LIVE.
+
+FIRST-TIME SETUP ON LINUX
+-------------------------
+
+1. Extract the release tar.gz to a writable folder, for example
+     tar -xzf GoldenEye-007-XBLA-PC-Recomp-v@VERSION@-linux-amd64.tar.gz
+   You get one folder, "GoldenEye 007".
+   Tip: put your package file beside "GoldenEye 007", or in a folder called
+   "Game Package" next to it, and it is found automatically.
+2. Run "GoldenEye 007" (double-click it in your file manager, or
+   ./"GoldenEye 007" from a terminal). The first time, the setup window
+   opens, the same one as on Windows.
+3. If your package was found it is checked and imported straight away.
+   Otherwise drag the package (the 30BA9271... file) or the folder holding it
+   onto the window, or click "Browse package". Setup checks it first and
+   tells you if it is the wrong file or an unsupported version.
+4. Tick any optional extras (all off unless asked for): start in fullscreen,
+   create a desktop entry, 100% game completion.
+5. Press Play.
+
+Without a desktop (SSH, a console) or with --cli, setup runs in the
+terminal instead: it asks the same questions, or takes them from the
+command line:
+     ./"GoldenEye 007" --package /path/to/your/package
+     ./"GoldenEye 007" --extras fullscreen,shortcut,complete --unattended
+   (fullscreen = start in fullscreen, shortcut = create a desktop entry,
+   complete = 100% game completion; --unattended asks nothing and does not
+   start the game.)
+
+From then on, running ./"GoldenEye 007" starts the game straight away. Use
+--setup to run setup again. The desktop shortcut extra writes a desktop
+entry to ~/.local/share/applications; delete that file to remove it.
+Nothing else is installed outside this folder and no administrator rights
+are needed.
 
 CONTROLS
 --------
@@ -104,6 +142,11 @@ may use the network; allow it on private and public networks (virtual LANs
 often count as public). If the game picks the wrong network adapter, set
 net_address in resources\userdata\ge.toml to your virtual LAN address.
 
+On Linux, allow UDP traffic for the game program
+(resources/runtime/GoldenEye 007) through your firewall (for example
+ufw or firewalld) when hosting or joining a LAN game. Set net_address in
+resources/userdata/ge.toml if the wrong network adapter is used.
+
 PORTABLE DATA
 -------------
 
@@ -122,6 +165,19 @@ Everything stays inside the extracted "GoldenEye 007" folder:
 Paths are relative, so the folder can be moved or copied anywhere (a USB
 drive works too). To back up your progress, copy resources\userdata.
 
+On Linux the same layout applies, with / in the paths:
+
+  GoldenEye 007              Run this to play (and to set up the first time)
+  README.txt, licenses/      This file and the third-party notices
+  resources/
+    runtime/                 The game program, its .so libraries and the
+                             port's own pictures
+      logs/                  Game and setup logs
+    assets/                  Game data imported from your package
+    userdata/ge.toml         Settings, saves and caches (userdata/)
+
+To back up your progress, copy resources/userdata.
+
 SETUP AGAIN, UPDATING AND OLDER RELEASES
 ----------------------------------------
 
@@ -130,6 +186,9 @@ To change your extras or import your package again, start the game with
 "GoldenEye 007.exe" --setup). Importing again replaces resources\assets only;
 saves and settings in resources\userdata are kept. If a needed file goes
 missing, opening GoldenEye 007.exe shows the setup window again by itself.
+
+On Linux, run ./"GoldenEye 007" --setup to change your extras or import
+your package again; resources/assets is replaced, resources/userdata is kept.
 
 To update, extract a new release over this folder (your resources\assets
 and resources\userdata are kept), or into a new folder: setup finds the old
@@ -149,6 +208,22 @@ Extract the ZIP first. Do not run GoldenEye 007.exe from inside the ZIP.
 GoldenEye 007.exe is not digitally signed, so the first time you open it
 Windows may show "Windows protected your PC". Choose More info, then Run
 anyway.
+
+On Linux:
+  Extract the tar.gz first and keep the executable bits (use tar, not a
+  tool that drops permissions). If double-clicking does nothing, run
+  ./"GoldenEye 007" from a terminal to see messages.
+  "No Vulkan device" or a crash at start: install your GPU's Vulkan driver
+  (Mesa vulkan packages such as mesa-vulkan-drivers on Debian/Ubuntu or
+  vulkan-radeon / vulkan-intel on Arch, or the NVIDIA driver) and check
+  that "vulkaninfo" lists a device. Vulkan 1.1 or newer is required.
+  The game always uses Vulkan on Linux; the gpu setting in ge.toml is
+  ignored there.
+  To change settings by hand, edit resources/userdata/ge.toml with any
+  text editor while the game is closed. Logs are in resources/runtime/logs;
+  include the newest ones when reporting a problem.
+  Under Wayland the window may not be centred and the pointer may not be
+  repositioned by the game; this does not affect play.
 
 If setup rejects your package, the reason is shown in the window and in
 resources\runtime\logs\setup.log. When reporting a problem, include the

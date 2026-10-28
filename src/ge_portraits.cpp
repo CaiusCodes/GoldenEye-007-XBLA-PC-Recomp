@@ -13,10 +13,13 @@
 // costumes) borrowed Bond's, Natalya's and Trevelyan's photos; they show "?"
 // until they have their own.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -28,14 +31,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <wincodec.h>
+#include <rex/ui/image_decode.h>
 
 namespace ge {
 bool SetGameText(uint8_t* base, uint32_t id, const std::string& text);  // ge_native_menu.cpp
@@ -92,32 +88,44 @@ void AssignPictures(uint8_t* base) {
 
 // A PNG scaled to kPicW x kPicH, as RGBA rows; empty if it cannot be read.
 std::vector<uint8_t> LoadPicture(const std::filesystem::path& path) {
-  std::vector<uint8_t> out;
-  const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-  IWICImagingFactory* factory = nullptr;
-  IWICBitmapDecoder* decoder = nullptr;
-  IWICBitmapFrameDecode* frame = nullptr;
-  IWICBitmapScaler* scaler = nullptr;
-  IWICFormatConverter* conv = nullptr;
-  if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                 IID_PPV_ARGS(&factory))) &&
-      SUCCEEDED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                   WICDecodeMetadataCacheOnDemand, &decoder)) &&
-      SUCCEEDED(decoder->GetFrame(0, &frame)) && SUCCEEDED(factory->CreateBitmapScaler(&scaler)) &&
-      SUCCEEDED(scaler->Initialize(frame, kPicW, kPicH, WICBitmapInterpolationModeFant)) &&
-      SUCCEEDED(factory->CreateFormatConverter(&conv)) &&
-      SUCCEEDED(conv->Initialize(scaler, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
-                                 nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
-    out.resize(kPicW * kPicH * 4);
-    if (FAILED(conv->CopyPixels(nullptr, kPicW * 4, static_cast<UINT>(out.size()), out.data())))
-      out.clear();
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return {};
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),
+                                   std::istreambuf_iterator<char>());
+  int w = 0, h = 0;
+  std::vector<uint8_t> src = rex::ui::DecodeImageRGBA(bytes.data(), bytes.size(), w, h);
+  if (src.empty() || w <= 0 || h <= 0 || src.size() < size_t(w) * size_t(h) * 4) {
+    REXKRNL_WARN("GEPORTRAIT could not decode {}", path.string());
+    return {};
   }
-  if (conv) conv->Release();
-  if (scaler) scaler->Release();
-  if (frame) frame->Release();
-  if (decoder) decoder->Release();
-  if (factory) factory->Release();
-  if (SUCCEEDED(co)) CoUninitialize();
+  if (w == kPicW && h == kPicH) return src;
+  // Box (area-average) filter into kPicW x kPicH; each destination texel
+  // averages the source rectangle it covers, weighted by overlap.
+  std::vector<uint8_t> out(size_t(kPicW) * kPicH * 4);
+  for (int y = 0; y < kPicH; ++y) {
+    const double y0 = double(y) * h / kPicH, y1 = double(y + 1) * h / kPicH;
+    for (int x = 0; x < kPicW; ++x) {
+      const double x0 = double(x) * w / kPicW, x1 = double(x + 1) * w / kPicW;
+      double sum[4] = {0, 0, 0, 0}, total = 0;
+      for (int sy = int(y0); sy < h && sy < y1; ++sy) {
+        const double wy = std::min<double>(sy + 1, y1) - std::max<double>(sy, y0);
+        for (int sx = int(x0); sx < w && sx < x1; ++sx) {
+          const double wt = wy * (std::min<double>(sx + 1, x1) - std::max<double>(sx, x0));
+          const uint8_t* p = &src[(size_t(sy) * w + sx) * 4];
+          const double a = wt * p[3];  // alpha-weighted colour
+          sum[0] += a * p[0]; sum[1] += a * p[1]; sum[2] += a * p[2]; sum[3] += a;
+          total += wt;
+        }
+      }
+      uint8_t* d = &out[(size_t(y) * kPicW + x) * 4];
+      if (sum[3] > 0 && total > 0) {
+        for (int c = 0; c < 3; ++c) d[c] = uint8_t(sum[c] / sum[3] + 0.5);
+        d[3] = uint8_t(sum[3] / total + 0.5);
+      } else {
+        d[0] = d[1] = d[2] = d[3] = 0;
+      }
+    }
+  }
   return out;
 }
 

@@ -44,6 +44,7 @@ set(GE_SOURCES
     src/ge_native_menu.cpp
     src/ge_portraits.cpp
     src/ge_gpu_detect.cpp
+    src/ge_platform.cpp
 )
 
 # The release version: VERSION is the single source of truth (Make-Release.ps1
@@ -98,9 +99,11 @@ rexglue_setup_target(ge GPU_PLUGINS xenos)
 # float results identical to the guest (no fused multiply-add).
 target_compile_options(ge PRIVATE -march=x86-64-v3 -ffp-contract=off)
 
-# Character pictures are read with WIC (ge_portraits.cpp).
-if(WIN32)
-    target_link_libraries(ge PRIVATE windowscodecs ole32)
+if(NOT WIN32)
+    # NVML (ge_gpu_detect.cpp) is loaded with dlopen.
+    target_link_libraries(ge PRIVATE ${CMAKE_DL_LIBS})
+    # The setup/launcher CLI (the Windows one is built by packaging/Build-Launcher.ps1).
+    add_subdirectory(packaging/launcher)
 endif()
 
 # ge_version_rc.h for GoldenEye.rc (see the VERSION block above).
