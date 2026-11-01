@@ -1285,16 +1285,18 @@ uint32_t copy_to_presenter_vk() {
 // the screen (the logo spin, intro and videos looked uneven). The moment is now
 // `margin_us` after `paced` (the frame's paced present moment on the game
 // thread): Direct3D 12 hands the frame over right then (2 ms is plenty);
-// Vulkan hands it over on a worker after waiting for the GPU, and anchoring to
-// that jittery hand-over still lost ~6 frames a second, so it anchors to the
-// steady paced moment with the full offset.
+// Vulkan hands it over on a worker after waiting for the GPU, up to ~5 ms
+// after the paced moment: anchoring to that jittery hand-over lost ~6 frames
+// a second, and the paced moment plus the 5 ms offset still lost ~2 (frames
+// arriving just after it), so Vulkan anchors to the steady paced moment with
+// 9 ms (the reported vblank may then lie a little in the future).
 void report_frame_to_presenter(rex::ui::Presenter* presenter, std::chrono::steady_clock::time_point paced,
                                int64_t margin_us) {
   static const int64_t offset_us = [] {
     const std::string v = rex::cvar::GetFlagByName("present_pacing_offset_us");
     return v.empty() ? int64_t(5000) : std::atoll(v.c_str());
   }();
-  const int64_t lead_us = std::max<int64_t>(0, offset_us - margin_us);
+  const int64_t lead_us = margin_us < offset_us ? offset_us - margin_us : -(margin_us - offset_us);
   presenter->OnGuestVblank(paced - std::chrono::microseconds(lead_us));
 }
 
@@ -1322,7 +1324,7 @@ void present_to_presenter_vk(uint32_t k) {
   g.out.vk_handoff[g.slot] = ge::native_vk::PresentAsync(
       k, &c, kind, g.gamma_ramp_version ? ramp : nullptr, ramp_version,
       [dev, fence] { vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX); },
-      [presenter, paced] { report_frame_to_presenter(presenter, paced, 5000); });
+      [presenter, paced] { report_frame_to_presenter(presenter, paced, 9000); });
 }
 
 // Copies the frame Swap was given into shared frame k (recorded at the end of
