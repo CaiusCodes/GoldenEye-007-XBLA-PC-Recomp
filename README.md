@@ -49,7 +49,7 @@ package is not needed again. Everything stays inside the extracted folder
 (`resources\assets` for the imported game data, `resources\userdata` for user save data
 and settings), so it can be moved or backed up as a whole.
 To open setup again (change extras, re-import), hold **Shift** while opening
-`GoldenEye 007.exe`, or choose Help & Options > Video Settings > **Run Setup
+`GoldenEye 007.exe`, or choose Help & Options > Other Settings > **Run Setup
 Again** in the game.
 Coming from an older release with `Setup GoldenEye 007.exe` and a `Game`
 folder? Extract into or next to the old folder and setup imports straight
@@ -88,9 +88,10 @@ neither setup nor the game contacts Xbox Live.
   Tailscale and Hamachi
   ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
-  (display mode, V-Sync, FPS counter, field of view, anti-aliasing,
-  resolution, screen ratio, render scale, FSR upscaling, post-processing
-  colour filter, Run Setup Again) and Online Settings. The new renderer uses
+  (display mode, resolution, screen ratio, V-Sync, render scale, FSR
+  upscaling, texture filtering, anti-aliasing, post-processing colour filter,
+  field of view, FPS counter), Online Settings, and Other Settings (with Run
+  Setup Again). The new renderer uses
   Direct3D 12 and switches to Vulkan by itself if Direct3D 12 can't start;
   `gpu_native_api = "vulkan"` in `ge.toml` picks Vulkan
   ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)

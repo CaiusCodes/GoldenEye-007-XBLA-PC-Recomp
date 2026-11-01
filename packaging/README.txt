@@ -79,15 +79,16 @@ SETTINGS
 Help & Options on the main menu holds the PC settings:
   Keyboard & Mouse   mouse look, sensitivity, precise aim sensitivity,
                      invert look, key bindings
-  Video Settings     windowed or fullscreen, V-Sync, FPS counter, field of
-                     view, anti-aliasing, window size (up to 3840x2160),
+  Video Settings     windowed or fullscreen, window size (up to 3840x2160),
                      screen ratio (4:3, 16:9 or 21:9; the window sizes
-                     offered follow it), render scale (1x = 1280x720 by
-                     default; 2x and 3x look sharper, need a stronger
-                     graphics card and restart the game), FSR upscaling
-                     (on or off), post-processing (colour filter) and Run
-                     Setup Again
+                     offered follow it), V-Sync, render scale (1x =
+                     1280x720 by default; 2x and 3x look sharper, need a
+                     stronger graphics card and restart the game),
+                     upscaling (FSR or off), texture filtering,
+                     anti-aliasing, post-processing (colour filter), field
+                     of view, FPS counter
   Online Settings    player name and the online server options
+  Other Settings     the game's own options, plus Run Setup Again
 
 MULTIPLAYER OVER LAN OR A VIRTUAL LAN
 -------------------------------------
@@ -129,7 +130,7 @@ SETUP AGAIN, UPDATING AND OLDER RELEASES
 
 To change your extras or import your package again, open the setup window:
 hold Shift while opening GoldenEye 007.exe (or its shortcut), or choose
-Help & Options > Video Settings > Run Setup Again in the game. Starting
+Help & Options > Other Settings > Run Setup Again in the game. Starting
 GoldenEye 007.exe with --setup works too. Importing again replaces resources\assets only;
 saves and settings in resources\userdata are kept. If a needed file goes
 missing, opening GoldenEye 007.exe shows the setup window again by itself.
