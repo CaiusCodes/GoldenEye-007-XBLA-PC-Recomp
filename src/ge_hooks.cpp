@@ -2307,6 +2307,41 @@ static bool ge_menu_cursor_limits(float& min_x, float& max_x, float& min_y, floa
   return true;
 }
 
+// The mouse-driven menu crosshair (ge_menu_cursor_from_pointer, once a frame).
+struct MenuPointer {
+  POINT last{-1, -1};                     // pointer as we last left it (-1: not driving)
+  float last_x = -1e9f, last_y = -1e9f;   // crosshair as we last left it
+  float game_x = -1e9f, game_y = -1e9f;   // where the game last moved it against us
+  uint32_t calls = 0, restored_at = 0;    // frames, and the frame of that restore
+};
+static MenuPointer g_menu_ptr;
+
+// The game jumps the crosshair when a menu opens: put it back where the mouse
+// left it, as a Windows pointer would stay. If the game puts it straight back
+// to the same spot within a few frames, the mouse is outside the area the game
+// allows (for example after the window shrank): that jump is accepted and the
+// pointer moves there, so the two never lock up. Only straight away:
+// re-entering a menu later jumps to the same spot as last time, and taking that
+// as "insisting" moved the crosshair (Help & Options > back > Help & Options).
+// Called from the game's own per-frame crosshair clamp too (before the menu is
+// drawn), so the jumped crosshair never shows for a frame.
+static bool ge_menu_cursor_restore_jump(uint8_t* base) {
+  MenuPointer& m = g_menu_ptr;
+  if (m.last.x < 0) return false;
+  const float cx = LDF32(base, GE_MENU_XY);
+  const float cy = LDF32(base, GE_MENU_XY + 4);
+  const float jump = std::max(std::fabs(cx - m.last_x), std::fabs(cy - m.last_y));
+  const bool game_insists = std::fabs(cx - m.game_x) <= 0.5f && std::fabs(cy - m.game_y) <= 0.5f &&
+                            m.calls - m.restored_at <= 3;
+  if (jump <= 12.f || game_insists) return false;
+  m.game_x = cx;
+  m.game_y = cy;
+  m.restored_at = m.calls;
+  STF32(base, GE_MENU_XY, m.last_x);
+  STF32(base, GE_MENU_XY + 4, m.last_y);
+  return true;
+}
+
 void ge_menu_cursor_clamp_x() {
   PPCContext* ctx; uint8_t* base; getcb(ctx, base);
   float lo, hi, y0, y1;
@@ -2323,6 +2358,7 @@ void ge_menu_cursor_clamp_y() {
   float y = LDF32(base, GE_MENU_XY + 4);
   y = std::clamp(y, lo, hi);
   STF32(base, GE_MENU_XY + 4, y);
+  if (LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE) ge_menu_cursor_restore_jump(base);
 }
 
 
@@ -2334,8 +2370,9 @@ void ge_menu_cursor_clamp_y() {
 // the pointer is not confined to the window (unfocused, mouse-look off) or a
 // mission is running.
 bool ge_menu_cursor_from_pointer(uint8_t* base) {
-  static POINT last{-1, -1};
-  static float last_x = -1e9f, last_y = -1e9f;  // crosshair as we last left it
+  POINT& last = g_menu_ptr.last;
+  float& last_x = g_menu_ptr.last_x;
+  float& last_y = g_menu_ptr.last_y;
   // Follow the pointer whenever the game has focus in the front-end menus,
   // whatever state the in-mission mouse capture was left in (after Abort
   // Mission it could stay released, so the crosshair stopped moving).
@@ -2382,28 +2419,8 @@ bool ge_menu_cursor_from_pointer(uint8_t* base) {
       return true;
   }
   const float jump = std::max(std::fabs(cx - last_x), std::fabs(cy - last_y));
-  // Where and when (call count) the game last moved the crosshair against us.
-  static float game_x = -1e9f, game_y = -1e9f;
-  static uint32_t calls = 0, restored_at = 0;
-  ++calls;
-  const bool game_insists = std::fabs(cx - game_x) <= 0.5f && std::fabs(cy - game_y) <= 0.5f &&
-                            calls - restored_at <= 3;
-  if (last.x >= 0 && jump > 12.f && !game_insists) {
-    // The game jumped the crosshair (a new menu opened): keep it where the
-    // mouse is instead, as a Windows pointer would stay. If the game puts it
-    // straight back to the same spot within a few frames, the mouse is outside
-    // the area the game allows (for example after the window shrank): that
-    // jump is accepted and the pointer moves there, so the two never lock up.
-    // Only straight away: re-entering a menu later jumps to the same spot as
-    // last time, and taking that as "insisting" moved the crosshair (Help &
-    // Options > back > Help & Options, or Dam > back > Dam).
-    game_x = cx;
-    game_y = cy;
-    restored_at = calls;
-    STF32(base, GE_MENU_XY, last_x);
-    STF32(base, GE_MENU_XY + 4, last_y);
-    return true;
-  }
+  ++g_menu_ptr.calls;
+  if (ge_menu_cursor_restore_jump(base)) return true;
   if (last.x < 0 || jump > 0.5f) {
     // Put the pointer on the crosshair.
     const PictureRect pic = ge_menu_rect(rc);

@@ -50,6 +50,12 @@ int ActiveRenderScale();  // ge_native_menu.cpp
 bool BackdropActiveNow();  // ge_native_menu.cpp: the desk goes behind this frame
 void PersistSettings();
 [[noreturn]] void RestartSelf();  // ge_hooks.cpp
+// Texture Filtering (anisotropic_override): set by the setting, which the
+// native renderer registers itself (ge_app.h); sampler_slot reads it for every
+// new sampler, so a change applies at once.
+std::atomic<int> g_native_aniso{3};
+void SetNativeAnisotropy(int value) { g_native_aniso.store(value, std::memory_order_relaxed); }
+int NativeAnisotropy() { return g_native_aniso.load(std::memory_order_relaxed); }
 }  // namespace ge
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -2597,10 +2603,7 @@ uint32_t sampler_slot(uint32_t dev, uint32_t sampler, uint32_t tex) {
   const uint32_t clamp_x = (d0 >> 10) & 7, clamp_y = (d0 >> 13) & 7, mag = (d3 >> 19) & 3, min = (d3 >> 21) & 3;
   const uint32_t mip = (d3 >> 23) & 3, mip_min = (d4 >> 2) & 0xF, mip_max = std::max((d4 >> 6) & 0xF, mip_min);
   const int32_t bias = int32_t(d4 << 10) >> 22;  // bits 12-21, sign-extended
-  static const int32_t override_aniso = [] {
-    const std::string v = rex::cvar::GetFlagByName("anisotropic_override");
-    return v.empty() ? 3 : std::atoi(v.c_str());
-  }();
+  const int32_t override_aniso = ge::g_native_aniso.load(std::memory_order_relaxed);
   uint32_t aniso = (d3 >> 25) & 7;
   if (override_aniso > -1 && override_aniso < 6 && mip != 2 && mag == 1 && min == 1 && mip_max > 0) aniso = uint32_t(override_aniso);
   aniso = std::min<uint32_t>(aniso, 5);

@@ -411,6 +411,7 @@ std::vector<Row> BuildPage(Page page) {
       AddAction(rows, "Done", [] { g_page = Page::Keyboard; });
       break;
     case Page::Video: {
+      // Order: display and window first, then picture quality, then the rest.
       AddAction(
           rows, "Display Mode:",
           [] {
@@ -420,20 +421,6 @@ std::vector<Row> BuildPage(Page page) {
             if (g_persist) g_persist();
           },
           [] { return std::string(GetB("fullscreen") ? "Fullscreen" : "Windowed"); });
-      rows.push_back(Row{RowKind::Toggle, "V-Sync:", "vsync"});
-      // No Frame Limit row: the game always runs at its own 60 FPS (its clock
-      // is the 60 Hz vblank; a lower cap slowed the game itself down).
-      rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
-      AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
-      // Native renderer: the scene's MSAA, applied at once (Off by default, the
-      // lightest); the classic renderer's FXAA post effect does nothing there.
-      if (g_renderer_active == 1)
-        AddChoice(rows, "Anti-Aliasing:", "gpu_native_msaa", {{"OFF", "1"}, {"2x", "2"}, {"4x", "4"}});
-      else
-        AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
-                  {{"OFF", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
-      // No Texture Filtering row: the native renderer always uses 4x
-      // anisotropic filtering (anisotropic_override in ge.toml still sets it).
       // Window size in windowed mode (fullscreen always uses the display). The
       // game keeps rendering the same way; the picture is scaled to the window.
       AddAction(
@@ -486,6 +473,7 @@ std::vector<Row> BuildPage(Page page) {
             SetWindowSize(*best);
           },
           [] { return EffectiveScreenRatio(); });
+      rows.push_back(Row{RowKind::Toggle, "V-Sync:", "vsync"});
       // No Graphics API row: Auto picks it (NVIDIA -> Direct3D 12, other GPUs
       // -> Vulkan); gpu = "d3d12" / "vulkan" in ge.toml still overrides it.
       AddAction(
@@ -506,19 +494,27 @@ std::vector<Row> BuildPage(Page page) {
           });
       // FSR (FSR 1 / CAS) or plain bilinear for stretching the Render Scale
       // picture to the window; applies at once.
-      AddChoice(rows, "FSR Upscaling:", "ge_upscaling", {{"ON", "on"}, {"OFF", "off"}});
+      AddChoice(rows, "Upscaling:", "ge_upscaling", {{"FSR", "on"}, {"OFF", "off"}});
+      // Texture Filtering: anisotropic filtering of the game's mipmapped
+      // textures, applied at once. The native renderer registers the setting
+      // itself (it is the classic renderer's), see ge_app.h.
+      AddChoice(rows, "Texture Filtering:", "anisotropic_override",
+                {{"Bilinear", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}});
+      // Native renderer: the scene's MSAA, applied at once (Off by default, the
+      // lightest); the classic renderer's FXAA post effect does nothing there.
+      if (g_renderer_active == 1)
+        AddChoice(rows, "Anti-Aliasing:", "gpu_native_msaa", {{"OFF", "1"}, {"2x", "2"}, {"4x", "4"}});
+      else
+        AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
+                  {{"OFF", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
       // No Renderer row: the classic Xenos renderer stays a ge.toml fallback
       // (gpu_native = false), read when the game starts.
       AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
-      // Re-run the launcher's setup (re-import the game, extras); closes the
-      // game. Only in the release layout, where the launcher exists.
-      static const bool have_launcher = !ge::LauncherPath().empty();
-      if (have_launcher) {
-        AddAction(rows, "Run Setup Again", [] {
-          ge::PersistSettings();
-          ge::RunSetupAgain();
-        });
-      }
+      AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
+      // No Frame Limit row: the game always runs at its own 60 FPS (its clock
+      // is the 60 Hz vblank; a lower cap slowed the game itself down).
+      rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
+      // Run Setup Again is the last row of Other Settings.
       AddAction(rows, "Done", [] {
         RestartIfRenderScaleChanged();
         g_leave_page = true;
@@ -1065,6 +1061,7 @@ constexpr uint32_t kOtherText = 0x8272C500;   // 16 bytes a row: label id, value
 constexpr uint32_t kOtherPos = 0x8272C580;    // label x, value x, first y, row spacing
 constexpr uint32_t kOtherHover = 0x8272C4FC;  // hovered row (screen position)
 constexpr int kCenterDotRow = 2;              // screen position of Show Crosshair
+constexpr int kSetupRow = 8;                  // screen position of Run Setup Again
 
 // The game's value for its row 2..6 (the getters its own draw calls).
 uint32_t OtherRowValue(PPCContext& ctx, uint8_t* base, int row) {
@@ -1095,8 +1092,27 @@ void ge_other_rows_draw() {
     const float value_x = LDF32(base, kOtherPos + 4);
     const float y0 = LDF32(base, kOtherPos + 8);
     const float step = LDF32(base, kOtherPos + 12);
-    const int hover = static_cast<int32_t>(LD32(base, kOtherHover));
     SetCustomText(base, kTxtFirstDynamic + 122, "Show Crosshair:");
+    // Run Setup Again (release layout only) as a ninth row under the game's
+    // eight. The game only hovers rows 0-7 (and keeps the last one hovered
+    // below them), so the crosshair over this row sets the hover here; the
+    // game then hands a select of it to ge_other_row_select as row 8.
+    static const bool have_launcher = !ge::LauncherPath().empty();
+    if (have_launcher) {
+      const float y8 = y0 + step * static_cast<float>(kSetupRow);
+      const float cy = LDF32(base, kCursorY);
+      if (cy >= y8 - 4.0f && cy < y8 - 4.0f + step) ST32(base, kOtherHover, kSetupRow);
+      SetCustomText(base, kTxtFirstDynamic + 123, "Run Setup Again");
+      const uint32_t label = LookupText(*ctx, base, kTxtFirstDynamic + 123);
+      if (static_cast<int32_t>(LD32(base, kOtherHover)) == kSetupRow) {
+        int w = 0, h = 0;
+        MeasureText(*ctx, base, sp, label, w, h);
+        const float pad = LDF32(base, kHighlightPad);
+        DrawBox(*ctx, base, 50, label_x - pad, y8 - pad, label_x - pad + w + 4, y8 - pad + h + 4);
+      }
+      DrawText(*ctx, base, sp, label, label_x, y8, 255);
+    }
+    const int hover_now = static_cast<int32_t>(LD32(base, kOtherHover));
     for (int pos = 2; pos <= 7; ++pos) {
       const float y = y0 + step * static_cast<float>(pos);
       uint32_t label_id, value_id;
@@ -1112,7 +1128,7 @@ void ge_other_rows_draw() {
         value_id = LD32(base, entry + 4 + value * 4);
       }
       const uint32_t label = LookupText(*ctx, base, label_id);
-      if (pos == hover) {
+      if (pos == hover_now) {
         int w = 0, h = 0;
         MeasureText(*ctx, base, sp, label, w, h);
         const float pad = LDF32(base, kHighlightPad);
@@ -1139,6 +1155,11 @@ void ge_other_row_select(PPCRegister& r11) {
     }
     *ctx = saved;
     r11.u64 = 0xFFFFFFFFu;  // nothing for the game to do
+  } else if (pos == kSetupRow) {
+    // Re-run the launcher's setup (re-import the game, extras); closes the game.
+    ge::PersistSettings();
+    ge::RunSetupAgain();
+    r11.u64 = 0xFFFFFFFFu;
   } else if (pos > kCenterDotRow && pos <= 7) {
     r11.u64 = static_cast<uint32_t>(pos - 1);
   }

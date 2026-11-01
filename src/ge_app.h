@@ -18,6 +18,7 @@
 #include <rex/ui/windowed_app_context.h>
 
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <string>
 
@@ -43,6 +44,9 @@ void LaunchSelfDetached();
 // start; ge_hooks.cpp). A normal close already ends with the SDK's "Window
 // closing" / "Title terminated" lines.
 void InstallCrashLog();
+// The native renderer's Texture Filtering (anisotropic_override; ge_native_gpu.cpp).
+void SetNativeAnisotropy(int value);
+int NativeAnisotropy();
 // The release launcher's path (empty in a dev build), and "Run Setup Again":
 // open its setup window and end the game.
 std::wstring LauncherPath();
@@ -205,6 +209,26 @@ class GeApp : public rex::ReXApp {
       register_bool("vsync", "GPU", "Enable vertical sync", &native_vsync);
       register_bool("vblank_timing_log", "Transient", "Log frame and present timing",
                     &native_timing_log);
+      // Texture Filtering (anisotropic_override, -1 = the game's own, 0 off,
+      // n = 2^(n-1)x): the renderer reads it live (ge_native_gpu.cpp).
+      {
+        rex::cvar::FlagEntry flag;
+        flag.name = "anisotropic_override";
+        flag.type = rex::cvar::FlagType::Int32;
+        flag.category = "GPU";
+        flag.description = "Texture filtering: -1 the game's own, 0 off, 3 4x, 4 8x, 5 16x";
+        flag.default_value = "3";
+        flag.setter = [](std::string_view v) {
+          const std::string s(v);
+          char* end = nullptr;
+          const long n = std::strtol(s.c_str(), &end, 10);
+          if (s.empty() || *end != '\0' || n < -1 || n > 5) return false;
+          ge::SetNativeAnisotropy(static_cast<int>(n));
+          return true;
+        };
+        flag.getter = [] { return std::to_string(ge::NativeAnisotropy()); };
+        rex::cvar::RegisterFlag(std::move(flag));
+      }
       // Vulkan: SPIR-V shaders and the SDK's Vulkan presenter (ge_native_vk_out.cpp).
       const bool vulkan = REXCVAR_GET(gpu_native_api) == "vulkan";
       ge::native_shaders::SetSpirv(vulkan);
