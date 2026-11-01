@@ -509,11 +509,11 @@ std::vector<Row> BuildPage(Page page) {
                   {{"OFF", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
       // No Renderer row: the classic Xenos renderer stays a ge.toml fallback
       // (gpu_native = false), read when the game starts.
-      AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
       AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
       // No Frame Limit row: the game always runs at its own 60 FPS (its clock
       // is the 60 Hz vblank; a lower cap slowed the game itself down).
       rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
+      AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
       // Run Setup Again is the last row of Other Settings.
       AddAction(rows, "Done", [] {
         RestartIfRenderScaleChanged();

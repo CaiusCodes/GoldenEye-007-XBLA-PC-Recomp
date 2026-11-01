@@ -89,8 +89,8 @@ neither setup nor the game contacts Xbox Live.
   ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
   (display mode, resolution, screen ratio, V-Sync, render scale, FSR
-  upscaling, texture filtering, anti-aliasing, post-processing colour filter,
-  field of view, FPS counter), Online Settings, and Other Settings (with Run
+  upscaling, texture filtering, anti-aliasing, field of view, FPS counter,
+  post-processing colour filter), Online Settings, and Other Settings (with Run
   Setup Again). The new renderer uses
   Direct3D 12 and switches to Vulkan by itself if Direct3D 12 can't start;
   `gpu_native_api = "vulkan"` in `ge.toml` picks Vulkan
