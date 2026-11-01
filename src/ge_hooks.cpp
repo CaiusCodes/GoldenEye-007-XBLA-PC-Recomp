@@ -2382,17 +2382,24 @@ bool ge_menu_cursor_from_pointer(uint8_t* base) {
       return true;
   }
   const float jump = std::max(std::fabs(cx - last_x), std::fabs(cy - last_y));
-  // Where the game last moved the crosshair against us (see below).
+  // Where and when (call count) the game last moved the crosshair against us.
   static float game_x = -1e9f, game_y = -1e9f;
-  if (last.x >= 0 && jump > 12.f &&
-      (std::fabs(cx - game_x) > 0.5f || std::fabs(cy - game_y) > 0.5f)) {
+  static uint32_t calls = 0, restored_at = 0;
+  ++calls;
+  const bool game_insists = std::fabs(cx - game_x) <= 0.5f && std::fabs(cy - game_y) <= 0.5f &&
+                            calls - restored_at <= 3;
+  if (last.x >= 0 && jump > 12.f && !game_insists) {
     // The game jumped the crosshair (a new menu opened): keep it where the
     // mouse is instead, as a Windows pointer would stay. If the game puts it
-    // straight back to the same spot, the mouse is outside the area the game
-    // allows (for example after the window shrank): the next frame accepts
-    // the game's spot and moves the pointer there, so the two never lock up.
+    // straight back to the same spot within a few frames, the mouse is outside
+    // the area the game allows (for example after the window shrank): that
+    // jump is accepted and the pointer moves there, so the two never lock up.
+    // Only straight away: re-entering a menu later jumps to the same spot as
+    // last time, and taking that as "insisting" moved the crosshair (Help &
+    // Options > back > Help & Options, or Dam > back > Dam).
     game_x = cx;
     game_y = cy;
+    restored_at = calls;
     STF32(base, GE_MENU_XY, last_x);
     STF32(base, GE_MENU_XY + 4, last_y);
     return true;
