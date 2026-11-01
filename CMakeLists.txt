@@ -44,6 +44,9 @@ set(GE_SOURCES
     src/ge_native_menu.cpp
     src/ge_portraits.cpp
     src/ge_gpu_detect.cpp
+    src/ge_native_probe.cpp
+    src/ge_native_gpu.cpp
+    src/ge_native_shaders.cpp
 )
 
 # The release version: VERSION is the single source of truth (Make-Release.ps1
@@ -105,3 +108,76 @@ endif()
 
 # ge_version_rc.h for GoldenEye.rc (see the VERSION block above).
 target_include_directories(ge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated_include")
+
+# Native renderer (gpu_native, src/ge_native_gpu.cpp): Plume (MIT), D3D12 and Vulkan
+# backends (gpu_native_api). Plume and XenosRecomp are submodules in thirdparty/,
+# patched by cmake/RendererPatches.cmake (which sets GE_PLUME_DIR and GE_XENOSRECOMP_DIR).
+if(WIN32)
+    include(cmake/RendererPatches.cmake)
+    add_library(ge_plume STATIC
+        "${GE_PLUME_DIR}/plume_d3d12.cpp"
+        "${GE_PLUME_DIR}/plume_vulkan.cpp"
+        "${GE_PLUME_DIR}/contrib/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp")
+    target_include_directories(ge_plume PUBLIC
+        "${GE_PLUME_DIR}"
+        "${GE_PLUME_DIR}/contrib/D3D12MemoryAllocator/include")
+    # Plume's Vulkan headers (volk, its Vulkan-Headers) only where Plume's Vulkan
+    # types are used: the SDK's Vulkan code (ge_native_vk_out.cpp) keeps its own.
+    set(_ge_plume_vk_includes
+        "${GE_PLUME_DIR}/contrib/volk"
+        "${GE_PLUME_DIR}/contrib/Vulkan-Headers/include"
+        "${GE_PLUME_DIR}/contrib/VulkanMemoryAllocator/include")
+    target_include_directories(ge_plume PRIVATE ${_ge_plume_vk_includes})
+    set_source_files_properties(src/ge_native_gpu.cpp PROPERTIES INCLUDE_DIRECTORIES "${_ge_plume_vk_includes}")
+    # The renderer and the probe read guest memory inside __try blocks that must
+    # catch a bad page: without asynchronous exceptions clang only catches faults
+    # raised in a called function, so a fault in the block itself (a texture
+    # naming unmapped memory) ended the game.
+    set_property(SOURCE src/ge_native_gpu.cpp src/ge_native_probe.cpp APPEND PROPERTY COMPILE_OPTIONS -fasync-exceptions)
+    target_compile_definitions(ge_plume PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(ge_plume PRIVATE -w)
+    target_link_libraries(ge_plume PUBLIC d3d12 dxgi dxguid d3dcompiler)
+    target_link_libraries(ge PRIVATE ge_plume)
+
+    # Shader translation on the player's PC (src/ge_native_shaders.cpp): XenosRecomp's
+    # recompiler (MIT) turns the game's Xenos shaders into HLSL; Microsoft's DXC
+    # (dxcompiler.dll + dxil.dll, redistributable) compiles it. Nothing translated ships.
+    set(_ge_xr "${GE_XENOSRECOMP_DIR}/XenosRecomp")
+    set(_ge_dxc "${GE_XENOSRECOMP_DIR}/thirdparty/dxc-bin")
+    add_library(ge_xenosrecomp STATIC "${_ge_xr}/shader_recompiler.cpp")
+    target_include_directories(ge_xenosrecomp PUBLIC
+        "${_ge_xr}"
+        "${_ge_dxc}/inc"
+        "${GE_XENOSRECOMP_DIR}/thirdparty/smol-v/source"
+        "${GE_XENOSRECOMP_DIR}/thirdparty/zstd/lib"
+        "${GE_XENOSRECOMP_DIR}/thirdparty/xxHash")
+    target_precompile_headers(ge_xenosrecomp PRIVATE "${_ge_xr}/pch.h")
+    target_compile_definitions(ge_xenosrecomp PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_options(ge_xenosrecomp PRIVATE -w -fms-extensions)
+    target_link_libraries(ge_xenosrecomp PUBLIC fmt::fmt)
+    target_link_libraries(ge PRIVATE ge_xenosrecomp)
+    # The HLSL side of XenosRecomp's shared definitions, prepended to every
+    # translated shader: embedded so the game needs no loose file for it.
+    file(READ "${_ge_xr}/shader_common.h" _ge_shader_common)
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated_include/ge_shader_common.inc"
+        CONTENT "// Generated from XenosRecomp/shader_common.h by CMakeLists.txt.\nR\"GESC(@_ge_shader_common@)GESC\"\n"
+        @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_ge_xr}/shader_common.h")
+    add_custom_command(TARGET ge POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_ge_dxc}/bin/x64/dxcompiler.dll" "${_ge_dxc}/bin/x64/dxil.dll" "$<TARGET_FILE_DIR:ge>")
+    # The Vulkan presenter hand-off (src/ge_native_vk_out.cpp) uses the SDK's Vulkan
+    # headers: built on its own, with the SDK's include paths only (the project root on
+    # the game's path holds VERSION, which <version> would find on Windows).
+    add_library(ge_vk_out OBJECT src/ge_native_vk_out.cpp)
+    target_compile_features(ge_vk_out PRIVATE cxx_std_23)
+    target_link_libraries(ge_vk_out PRIVATE rex::runtime)  # the SDK's headers and definitions
+    # renderdoc_app.h (included by the SDK's Vulkan headers): the installed SDK's
+    # include/renderdoc, or the SDK source tree's thirdparty/renderdoc.
+    if(rexglue_DIR AND EXISTS "${rexglue_DIR}/../../../include/renderdoc/renderdoc_app.h")
+        target_include_directories(ge_vk_out SYSTEM PRIVATE "${rexglue_DIR}/../../../include/renderdoc")
+    elseif(REXSDK_DIR AND EXISTS "${REXSDK_DIR}/thirdparty/renderdoc/renderdoc_app.h")
+        target_include_directories(ge_vk_out SYSTEM PRIVATE "${REXSDK_DIR}/thirdparty/renderdoc")
+    endif()
+    target_link_libraries(ge PRIVATE ge_vk_out)
+endif()

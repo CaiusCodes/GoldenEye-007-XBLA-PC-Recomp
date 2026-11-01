@@ -14,7 +14,9 @@
 #include <atomic>
 #include <cmath>
 #include <deque>
+#include <unordered_map>
 #include <vector>
+#include <filesystem>
 #include <functional>
 #include <chrono>
 #include <cstdint>
@@ -23,6 +25,7 @@
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
 #include "ge_gpu_detect.h"  // DisplayRefreshHz
 #include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
+#include <rex/logging/api.h>  // FlushLogging (crash / closing lines)
 #include <rex/kernel/xam/ge_online_control.h>  // GeNetworkGameActive
 #include <rex/ui/keybinds.h>     // ParseVirtualKey (keyboard rebinding)
 #include <rex/ui/virtual_key.h>
@@ -44,6 +47,10 @@
 #include <windows.h>
 #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
 #include <string>
+#include <set>
+#include <rex/filesystem.h>
+#include <unordered_map>
+#include <filesystem>
 
 // Replaces the unsupported `bc 20,lt,0x820F285C` at 0x820F2838. BO=20 makes
 // this an unconditional branch; ge_config.toml supplies the explicit target.
@@ -58,6 +65,7 @@ void ge_fix_mp_menu_branch() {
 HWND g_game_hwnd_for_resize();
 namespace ge { void ApplyPlayerName(const std::string& requested); }
 namespace ge { void PersistSettings(); }  // ge_native_menu.cpp: save ge.toml
+namespace ge { bool NativeRendererActive(); }  // ge_native_menu.cpp: fixed for the run
 namespace ge { void TestEnterText(const std::string& text); }  // ge_native_menu.cpp
 namespace ge { void TestToggleReady(); void LobbyPollTick(uint8_t* base, uint32_t menu); }  // ge_native_menu.cpp
 namespace { void ge_rename_tick(PPCContext& ctx, uint8_t* base); }  // below: a new player name
@@ -166,11 +174,74 @@ void ResizeGameWindow(int w, int h) {
   SetWindowPos(hwnd, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// How the game ended, as the log's last line: a restart or setup (a normal
+// close ends with the SDK's own lines), or (for a crash, which otherwise just cut the log off) the exception
+// and where it happened. The SDK's own vectored handler sees faults first and
+// handles the expected ones; this filter only runs for a real crash.
+namespace {
+LONG WINAPI ge_crash_filter(EXCEPTION_POINTERS* ep) {
+  const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+  HMODULE mod = nullptr;
+  wchar_t path[MAX_PATH] = L"?";
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         static_cast<LPCWSTR>(r->ExceptionAddress), &mod))
+    GetModuleFileNameW(mod, path, MAX_PATH);
+  const uintptr_t at = reinterpret_cast<uintptr_t>(r->ExceptionAddress);
+  const std::string module = std::filesystem::path(path).filename().string();
+  if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
+    REXLOG_ERROR("Game crashed: access violation ({} address {:X}) at {}+0x{:X}, thread {}",
+                 r->ExceptionInformation[0] == 1 ? "writing" : r->ExceptionInformation[0] == 8 ? "running" : "reading",
+                 r->ExceptionInformation[1], module, at - reinterpret_cast<uintptr_t>(mod),
+                 GetCurrentThreadId());
+  } else {
+    REXLOG_ERROR("Game crashed: exception {:08X} at {}+0x{:X}, thread {}", r->ExceptionCode, module,
+                 at - reinterpret_cast<uintptr_t>(mod), GetCurrentThreadId());
+  }
+  rex::FlushLogging();
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+void log_closing(const char* why) {
+  REXLOG_INFO("Game {}", why);
+  rex::FlushLogging();
+}
+}  // namespace
+
+void InstallCrashLog() { SetUnhandledExceptionFilter(ge_crash_filter); }
+
 void RestartSelf() {
   LaunchSelfDetached();
+  log_closing("restarting (settings change)");
   TerminateProcess(GetCurrentProcess(), 0);
   for (;;) {
   }
+}
+
+// The release launcher, <release>\GoldenEye 007.exe, when this game runs from
+// <release>\resources\runtime; empty in a dev build (no launcher).
+std::wstring LauncherPath() {
+  wchar_t exe_path[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return {};
+  const std::filesystem::path runtime = std::filesystem::path(exe_path).parent_path();
+  const std::filesystem::path resources = runtime.parent_path();
+  if (_wcsicmp(runtime.filename().c_str(), L"runtime") != 0 ||
+      _wcsicmp(resources.filename().c_str(), L"resources") != 0)
+    return {};
+  const std::filesystem::path launcher = resources.parent_path() / L"GoldenEye 007.exe";
+  std::error_code ec;
+  return std::filesystem::is_regular_file(launcher, ec) ? launcher.wstring() : std::wstring();
+}
+
+// Help & Options > Video Settings > Run Setup Again: open the launcher's setup
+// window and end the game (settings are saved by the caller).
+void RunSetupAgain() {
+  const std::wstring launcher = LauncherPath();
+  if (launcher.empty()) return;
+  const std::wstring folder = std::filesystem::path(launcher).parent_path().wstring();
+  ShellExecuteW(nullptr, L"open", launcher.c_str(), L"--setup", folder.c_str(), SW_SHOWNORMAL);
+  log_closing("closing to run setup again");
+  TerminateProcess(GetCurrentProcess(), 0);
 }
 }  // namespace ge
 
@@ -178,6 +249,8 @@ void RestartSelf() {
 // derived class may touch protected base members; we only reinterpret an
 // existing CP* and call a non-virtual accessor -- no construction, no
 // vtable use, layout-compatible single inheritance).
+REXCVAR_DECLARE(bool, gpu_native);  // ge_native_gpu.cpp
+
 namespace {
 struct CPProbe : rex::graphics::CommandProcessor {
   uint32_t rpi() const { return read_ptr_index_; }
@@ -198,7 +271,8 @@ inline rex::graphics::CommandProcessor* ge_cp() {
   auto* rt = ks->emulator();
   if (!rt) return nullptr;
   auto* igs = rt->graphics_system();
-  if (!igs) return nullptr;
+  // Native mode: the presenter-only graphics system has no command processor.
+  if (!igs || ge::NativeRendererActive()) return nullptr;
   return static_cast<rex::graphics::GraphicsSystem*>(igs)->command_processor();
 }
 inline rex::graphics::GraphicsSystem* ge_gs() {
@@ -207,7 +281,7 @@ inline rex::graphics::GraphicsSystem* ge_gs() {
   auto* rt = ks->emulator();
   if (!rt) return nullptr;
   auto* igs = rt->graphics_system();
-  if (!igs) return nullptr;
+  if (!igs || ge::NativeRendererActive()) return nullptr;
   return static_cast<rex::graphics::GraphicsSystem*>(igs);
 }
 }  // namespace
@@ -343,6 +417,118 @@ void ge_match_display_refresh() {
   }
 }
 
+// npc_path_log (ge.toml, off by default): for bug reports about characters
+// that get stuck. Once a second the watchdog thread reads every character
+// (read only) and logs (a) each change of the AI script it runs, and (b) any
+// character that has not moved for 15 seconds while it is running or walking
+// to a position, with its position, action, script and step. XBLA layout: chr prop
+// (type 3) +0x08 = chr, +0x0C position; chr +0x00 number, +0x07 action,
+// +0x18 prop, +0x104 AI list, +0x108 step.
+REXCVAR_DEFINE_BOOL(npc_path_log, false, "Diagnostics",
+                    "Log characters that get stuck and the AI scripts they run (for bug reports)");
+
+namespace {
+uint32_t ge_level_ai_table(uint8_t* base, uint32_t stage) {
+  // Level table records: +0x00 id, +0x04 name, +0x18 single-player setup;
+  // the setup header's +0x14 is the AI list table ({list, id} pairs).
+  for (uint32_t a = 0x82857E00u; a < 0x82858800u; a += 4) {
+    if (LD32(base, a) != stage) continue;
+    const uint32_t name = LD32(base, a + 4), setup = LD32(base, a + 0x18);
+    if (name < 0x82000000u || name >= 0x82010000u) continue;
+    if (setup < 0x82C00000u || setup >= 0x82E80000u) continue;
+    return LD32(base, setup + 0x14);
+  }
+  return 0;
+}
+// AI list id containing `ptr` (the nearest list start at or below it).
+uint32_t ge_ai_list_id(uint8_t* base, uint32_t table, uint32_t ptr, uint32_t* start) {
+  uint32_t best = 0, best_id = 0xFFFFFFFFu;
+  for (int i = 0; table && i < 512; ++i) {
+    const uint32_t lp = LD32(base, table + i * 8), id = LD32(base, table + i * 8 + 4);
+    if (!lp) break;
+    if (lp <= ptr && lp > best) { best = lp; best_id = id; }
+  }
+  if (start) *start = best;
+  return best_id;
+}
+}  // namespace
+
+void ge_log_npc_paths(uint8_t* base) {
+  static uint32_t poll = 0;
+  static bool on = false;
+  if ((poll++ % 16) == 0) on = REXCVAR_GET(npc_path_log);
+  if (!on || (poll % 4) != 0) return;  // once a second
+  struct Npc {
+    float x = 0, y = 0, z = 0;
+    uint32_t still = 0;     // seconds without moving
+    uint32_t list = 0;      // AI list pointer last seen
+    int reported = 0;       // stuck lines logged for this stop (at 15 s and 60 s)
+  };
+  static std::unordered_map<uint32_t, Npc> npcs;
+  static uint32_t stage_seen = 0, table = 0;
+  static uint32_t lines = 0, minute = 0;
+  const uint32_t stage = LD32(base, 0x82423E00u);
+  if (stage != stage_seen) {
+    stage_seen = stage;
+    npcs.clear();
+    table = stage == 90u ? 0 : ge_level_ai_table(base, stage);
+    if (table) REXKRNL_INFO("ge npc: stage {}, AI list table {:08X}", stage, table);
+  }
+  if (!table) return;
+  if (++minute >= 60) { minute = 0; lines = 0; }
+  const uint32_t pl = LD32(base, 0x82F1FA98u);
+  uint32_t prop = pl ? LD32(base, pl + 0x1ACu) : 0;
+  // Props live in the game image's heap and characters in its 0x4xxxxxxx
+  // heap; anything else (a list being changed under us) ends the walk.
+  auto prop_ok = [](uint32_t p) { return p >= 0x82000000u && p < 0x83200000u; };
+  if (!prop_ok(prop)) return;
+  for (int i = 0; i < 2000 && prop_ok(LD32(base, prop + 0x2Cu)); ++i) prop = LD32(base, prop + 0x2Cu);
+  for (int i = 0; i < 2000 && prop_ok(prop); ++i, prop = LD32(base, prop + 0x28u)) {
+    if (base[prop] != 3) continue;
+    const uint32_t chr = LD32(base, prop + 0x08u);
+    if (chr < 0x40000000u || chr >= 0x50000000u || LD32(base, chr + 0x18u) != prop) continue;
+    const int num = static_cast<int16_t>(LD16(base, chr));
+    const uint32_t action = base[chr + 7];
+    const uint32_t list = LD32(base, chr + 0x104u);
+    const uint32_t step = LD16(base, chr + 0x108u);
+    const float x = LDF32(base, prop + 0x0Cu), y = LDF32(base, prop + 0x10u),
+                z = LDF32(base, prop + 0x14u);
+    Npc& n = npcs[chr];
+    uint32_t list_start = 0;
+    if (list != n.list) {
+      if (n.list && lines < 60) {
+        ++lines;
+        REXKRNL_INFO("ge npc: chr {} now on AI list {:04X} (action {}, at {:.0f},{:.0f},{:.0f})",
+                     num, ge_ai_list_id(base, table, list, nullptr), action, x, y, z);
+      }
+      n.list = list;
+    }
+    const float moved = std::fabs(x - n.x) + std::fabs(y - n.y) + std::fabs(z - n.z);
+    n.x = x; n.y = y; n.z = z;
+    // Running or walking to a position (N64 action numbers 13 and 15, which
+    // XBLA keeps). Patrols (14) are left out: a patrol out of view jumps from
+    // point to point and sits still in between, which looked stuck.
+    const bool moving_action = action == 13 || action == 15;
+    if (moved > 2.f || !moving_action) {
+      n.still = 0;
+      n.reported = 0;
+      continue;
+    }
+    // Out of view, the game moves characters from point to point with pauses,
+    // so a 15 s stop can be normal; one still stopped at 60 s is stuck.
+    ++n.still;
+    if (((n.still >= 15 && n.reported == 0) || (n.still >= 60 && n.reported == 1)) && lines < 60) {
+      ++n.reported;
+      ++lines;
+      const uint32_t id = ge_ai_list_id(base, table, list, &list_start);
+        const uint32_t cmd = list >= 0x82000000u && list < 0x83200000u ? base[list + step] : 0;
+      REXKRNL_INFO("ge npc stuck: chr {} has not moved for {} s at {:.0f},{:.0f},{:.0f}; action {}, "
+                   "AI list {:04X} step {} (command {:02X})",
+                   num, n.still, x, y, z, action, id, step, cmd);
+    }
+  }
+}
+
 void ge_watchdog_thread() {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
@@ -355,6 +541,7 @@ void ge_watchdog_thread() {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     if ((display_check++ % 8) == 0) ge_match_display_refresh();  // every 2 s
     ge_log_gpu_clock_changes();
+    ge_log_npc_paths(base);
     auto* cp = ge_cp();
     if (!cp) continue;
     uint32_t wpi = static_cast<CPProbe*>(cp)->wpi();
@@ -2406,6 +2593,24 @@ void ge_mouse_camera(uint8_t* base) {
     start_centering = false;   // nothing to centre -> no spring-back
     disable_sway = false;
   } else {
+    // #10: with the game's Auto-Aim on, the game itself moves the gun and the
+    // crosshair onto the target, and shots go where the crosshair is. Our sway
+    // and recentring below pulled them back every frame, so the gun swung
+    // toward a guard but the crosshair stayed short of him and the shot missed.
+    // With Auto-Aim on, the mouse only turns the camera here.
+    const uint32_t settings_ptr = LD32(base, GE_SETTINGS_PTR);
+    if (settings_ptr && (LD32(base, settings_ptr + GE_SETTINGS_BITS) & GE_SET_AutoAim)) {
+      if (look_mdx != 0.f || mdy != 0.f) {
+        float camX = LDF32(base, player + GE_OFF_CAM_X);
+        float camY = LDF32(base, player + GE_OFF_CAM_Y);
+        camX += (invert_x ? -1.f : 1.f) * (look_mdx / 10.f) * sensitivity;
+        camY -= (invert_y ? -1.f : 1.f) * (mdy / 10.f) * sensitivity;
+        STF32(base, player + GE_OFF_CAM_X, camX);
+        STF32(base, player + GE_OFF_CAM_Y, camY);
+      }
+      start_centering = false;
+      return;
+    }
     float gX = LDF32(base, player + GE_OFF_GUN_X);
     float gY = LDF32(base, player + GE_OFF_GUN_Y);
 
@@ -2542,12 +2747,6 @@ static void ge_watch_help_rows(uint8_t* base) {
     if (LD32(base, kTable + i * 4u) != want[i]) ST32(base, kTable + i * 4u, want[i]);
 }
 
-// Screen Ratio is set from the window's shape (the Other Settings row is
-// hidden): profile option 12 = 16:9, 13 = 21:9, neither = 4:3. A window close
-// to 4:3 gets 4:3, one about as wide as 21:9 (fullscreen on an ultrawide
-// screen, or a window stretched that far) gets 21:9, anything else 16:9. The
-// game shapes its 16:9 frame for the chosen TV, so the frame is presented at
-// that shape too (4:3 and 21:9; 16:9 is the frame's own).
 // Auto-Aim is kept in ge.toml (ge_autoaim, off by default): applied to the
 // first profile's option bit (+0x298 & 0x10) when the profile is loaded, and
 // a change the player makes in the Controls options or the watch is saved
@@ -2595,6 +2794,103 @@ void ge_autoaim_tick(uint8_t* base) {
   }
 }
 
+// Jungle's broad-leaf plants: Rare's unfinished build has no texture for them,
+// so the game hands D3D its missing-texture picture, a 16x16 DXT1 checker of
+// magenta and dark magenta, and they show up purple. In
+// Jungle, SetTexture is given one of the level's own leaf textures instead.
+// Both renderers read the texture object they are handed, so both get it. The
+// leaf is the nearest texture object of the level's table (objects 0x80 apart)
+// with the size ge_jungle_plant_texture names.
+REXCVAR_DEFINE_BOOL(ge_fix_jungle_plants, true, "Video",
+                    "Jungle: draw the plants the game left untextured with a leaf texture");
+REXCVAR_DEFINE_STRING(ge_jungle_plant_texture, "128x512", "Debug",
+                      "Jungle: size (WxH) of the level texture used on the untextured plants");
+constexpr uint32_t GE_STAGE_JUNGLE = 0x25u;
+
+namespace {
+struct GeTexInfo {
+  uint32_t fmt = 0, width = 0, height = 0, data = 0;
+};
+// The texture object's fetch constant (+28): format, size and where the base
+// level is. Textures loaded with the level sit at 0xE0000000+, read 4 KB on.
+GeTexInfo ge_tex_info(uint8_t* base, uint32_t tex) {
+  GeTexInfo t;
+  const uint32_t f1 = LD32(base, tex + 32), f2 = LD32(base, tex + 36);
+  t.fmt = f1 & 0x3F;
+  t.width = (f2 & 0x1FFF) + 1;
+  t.height = ((f2 >> 13) & 0x1FFF) + 1;
+  const uint32_t phys = f1 & 0xFFFFF000u;
+  t.data = phys >= 0xE0000000u ? phys + 0x1000 : 0;
+  return t;
+}
+bool ge_is_missing_texture(uint8_t* base, uint32_t tex) {
+  const GeTexInfo t = ge_tex_info(base, tex);
+  if (t.fmt != 18 || t.width != 16 || t.height != 16 || !t.data) return false;  // k_DXT1
+  // A small base level sits at an offset in its tile (packed mips), which can
+  // be shared with other textures: count checker blocks over the 8 KB tile.
+  auto magenta = [](uint16_t c) {  // RGB565 with no green and red = blue
+    const int r = c >> 11, g = (c >> 5) & 0x3F, b = c & 0x1F;
+    return r > 0 && g <= 2 && std::abs(r - b) <= 2;
+  };
+  int checker = 0;
+  for (uint32_t off = 0; off < 0x2000; off += 8) {
+    const uint16_t c0 = LD16(base, t.data + off), c1 = LD16(base, t.data + off + 2);
+    if (magenta(c0) && magenta(c1)) ++checker;
+  }
+  return checker >= 16;  // the 16x16 base level alone is 16 blocks; the tile can hold other data
+}
+}  // namespace
+
+void ge_jungle_set_texture(PPCRegister& r5) {
+  // The level's checker objects (it has two) and the leaf each one becomes.
+  struct Swap { uint32_t missing, leaf; };
+  static Swap swaps[4];
+  static uint32_t count = 0, stage_seen = 0, last_other = 0;
+  const uint32_t tex = r5.u32;
+  if (!tex || !REXCVAR_GET(ge_fix_jungle_plants)) return;
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  const uint32_t stage = LD32(base, GE_CURRENT_STAGE);
+  if (stage != stage_seen) {  // a new level: its textures are new objects
+    stage_seen = stage;
+    count = last_other = 0;
+  }
+  if (stage != GE_STAGE_JUNGLE || tex == last_other) return;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (swaps[i].missing == tex) {
+      if (swaps[i].leaf) r5.u64 = swaps[i].leaf;
+      return;
+    }
+  }
+  if (count == 4 || !ge_is_missing_texture(base, tex)) {
+    last_other = tex;  // the cheap test above skips it next time in a row
+    return;
+  }
+  uint32_t want_w = 0, want_h = 0, leaf = 0;
+  std::sscanf(REXCVAR_GET(ge_jungle_plant_texture).c_str(), "%ux%u", &want_w, &want_h);
+  for (uint32_t k = 1; k <= 64 && !leaf; ++k) {
+    for (const uint32_t other : {tex - k * 0x80u, tex + k * 0x80u}) {
+      const GeTexInfo t = ge_tex_info(base, other);
+      if ((t.fmt == 18 || t.fmt == 19 || t.fmt == 20) && t.width == want_w && t.height == want_h && t.data) {
+        leaf = other;
+        break;
+      }
+    }
+  }
+  swaps[count++] = {tex, leaf};
+  REXKRNL_INFO("GEJUNGLE missing-texture object {:08X} -> leaf {:08X} ({})", tex, leaf,
+               REXCVAR_GET(ge_jungle_plant_texture));
+  if (leaf) r5.u64 = leaf;
+}
+
+// Screen Ratio (the game's Other Settings row is hidden): profile option 12 =
+// 16:9, 13 = 21:9, neither = 4:3. ge_screen_ratio (PC Settings > Video) picks
+// it; on Auto it follows the window's shape: a window close to 4:3 gets 4:3,
+// one about as wide as 21:9 (fullscreen on an ultrawide screen, or a window
+// stretched that far) gets 21:9, anything else 16:9. The game shapes its 16:9
+// frame for the chosen TV, so the frame is presented at that shape too (4:3
+// and 21:9; 16:9 is the frame's own), with bars where the window differs.
+REXCVAR_DEFINE_STRING(ge_screen_ratio, "auto", "Video",
+                      "Screen ratio: auto (follow the window's shape), 4:3, 16:9 or 21:9");
 void ge_screen_ratio_tick(uint8_t* base) {
   static int countdown = 0;
   static int shown = -1;
@@ -2608,6 +2904,11 @@ void ge_screen_ratio_tick(uint8_t* base) {
     rex::cvar::SetFlagByName("ge_boot_cover", "false");
     REXKRNL_INFO("GEBOOTCOVER lifted at poll {} (ratio set at {})", polls, applied_at);
   }
+  static std::string last_chosen;
+  if (REXCVAR_GET(ge_screen_ratio) != last_chosen) {  // a new choice applies at once
+    last_chosen = REXCVAR_GET(ge_screen_ratio);
+    countdown = 0;
+  }
   if (--countdown > 0) return;
   countdown = 30;
   const uint32_t profile = LD32(base, 0x83088228u);
@@ -2617,6 +2918,10 @@ void ge_screen_ratio_tick(uint8_t* base) {
   if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return;
   const float aspect = static_cast<float>(rc.right) / static_cast<float>(rc.bottom);
   int ratio = aspect < 1.55f ? 0 : aspect >= 2.2f ? 2 : 1;  // 0 4:3, 1 16:9, 2 21:9
+  const std::string chosen = REXCVAR_GET(ge_screen_ratio);
+  if (chosen == "4:3") ratio = 0;
+  else if (chosen == "16:9") ratio = 1;
+  else if (chosen == "21:9") ratio = 2;
   // The game's own 21:9 front-end squeezes the menus into part of the frame
   // and leaves the rest black, so the menus stay 16:9 (with side bars on an
   // ultrawide window); missions use 21:9.
@@ -2764,6 +3069,17 @@ struct GeScriptPress {
   int16_t lx = 0, ly = 0;
 };
 std::deque<GeScriptPress> g_script_queue;
+// Test pads 2-4 (ge_debug_pads): words prefixed "P2:" .. "P4:" go to their
+// own queue; XamInputGetState answers for those users from it (below).
+REXCVAR_DEFINE_INT32(ge_debug_pads, 1, "Debug",
+                     "Test-only: pads the input pipe drives (2-4 adds pads for users 2-4, words P2: .. P4:)")
+    .range(1, 4);
+struct GeExtraPad {
+  std::deque<GeScriptPress> queue;
+  GeScriptPress current;
+  int phase = 0;
+};
+GeExtraPad g_extra_pads[3];
 // Test-only watch click from the pipe: "CLICK=x,y" in 1280x720 units.
 bool g_test_click = false;
 bool g_test_menu_click = false;  // the same click, for front-end menus
@@ -2800,6 +3116,15 @@ void ge_script_read_new_lines() {
         start = end + 1;
         while (!word.empty() && (word.back() == '\r' || word.back() == ' ')) word.pop_back();
         GeScriptPress press;
+        int pad = 0;  // "P2:A" = pad 2's A
+        if (word.size() > 3 && word[0] == 'P' && word[1] >= '2' && word[1] <= '4' && word[2] == ':') {
+          pad = word[1] - '1';
+          word = word.substr(3);
+        }
+        if (word == "TRACE") {  // test: the native renderer logs the next frame's draws
+          rex::cvar::SetFlagByName("gpu_native_trace_frame", "-1");
+          continue;
+        }
         if (word == "READY") {  // test: toggle ready in the LAN lobby
           ge::TestToggleReady();
           continue;
@@ -2830,6 +3155,11 @@ void ge_script_read_new_lines() {
           (word == "WHEELUP" ? g_wheel_up_queue : g_wheel_down_queue).fetch_add(1);
           continue;
         }
+        if (word.rfind("CVAR=", 0) == 0) {  // test: CVAR=name=value sets a setting mid-run
+          const size_t eq = word.find('=', 5);
+          if (eq != std::string::npos) rex::cvar::SetFlagByName(word.substr(5, eq - 5), word.substr(eq + 1));
+          continue;
+        }
         if (word.rfind("CLICK=", 0) == 0) {
           if (std::sscanf(word.c_str() + 6, "%f,%f", &g_test_click_x, &g_test_click_y) == 2)
             g_test_click = true;
@@ -2855,7 +3185,8 @@ void ge_script_read_new_lines() {
         else if (word == "SLEFT") press.lx = -32767;
         else if (word == "SRIGHT") press.lx = 32767;
         else if (word != "WAIT") continue;
-        g_script_queue.push_back(press);
+        if (pad) g_extra_pads[pad - 1].queue.push_back(press);
+        else g_script_queue.push_back(press);
       }
     }
   }
@@ -2864,6 +3195,17 @@ void ge_script_read_new_lines() {
 
 void ge_script_apply(uint8_t* base) {
   ge_script_read_new_lines();
+  for (GeExtraPad& pad : g_extra_pads) {  // the same hold / gap rhythm as pad 1
+    if (pad.phase > 0) {
+      if (--pad.phase == 0) pad.phase = -8;
+    } else if (pad.phase < 0) {
+      ++pad.phase;
+    } else if (!pad.queue.empty()) {
+      pad.current = pad.queue.front();
+      pad.queue.pop_front();
+      pad.phase = 6;
+    }
+  }
   if (g_script_phase > 0) {
     if (--g_script_phase == 0) g_script_phase = -8;
   } else if (g_script_phase < 0) {
@@ -2883,6 +3225,31 @@ void ge_script_apply(uint8_t* base) {
     if (g_script_current.lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(g_script_current.lx));
     if (g_script_current.ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(g_script_current.ly));
   }
+}
+
+// The game's XamInputGetState call (user index, XINPUT_STATE*). Test pads 2-4
+// are "connected" while ge_debug_pads covers them and the pipe is set, and
+// report the press being played back.
+extern "C" REX_FUNC(sub_824082E8) {
+  const uint32_t user = ctx.r3.u32;
+  if (user >= 1 && user <= 3 && static_cast<int>(user) < REXCVAR_GET(ge_debug_pads) &&
+      !REXCVAR_GET(ge_debug_input_file).empty() && ctx.r4.u32) {
+    const GeExtraPad& pad = g_extra_pads[user - 1];
+    const uint32_t state = ctx.r4.u32;
+    static uint32_t packet = 0;
+    ST32(base, state + 0, ++packet);
+    const GeScriptPress none;
+    const GeScriptPress& p = pad.phase > 0 ? pad.current : none;
+    ST16(base, state + 4, p.buttons);
+    base[state + 6] = p.lt;
+    base[state + 7] = p.rt;
+    ST16(base, state + 8, static_cast<uint16_t>(p.lx));
+    ST16(base, state + 10, static_cast<uint16_t>(p.ly));
+    ST32(base, state + 12, 0);  // right stick
+    ctx.r3.u64 = 0;             // ERROR_SUCCESS
+    return;
+  }
+  __imp__sub_824082E8(ctx, base);
 }
 
 // A wheel notch becomes a press held for a few polls, then a gap, so the game
@@ -3383,12 +3750,19 @@ void ge_watch_mouse(uint8_t* base) {
 // the game starts the fade at once (fade timer +44 goes from -1 to 0, then up to
 // 90 = gone), so bodies vanished after about a second and a half. They now lie
 // for ge_body_seconds first: the timer counts up from below -1 while they lie.
-REXCVAR_DEFINE_INT32(ge_body_seconds, 60, "Game", "Seconds a dead guard stays before fading");
+// 10 s, not longer: levels refill a guard slot (with reinforcements) only once
+// its body is gone, so a minute held reinforcements back.
+REXCVAR_DEFINE_INT32(ge_body_seconds, 10, "Game", "Seconds a dead guard stays before fading");
 bool ge_corpse_linger(PPCRegister& r3) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const uint32_t chr = r3.u32;
   const int32_t t = static_cast<int32_t>(LD32(base, chr + 44u));
   if (t >= 0) return false;  // fading: the game's own code
+  // Cradle's Trevelyan (stage 41, chr 0) fades at once: if he's killed rather
+  // than shot off the platform, the mission ends only after his body is gone
+  // (if_chr_does_not_exist 00), so a lingering body held the ending back by a
+  // minute and players thought it never ended (issue #13).
+  if (LD32(base, GE_CURRENT_STAGE) == 41u && static_cast<int16_t>(LD16(base, chr)) == 0) return false;
   const int32_t linger = std::clamp(REXCVAR_GET(ge_body_seconds), 0, 600) * 60;
   if (t == -1) {  // just died
     if (linger == 0) return false;
@@ -4320,34 +4694,64 @@ void ApplyPlayerName(const std::string& requested) {
 // built-in one is kept off: before each draw of that model (sub_8209D250(res),
 // at 0x8209D270 with r31 = res; res + 16 holds its file path) the bit is cleared.
 //
-// Old graphics: some original bodies have a head built in although the body
-// table says they have none (byte +25 clear): Bond's four (boilerbond,
-// suitbond, timberbond, snowbond) and the Russian infantry guard (greatguard2).
-// The game attaches a separate head to them too, and two faces cut through
-// each other. In the new graphics those bodies are headless and need it, so
-// only the original-graphics draw of the separate head is skipped: a character
-// draws its body, then its head, so a head drawn right after one of these
-// bodies is left out (true jumps to the draw's return, 0x8209D3A4).
+// Old graphics: an original body model made to wear a separate head has the
+// attachment point CP_HEADCHILD; one without it has its head built in. The
+// game adds a separate head when the body table (0x82729020, 36-byte entries,
+// +25 the body has its own head) says it has none. That table follows the new
+// graphics, and some original bodies it says that of have a head built in, so
+// two faces cut through each other: Bond's four, greatguard2, blueman,
+// bluewoman and greyman. A character draws its body, then its head, so an
+// original head drawn right after an original body with its own head is left
+// out (true jumps to the draw's return, 0x8209D3A4). (The new models attach
+// their heads differently: CP_HEADCHILD says nothing there.)
 namespace {
-bool g_body_has_head = false;  // the last original body drawn has its own head
+bool g_body_has_head = false;  // the last body drawn has its own head
+
+// Whether the model file a draw names ("game:\\files\\...") has a head built
+// in: no CP_HEADCHILD in it. Read once per file from the game data folder.
+bool model_has_own_head(const char* guest_path) {
+  static std::unordered_map<std::string, bool> cache;
+  const auto it = cache.find(guest_path);
+  if (it != cache.end()) return it->second;
+  bool own_head = false;
+  const char* rel = std::strchr(guest_path, ':');
+  if (rel) {
+    std::filesystem::path root = rex::filesystem::GetExecutableFolder();
+    std::string name = root.filename().string();
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (name == "runtime") root = root.parent_path();  // release: resources\\runtime -> resources\\assets
+    std::string tail = rel + 1;
+    while (!tail.empty() && (tail[0] == '\\' || tail[0] == '/')) tail.erase(0, 1);
+    if (FILE* f = _wfopen((root / "assets" / tail).c_str(), L"rb")) {
+      std::string data;
+      char buf[65536];
+      for (size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;) data.append(buf, n);
+      std::fclose(f);
+      own_head = !data.empty() && data.find("CP_HEADCHILD") == std::string::npos;
+    }
+  }
+  cache.emplace(guest_path, own_head);
+  return own_head;
 }
+}  // namespace
+
 bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
+  static std::string last_body;
   if (std::strstr(path, "\\original\\head\\")) {
     const bool skip = g_body_has_head;
     g_body_has_head = false;
+    static std::set<std::string> logged;
+    if (skip && logged.insert(last_body).second)
+      REXKRNL_INFO("GEHEADS {} has its own head: the separate head is left out", last_body);
     return skip;
   }
-  static const char* const kHeadedBodies[] = {
-      "\\original\\char\\boilerbond\\", "\\original\\char\\suitbond\\", "\\original\\char\\timberbond\\",
-      "\\original\\char\\snowbond\\", "\\original\\char\\greatguard2\\"};
   g_body_has_head = false;
-  for (const char* body : kHeadedBodies) {
-    if (std::strstr(path, body)) {
-      g_body_has_head = true;
-      return false;
-    }
+  if (std::strstr(path, "\\original\\char\\")) {
+    g_body_has_head = model_has_own_head(path);
+    last_body = path;
+    return false;
   }
   if (!std::strstr(path, "\\new\\prop\\chrautoshot\\")) return false;
   const uint32_t params = LD32(base, r31.u32 + 12);

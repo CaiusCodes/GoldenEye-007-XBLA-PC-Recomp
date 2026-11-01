@@ -7,6 +7,8 @@ file_path = "game/default.xex"
 out_directory_path = "generated"
 includes = [
   "ge_config.toml",
+  "native/probe_hooks.toml",
+  "native/native_hooks.toml",
 ]
 
 setjmp_address = 0x823F22C0

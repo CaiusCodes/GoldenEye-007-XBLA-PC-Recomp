@@ -84,10 +84,15 @@ constexpr int kBorrowed[] = {33, 34, 35, 36, 37, 38};
 uint32_t g_slots = 0;  // our table (guest address), kOurSlotCount slots
 int g_assigned[64];    // character index -> our slot, 0 = none
 
+// A character whose picture did not load (its file missing from portraits\)
+// shows "who": its own number points past the game's 27, at a slot of our
+// table that stays empty, and drawing that crashed the native renderer (a save
+// with such a character chosen crashed at the title).
 void AssignPictures(uint8_t* base) {
   for (int i : kBorrowed) base[kCharTable + i * 12 + 3] = static_cast<uint8_t>(kWhoSlot);
-  for (int i = 0; i < 64; ++i)
-    if (g_assigned[i]) base[kCharTable + i * 12 + 3] = static_cast<uint8_t>(g_assigned[i]);
+  for (const Pic& pic : kPics)
+    base[kCharTable + pic.index * 12 + 3] =
+        static_cast<uint8_t>(g_assigned[pic.index] ? g_assigned[pic.index] : static_cast<int>(kWhoSlot));
 }
 
 // A PNG scaled to kPicW x kPicH, as RGBA rows; empty if it cannot be read.

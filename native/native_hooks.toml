@@ -1,0 +1,12 @@
+# Native renderer hooks (src/ge_native_gpu.cpp); inert unless gpu_native = true.
+
+# The game's frame limiter (sub_821898D0) busy-waits on the timebase until
+# 1/60 s has passed since the last frame: r3 = now, r31 = the last frame's
+# time (microseconds), r23 = 1000000 (it loops while (now - last) * 60 < r23).
+# Under Xenos the frame's GPU wait already takes that time; the native
+# renderer's Swap returns at once, so the loop spun a core at ~90%. The hook
+# sleeps until just before the deadline and leaves the last bit to the loop.
+[[midasm_hook]]
+address = 0x82189DE0
+name = "ge_native_frame_wait"
+registers = ["r3", "r31", "r23"]

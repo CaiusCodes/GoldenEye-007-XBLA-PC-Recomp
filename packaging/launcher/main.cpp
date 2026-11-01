@@ -3,7 +3,9 @@
 //   GoldenEye 007.exe                 start the game; shows setup first when the
 //                                     game data has not been imported (or a
 //                                     needed file is missing)
-//   GoldenEye 007.exe --setup         open the setup window
+//   GoldenEye 007.exe --setup         open the setup window (as does holding
+//                                     Shift while opening it, or the game's
+//                                     Video Settings > Run Setup Again)
 //
 // For automated tests (no window):
 //   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,complete]
@@ -84,6 +86,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
   }
   if (argv) LocalFree(argv);
+  // Holding Shift while opening the launcher (or its shortcut) opens setup,
+  // so players can re-run it without the command line, even when the game
+  // itself won't start.
+  if (GetAsyncKeyState(VK_SHIFT) & 0x8000) setup = true;
 
   const Paths p = MakePaths();
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);

@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -52,6 +53,9 @@ void SetRebindCapturing(bool v);  // ge_hooks.cpp: swallow pad input while captu
 std::string TakeWheelNotch();      // ge_hooks.cpp: "WheelUp"/"WheelDown" since last call
 void ApplyPlayerName(const std::string& name);  // ge_hooks.cpp
 void ApplyUpscaling();                          // below
+std::wstring LauncherPath();                    // ge_hooks.cpp
+void RunSetupAgain();                           // ge_hooks.cpp
+void PersistSettings();                         // below
 }
 
 namespace {
@@ -194,45 +198,74 @@ float GetF(const char* cvar) { return static_cast<float>(std::atof(GetS(cvar).c_
 // Render Scale (see ge::ApplyRenderScale below).
 int g_render_scale_active = 0;  // the scale this run uses (0 = not set yet)
 ge::GpuForScale g_scale_gpu;    // read once at start
-// Auto: the smallest scale whose internal height (720 x scale) covers the
-// display height (720p 1x, up to 1440p 2x, above 3x), capped at 1x on an
-// integrated GPU or one with under 4 GB of video memory and at 2x otherwise:
-// 3x is only ever a manual choice. Ultrawide goes by height (the game draws
-// into 16:9 surfaces and the picture is stretched to 21:9).
-int AutoRenderScale(int display_height) {
-  const int target = display_height <= 720 ? 1 : display_height <= 1440 ? 2 : 3;
-  const bool modest_gpu = g_scale_gpu.integrated ||
-                          (g_scale_gpu.known && g_scale_gpu.video_memory_mb < 4096);
-  return std::min(target, modest_gpu ? 1 : 2);
-}
-// The display height the game uses now: in fullscreen the real mode of the
-// monitor the game window is on, windowed the chosen window height. Cached for
-// half a second (the Video page asks every frame).
-int CurrentDisplayHeight() {
-  static ULONGLONG last = 0;
-  static int cached = 0;
-  const ULONGLONG now = GetTickCount64();
-  if (cached && now - last < 500) return cached;
-  last = now;
-  int h = 0;
-  if (GetB("fullscreen")) {
-    if (HWND w = GetForegroundWindow()) {
-      DWORD pid = 0;
-      GetWindowThreadProcessId(w, &pid);
-      if (pid == GetCurrentProcessId()) h = ge::WindowDisplayHeight(w);
-    }
-    if (h <= 0) h = ge::StartupDisplayHeight(std::atoi(GetS("monitor").c_str()));
-  } else {
-    h = std::atoi(GetS("ge_window_height").c_str());
-  }
-  cached = h > 0 ? h : 1080;
-  return cached;
-}
+// 1x unless the player chose 2x or 3x ("auto" from an older ge.toml is 1x).
 int DesiredRenderScale() {
   const std::string v = GetS("ge_render_scale");
-  if (v == "1" || v == "2" || v == "3") return v[0] - '0';
-  return AutoRenderScale(CurrentDisplayHeight());
+  return v == "2" || v == "3" ? v[0] - '0' : 1;
 }
+
+// Window sizes for the Resolution row, each with its Screen Ratio shape. The
+// row offers only the sizes of the chosen Screen Ratio (Auto: all of them)
+// that fit on the screen, so the window and the picture keep the same shape.
+struct WindowSize {
+  int w, h;
+  const char* ratio;
+};
+constexpr WindowSize kWindowSizes[] = {
+    {1024, 768, "4:3"},   {1440, 1080, "4:3"},  {1280, 720, "16:9"},
+    {1600, 900, "16:9"},  {1920, 1080, "16:9"}, {2560, 1440, "16:9"},
+    {3840, 2160, "16:9"}, {2560, 1080, "21:9"}, {3440, 1440, "21:9"}};
+// The Screen Ratio in use: the chosen one, or for "auto" (the default, and
+// older ge.toml files) the shape of the window, or of the screen in
+// fullscreen, by the same rule as ge_screen_ratio_tick. The Video page offers
+// only 4:3, 16:9 and 21:9, starting from this one.
+std::string EffectiveScreenRatio() {
+  const std::string chosen = GetS("ge_screen_ratio");
+  if (chosen != "auto") return chosen;
+  int w = std::atoi(GetS("ge_window_width").c_str());
+  int h = std::atoi(GetS("ge_window_height").c_str());
+  if (GetB("fullscreen")) {
+    MONITORINFO mi{sizeof(mi)};
+    HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+      w = mi.rcMonitor.right - mi.rcMonitor.left;
+      h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    }
+  }
+  if (w <= 0 || h <= 0) return "16:9";
+  const float aspect = static_cast<float>(w) / static_cast<float>(h);
+  return aspect < 1.55f ? "4:3" : aspect >= 2.2f ? "21:9" : "16:9";
+}
+
+std::vector<WindowSize> OfferedWindowSizes(const std::string& ratio) {
+  // Room for the window's picture: the screen's work area (no taskbar) less
+  // the window frame. A bigger size was cut down by Windows to a different
+  // shape (3440x1440 became 3424x1353 on a 3440x1440 screen).
+  int screen_w = 0, screen_h = 0;
+  MONITORINFO mi{sizeof(mi)};
+  HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+  if (mon && GetMonitorInfoW(mon, &mi)) {
+    RECT frame{0, 0, 0, 0};
+    AdjustWindowRectEx(&frame, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    screen_w = (mi.rcWork.right - mi.rcWork.left) - (frame.right - frame.left);
+    screen_h = (mi.rcWork.bottom - mi.rcWork.top) - (frame.bottom - frame.top);
+  }
+  std::vector<WindowSize> shape, fitting;
+  for (const WindowSize& s : kWindowSizes) {
+    if (ratio != "auto" && ratio != s.ratio) continue;
+    shape.push_back(s);
+    if (screen_w <= 0 || (s.w <= screen_w && s.h <= screen_h)) fitting.push_back(s);
+  }
+  return fitting.empty() ? shape : fitting;  // a small screen still gets the smallest size
+}
+void SetWindowSize(const WindowSize& s) {
+  rex::cvar::SetFlagByName("ge_window_width", std::to_string(s.w));
+  rex::cvar::SetFlagByName("ge_window_height", std::to_string(s.h));
+  if (g_persist) g_persist();
+  if (g_window_size) g_window_size(s.w, s.h);
+}
+// The renderer this run started with: -1 not known yet, 0 classic, 1 native.
+int g_renderer_active = -1;
 // Leaving the Video page with a different Render Scale: save and restart now
 // (the emulated GPU reads the scale only when it starts).
 void RestartIfRenderScaleChanged() {
@@ -260,7 +293,8 @@ constexpr float kLabelX = 70.0f;
 constexpr float kValueX = 245.0f;
 constexpr float kRowY0 = 88.0f;
 constexpr float kRowSpacing = 24.0f;
-constexpr float kSliderW = 100.0f;
+constexpr int kRowsAtFullSpacing = 10;  // more rows are drawn closer, so the last stays on screen
+constexpr float kSliderW = 60.0f;  // short enough for the value to fit the 4:3 page
 constexpr float kSliderH = 12.0f;
 
 // Online Settings' Player Name row: "<" and ">" either side of the name step
@@ -391,30 +425,28 @@ std::vector<Row> BuildPage(Page page) {
       // is the 60 Hz vblank; a lower cap slowed the game itself down).
       rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
       AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
-      AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
-                {{"Off", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
-      AddChoice(rows, "Texture Filtering:", "anisotropic_override",
-                {{"Bilinear", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}});
+      // Native renderer: the scene's MSAA, applied at once (Off by default, the
+      // lightest); the classic renderer's FXAA post effect does nothing there.
+      if (g_renderer_active == 1)
+        AddChoice(rows, "Anti-Aliasing:", "gpu_native_msaa", {{"OFF", "1"}, {"2x", "2"}, {"4x", "4"}});
+      else
+        AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
+                  {{"OFF", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
+      // No Texture Filtering row: the native renderer always uses 4x
+      // anisotropic filtering (anisotropic_override in ge.toml still sets it).
       // Window size in windowed mode (fullscreen always uses the display). The
       // game keeps rendering the same way; the picture is scaled to the window.
       AddAction(
           rows, "Resolution:",
           [] {
             if (GetB("fullscreen")) return;  // fullscreen always uses the screen's size
-            // 4:3, 16:9 and 21:9 sizes; Screen Ratio follows the window shape.
-            static const int kSizes[][2] = {{1024, 768},  {1280, 720},  {1920, 1080},
-                                            {2560, 1080}, {2560, 1440}, {3440, 1440},
-                                            {3840, 2160}};
-            constexpr int kCount = 7;
+            const std::vector<WindowSize> sizes = OfferedWindowSizes(EffectiveScreenRatio());
             const int w = std::atoi(GetS("ge_window_width").c_str());
             const int h = std::atoi(GetS("ge_window_height").c_str());
-            int next = 1;  // 1280x720 unless the current size is in the list
-            for (int i = 0; i < kCount; ++i)
-              if (kSizes[i][0] == w && kSizes[i][1] == h) next = (i + 1) % kCount;
-            rex::cvar::SetFlagByName("ge_window_width", std::to_string(kSizes[next][0]));
-            rex::cvar::SetFlagByName("ge_window_height", std::to_string(kSizes[next][1]));
-            if (g_persist) g_persist();
-            if (g_window_size) g_window_size(kSizes[next][0], kSizes[next][1]);
+            size_t next = 0;  // the first size unless the current one is offered
+            for (size_t i = 0; i < sizes.size(); ++i)
+              if (sizes[i].w == w && sizes[i].h == h) next = (i + 1) % sizes.size();
+            SetWindowSize(sizes[next]);
           },
           [] {
             if (GetB("fullscreen")) {  // the size of the screen the game is on
@@ -427,28 +459,66 @@ std::vector<Row> BuildPage(Page page) {
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
           });
+      // The game's TV shape (ge_hooks.cpp): 4:3, 16:9 or 21:9 (an "auto"
+      // setting shows as the shape it follows). Choosing a shape in a window
+      // also moves the window to the nearest size of that shape, so the picture
+      // fills it (fullscreen keeps the screen's shape, with bars where the two
+      // differ).
+      AddAction(
+          rows, "Screen Ratio:",
+          [] {
+            static const char* const kOrder[] = {"4:3", "16:9", "21:9"};
+            const std::string cur = EffectiveScreenRatio();
+            int i = 0;
+            for (int k = 0; k < 3; ++k)
+              if (cur == kOrder[k]) i = k;
+            const std::string next = kOrder[(i + 1) % 3];
+            SetS("ge_screen_ratio", next);
+            if (GetB("fullscreen")) return;
+            const int w = std::atoi(GetS("ge_window_width").c_str());
+            const int h = std::atoi(GetS("ge_window_height").c_str());
+            const std::vector<WindowSize> sizes = OfferedWindowSizes(next);
+            const WindowSize* best = &sizes.front();
+            for (const WindowSize& s : sizes) {
+              if (s.w == w && s.h == h) return;  // already this shape
+              if (std::abs(s.h - h) < std::abs(best->h - h)) best = &s;
+            }
+            SetWindowSize(*best);
+          },
+          [] { return EffectiveScreenRatio(); });
       // No Graphics API row: Auto picks it (NVIDIA -> Direct3D 12, other GPUs
       // -> Vulkan); gpu = "d3d12" / "vulkan" in ge.toml still overrides it.
       AddAction(
           rows, "Render Scale:",
           [] {
-            static const char* const kOrder[] = {"auto", "1", "2", "3"};
-            const std::string cur = GetS("ge_render_scale");
-            int i = 0;
-            for (int k = 0; k < 4; ++k)
-              if (cur == kOrder[k]) i = k;
-            SetS("ge_render_scale", kOrder[(i + 1) % 4]);
+            const int next = DesiredRenderScale() % 3 + 1;  // 1x -> 2x -> 3x -> 1x
+            SetS("ge_render_scale", std::to_string(next));
           },
           [] {
-            const std::string v = GetS("ge_render_scale");
-            std::string text = v == "1" || v == "2" || v == "3"
-                                   ? v + "x"
-                                   : "Auto (" + std::to_string(DesiredRenderScale()) + "x)";
-            if (g_render_scale_active && DesiredRenderScale() != g_render_scale_active)
+            // Any change restarts the game on Done; 2x and 3x always say so.
+            const int scale = DesiredRenderScale();
+            std::string text = std::to_string(scale) + "x";
+            if (g_render_scale_active && scale != g_render_scale_active)
               text += " - restarts";
+            else if (scale > 1)
+              text += " (restart)";
             return text;
           });
+      // FSR (FSR 1 / CAS) or plain bilinear for stretching the Render Scale
+      // picture to the window; applies at once.
+      AddChoice(rows, "FSR Upscaling:", "ge_upscaling", {{"ON", "on"}, {"OFF", "off"}});
+      // No Renderer row: the classic Xenos renderer stays a ge.toml fallback
+      // (gpu_native = false), read when the game starts.
       AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
+      // Re-run the launcher's setup (re-import the game, extras); closes the
+      // game. Only in the release layout, where the launcher exists.
+      static const bool have_launcher = !ge::LauncherPath().empty();
+      if (have_launcher) {
+        AddAction(rows, "Run Setup Again", [] {
+          ge::PersistSettings();
+          ge::RunSetupAgain();
+        });
+      }
       AddAction(rows, "Done", [] {
         RestartIfRenderScaleChanged();
         g_leave_page = true;
@@ -457,8 +527,6 @@ std::vector<Row> BuildPage(Page page) {
     }
     case Page::PostFx:
       rows.push_back(Row{RowKind::Toggle, "Post-Processing:", "postfx_enabled"});
-      // Upscaling lives here: the Video page holds ten rows.
-      AddChoice(rows, "Upscaling:", "ge_upscaling", {{"FSR", "on"}, {"Off", "off"}});
       AddSlider(rows, "Brightness:", "postfx_brightness", -1.0f, 1.0f, 0.02f);
       AddSlider(rows, "Contrast:", "postfx_contrast", 0.0f, 2.0f, 0.02f);
       AddSlider(rows, "Saturation:", "postfx_saturation", 0.0f, 2.0f, 0.02f);
@@ -620,12 +688,21 @@ bool ButtonHeld(PPCContext& ctx, uint8_t* base, uint32_t mask) {
   return ctx.r3.u32 != 0;
 }
 
-float RowY(int i) { return kRowY0 + kRowSpacing * static_cast<float>(i); }
+// Row spacing of the page being shown: pages longer than ten rows squeeze
+// them into the height of ten (the game's text stays its own size).
+float g_row_spacing = kRowSpacing;
+void SetRowCount(size_t count) {
+  g_row_spacing = count > kRowsAtFullSpacing
+                      ? kRowSpacing * (kRowsAtFullSpacing - 1) / static_cast<float>(count - 1)
+                      : kRowSpacing;
+}
+
+float RowY(int i) { return kRowY0 + g_row_spacing * static_cast<float>(i); }
 
 int RowAtCursor(uint8_t* base, int count) {
   const float y = LDF32(base, kCursorY);
   for (int i = 0; i < count; ++i) {
-    if (y >= RowY(i) - 4.0f && y < RowY(i) - 4.0f + kRowSpacing) return i;
+    if (y >= RowY(i) - 4.0f && y < RowY(i) - 4.0f + g_row_spacing) return i;
   }
   return -1;
 }
@@ -721,6 +798,7 @@ void BeginCapture(const Row& r) {
 void DrawPage(PPCContext& ctx, uint8_t* base) {
   if (!EnsureGuestBlocks(base)) return;
   const std::vector<Row> rows = BuildPage(g_page);
+  SetRowCount(rows.size());
   GuestFrame frame(ctx);
   const uint32_t sp = frame.sp;
   for (size_t i = 0; i < rows.size(); ++i) {
@@ -791,6 +869,7 @@ void Activate(Row& r) {
 bool UpdatePage(PPCContext& ctx, uint8_t* base) {
   UpdateCapture();
   std::vector<Row> rows = BuildPage(g_page);
+  SetRowCount(rows.size());
   if (g_capture_cvar) return false;  // typing: the menu waits
   g_hover = RowAtCursor(base, static_cast<int>(rows.size()));
 
@@ -864,6 +943,10 @@ void SetNativeMenuCallbacks(std::function<void(bool)> fullscreen, std::function<
 void PersistSettings() {
   if (g_persist) g_persist();
 }
+void SetActiveRenderer(bool native) { g_renderer_active = native ? 1 : 0; }
+// The renderer is fixed for the run (gpu_native may change in the menu: it
+// applies after the restart).
+bool NativeRendererActive() { return g_renderer_active == 1; }
 void SetWindowSizeHandler(std::function<void(int, int)> handler) {
   g_window_size = std::move(handler);
 }
@@ -1239,33 +1322,24 @@ std::string ReadVersionText() {
 // The SDK's resolution_scale multiplies the game's 1280x720 render targets
 // (2x = 2560x1440). It is read once when the emulated GPU starts, so a change
 // applies by restarting the game (done for the player on leaving the Video
-// page). Auto: 1x on an integrated GPU (handhelds, laptops), else 2x.
+// page). 1x by default; 2x and 3x are the player's choice.
 // Upscaling (see ge::ApplyUpscaling).
 REXCVAR_DEFINE_STRING(ge_upscaling, "on", "Video", "Upscaling: on (FSR 1 / CAS) or off (bilinear)")
     .allowed({"on", "off"});
-REXCVAR_DEFINE_STRING(ge_render_scale, "auto", "Video",
-                      "Render scale: auto (1x on integrated GPUs, else 2x), 1, 2 or 3")
-    .allowed({"auto", "1", "2", "3"});
+REXCVAR_DEFINE_STRING(ge_render_scale, "1", "Video",
+                      "Render scale: 1 (1280x720, the default), 2 (2560x1440) or 3 (3840x2160)")
+    .allowed({"auto", "1", "2", "3"});  // "auto" (older ge.toml files) now means 1
 namespace ge {
 void ApplyRenderScale() {
   g_scale_gpu = DetectGpuForScale();
-  // The window does not exist yet: fullscreen uses the monitor it will open on.
-  const bool fullscreen = GetB("fullscreen");
-  const int height = fullscreen ? StartupDisplayHeight(std::atoi(GetS("monitor").c_str()))
-                                : std::atoi(GetS("ge_window_height").c_str());
-  const int auto_scale = AutoRenderScale(height > 0 ? height : 1080);
   const std::string choice = GetS("ge_render_scale");
-  g_render_scale_active =
-      (choice == "1" || choice == "2" || choice == "3") ? choice[0] - '0' : auto_scale;
+  g_render_scale_active = DesiredRenderScale();
   // resolution_scale belongs to the GPU plugin, which is not loaded yet:
   // ApplyRenderScaleToGpu sets it once the plugin is in (setting it here was
   // silently rejected, so every scale drew at the plugin's default 2x).
-  REXLOG_INFO(
-      "Render scale {}x (setting {}; auto {}x from {} display height {}; GPU {}, {}, {} MB video "
-      "memory)",
-      g_render_scale_active, choice, auto_scale, fullscreen ? "fullscreen" : "windowed", height,
-      g_scale_gpu.name, g_scale_gpu.integrated ? "integrated" : "dedicated",
-      g_scale_gpu.video_memory_mb);
+  REXLOG_INFO("Render scale {}x (setting {}; GPU {}, {}, {} MB video memory)",
+              g_render_scale_active, choice, g_scale_gpu.name,
+              g_scale_gpu.integrated ? "integrated" : "dedicated", g_scale_gpu.video_memory_mb);
 }
 // performance_diagnostics (ge.toml, off by default): the one setting players
 // change to send a detailed log. It turns on the existing detailed timing,
@@ -1345,7 +1419,9 @@ void LogSessionHeader() {
               GetB("fullscreen") ? "fullscreen, window" : "windowed", GetS("ge_window_width"),
               GetS("ge_window_height"));
   REXLOG_INFO("Settings: renderer {}, render scale {} ({}x), V-Sync {}, mouse look {}",
-              GetS("gpu"), GetS("ge_render_scale"), g_render_scale_active, GetS("vsync"),
+              g_renderer_active == 1 ? "native (graphics API " + GetS("gpu_native_api") + ")"
+                                     : "classic (graphics API " + GetS("gpu") + ")",
+              GetS("ge_render_scale"), g_render_scale_active, GetS("vsync"),
               GetS("ge_mouselook_enable"));
   REXLOG_INFO("Performance diagnostics: {}",
               GetB("performance_diagnostics") ? "on" : "off (set performance_diagnostics = true "
@@ -1363,7 +1439,13 @@ void ApplyUpscaling() {
 void SetUpscalingChangedHandler(std::function<void()> handler) {
   g_upscaling_changed = std::move(handler);
 }
+// The scale this run draws at (the native renderer sizes its targets by it).
+int ActiveRenderScale() { return g_render_scale_active > 0 ? g_render_scale_active : 2; }
 void ApplyRenderScaleToGpu() {
+  // resolution_scale is the Xenos plugin's; the native renderer reads the
+  // scale itself (ActiveRenderScale), so there's nothing to set (and no
+  // "could not set" warning in every player's log).
+  if (NativeRendererActive()) return;
   const std::string want = std::to_string(g_render_scale_active > 0 ? g_render_scale_active : 2);
   const bool ok = rex::cvar::SetFlagByName("resolution_scale", want);
   const std::string now = rex::cvar::GetFlagByName("resolution_scale");
@@ -1388,6 +1470,22 @@ void ge_backdrop_tick(bool front_end) {
   last = static_cast<int>(front_end);
   rex::cvar::SetFlagByName("ge_backdrop_active", front_end ? "true" : "false");
 }
+
+namespace ge {
+// Whether the desk goes behind the frame being presented, from the game's state
+// at that moment (the same test as ge_backdrop_tick's caller): the folder menus
+// of the front end, menu 7 and up, but not the mission black-out (12) or the
+// agent showcase (24, 25). ge_backdrop_active follows the controller polls,
+// which can come a frame after the main menu first shows: that frame had no
+// desk, the folder filling the screen for a moment between logo and menu.
+bool BackdropActiveNow() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks || !ks->memory()) return false;
+  uint8_t* base = ks->memory()->virtual_membase();
+  const uint32_t stage = LD32(base, 0x82423E00u), menu = LD32(base, 0x8272B35Cu);
+  return stage == 90u && menu >= 7u && menu != 12u && menu != 24u && menu != 25u;
+}
+}  // namespace ge
 
 // Front-end menus: the open folder is a 3D model (sub_820F5898, drawn first by
 // every menu) framed for a 4:3 screen, so a wide window showed black where the

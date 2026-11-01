@@ -26,7 +26,8 @@ projects, you can tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 ## Requirements
 
 - Windows 10 or 11, 64-bit
-- A graphics card with DirectX 12 support
+- A graphics card with DirectX 12 or Vulkan support (integrated laptop
+  graphics such as Intel HD 620 or AMD Radeon included)
 - Your own GoldenEye 007 Xbox Live Arcade package (the Xbox 360 game file for
   Title ID `584108A9`)
 
@@ -47,6 +48,9 @@ From then on opening `GoldenEye 007.exe` starts the game straight away; the
 package is not needed again. Everything stays inside the extracted folder
 (`resources\assets` for the imported game data, `resources\userdata` for user save data
 and settings), so it can be moved or backed up as a whole.
+To open setup again (change extras, re-import), hold **Shift** while opening
+`GoldenEye 007.exe`, or choose Help & Options > Video Settings > **Run Setup
+Again** in the game.
 Coming from an older release with `Setup GoldenEye 007.exe` and a `Game`
 folder? Extract into or next to the old folder and setup imports straight
 from the old install, saves and settings included.
@@ -57,10 +61,19 @@ neither setup nor the game contacts Xbox Live.
 ## Features
 
 - **Native Windows PC build**: no emulator, runs as a normal Windows program
+- **New native renderer**: the game is drawn directly with Direct3D 12 (or
+  Vulkan) instead of emulating the Xbox 360's graphics chip, using about half
+  the CPU and graphics power, so it runs at a steady 60 FPS on laptops and
+  integrated graphics too. The first time a level loads, its shaders are
+  translated on your PC (a moment longer; later loads are quick). The classic
+  renderer of earlier versions stays available (`gpu_native = false` in
+  `ge.toml`)
 - **Up to 4K**: windowed sizes from 1024×768 to 3840×2160, or fullscreen at
-  your screen's resolution, rendered at twice the original resolution
-- **Widescreen**: 16:9 and 21:9 (Screen Ratio in the game's options), with a
-  desk backdrop around the menus on wide screens
+  your screen's resolution; render scale 1x (1280×720, the default), 2x or 3x
+  with FSR upscaling
+- **Widescreen**: 4:3, 16:9 and 21:9 (Screen Ratio in Video Settings, which
+  also picks matching window sizes), with a desk backdrop around the menus on
+  wide screens
   ![GoldenEye 007 running in 21:9 widescreen](docs/screenshots/gameplay-ultrawide.jpg)
 - **Steady 60 FPS** (the game's own rate), with tear-free V-Sync and an
   optional FPS / frame-time counter
@@ -75,11 +88,11 @@ neither setup nor the game contacts Xbox Live.
   Tailscale and Hamachi
   ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
-  (display mode, window size, V-Sync, FPS counter, field of view,
-  anti-aliasing, texture filtering, render scale, post-processing filter)
-  and Online Settings. The renderer is picked automatically: Direct3D 12 on
-  NVIDIA, Vulkan on AMD and other GPUs (Direct3D 12 crashes on AMD with this
-  game); `gpu = "d3d12"` or `gpu = "vulkan"` in `ge.toml` overrides it
+  (display mode, V-Sync, FPS counter, field of view, anti-aliasing,
+  resolution, screen ratio, render scale, FSR upscaling, post-processing
+  colour filter, Run Setup Again) and Online Settings. The new renderer uses
+  Direct3D 12 and switches to Vulkan by itself if Direct3D 12 can't start;
+  `gpu_native_api = "vulkan"` in `ge.toml` picks Vulkan
   ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)
 - **Wider field of view** (10 degrees wider by default, adjustable from the
   original up to +30)
@@ -121,7 +134,8 @@ console.
 - Frigate, both small balconies can be walked onto and players can drop off the large ledge onto the deck below (multiplayer).
 - Bunker: the entrance out to the snow is walled off again, so players can’t leave the map (multiplayer).
 - Music fixed watch/pause theme, Mission Select music after a mission ends and the Control and Caverns elevator music which now resumes where it left off.
-- Dead guards fade out increased from 1.5 seconds to 1 minute.
+- Dead guards stay 10 seconds before they fade out (the original faded them after 1.5 seconds).
+- Cradle: killing Trevelyan at the final showdown now ends the mission.
 - Tank turret aiming with the mouse.
 - Fixed two different characters both being called "Scientist" on character select.
 - Fixed multiplayer characters icons "?" now show character models in character select.
@@ -162,6 +176,11 @@ For slowdowns, stutter or freezes, a detailed log helps most:
 Every log, detailed or not, has a line a minute with the frame rate and the
 frames that took too long. The 20 newest logs are kept.
 
+For a character that gets stuck (someone who should walk somewhere and doesn't,
+so the mission can't finish), do the same with `npc_path_log = true`: play until
+it happens, wait a minute, close the game and attach the newest log. It records
+where characters stopped and which part of the mission script they were running.
+
 ## For Developers
 
 Building from source. You need Git, CMake 3.25 or newer, Ninja, LLVM/Clang 18
@@ -171,8 +190,13 @@ releases ship) and Windows PowerShell, plus your own GoldenEye 007 package.
 
 ReXGlue is the `rexglue-sdk` submodule, pinned to upstream v0.10.0. This
 project's changes to it, including the GoldenEye Recomp ReXGlue fork, are kept
-in `patches/rexglue.patch`, which CMake applies automatically. ReXGlue's
-dependencies are nested deeply, so enable long paths when cloning:
+in `patches/rexglue.patch`, which CMake applies automatically. The native
+renderer's libraries are submodules too: `thirdparty/plume`
+([Plume](https://github.com/zolaware/plume)) and `thirdparty/XenosRecomp`
+([XenosRecomp](https://github.com/hedge-dev/XenosRecomp), which brings
+Microsoft's DirectX Shader Compiler binaries), with small changes in
+`patches/plume.patch` and `patches/xenosrecomp.patch`, also applied by CMake.
+The dependencies are nested deeply, so enable long paths when cloning:
 
 ```powershell
 git -c core.longpaths=true clone --recurse-submodules --shallow-submodules https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp.git
@@ -233,6 +257,9 @@ This project is built on the work of others:
 - [ReXGlue](https://github.com/rexglue/rexglue-sdk) by Tom Clay and
   contributors (BSD 3-Clause), which includes code derived from
   [Xenia](https://xenia.jp).
+- [Plume](https://github.com/zolaware/plume) (MIT) and
+  [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) (MIT), which the
+  native renderer draws with and translates the game's shaders with.
 
 This project's own code is released under The Unlicense, like GoldenEye
 Recomp (see [LICENSE](LICENSE), which also lists what it does not cover).
@@ -242,7 +269,11 @@ The STFS package reader (`packaging/launcher/stfs.cpp` and
 launcher it is compiled into (`GoldenEye 007.exe` in the release root) is
 distributed under the GPL-3.0; the game itself is a separate program. ReXGlue and
 its third-party libraries keep their own licences; see
-[packaging/licenses](packaging/licenses).
+[packaging/licenses](packaging/licenses). The release ships Microsoft's
+DirectX Shader Compiler (`dxcompiler.dll`, LLVM/MIT licences, and `dxil.dll`,
+Microsoft's redistributable under the Microsoft Software License Terms); its
+terms are in [packaging/licenses-native](packaging/licenses-native), and using
+`dxil.dll` means accepting them.
 
 GoldenEye 007, James Bond, Xbox and Xbox 360 are trademarks or property of
 their respective owners. This is an unofficial fan project, not affiliated

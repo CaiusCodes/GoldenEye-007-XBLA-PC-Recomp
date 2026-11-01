@@ -21,7 +21,8 @@ that it is the supported version and imports the game data from it into this
 folder. After that the package is not needed any more.
 
 Requirements:
-  Windows 10 or 11 (64-bit) and a DirectX 12 capable graphics card.
+  Windows 10 or 11 (64-bit) and a graphics card with DirectX 12 or Vulkan
+  (integrated laptop graphics such as Intel HD 620 or AMD Radeon work too).
   Nothing else needs installing: the Microsoft Visual C++ runtime the game
   uses is included.
 
@@ -78,14 +79,15 @@ SETTINGS
 Help & Options on the main menu holds the PC settings:
   Keyboard & Mouse   mouse look, sensitivity, precise aim sensitivity,
                      invert look, key bindings
-  Video Settings     windowed or fullscreen, window size (up to 3840x2160),
-                     V-Sync, FPS counter, field of view, anti-aliasing,
-                     texture filtering, render scale (Auto: 1x on
-                     handhelds and laptops, 2x on most graphics cards),
-                     post-processing
+  Video Settings     windowed or fullscreen, V-Sync, FPS counter, field of
+                     view, anti-aliasing, window size (up to 3840x2160),
+                     screen ratio (4:3, 16:9 or 21:9; the window sizes
+                     offered follow it), render scale (1x = 1280x720 by
+                     default; 2x and 3x look sharper, need a stronger
+                     graphics card and restart the game), FSR upscaling
+                     (on or off), post-processing (colour filter) and Run
+                     Setup Again
   Online Settings    player name and the online server options
-
-Screen Ratio (Normal, 16:9 or 21:9) is in the game's own options.
 
 MULTIPLAYER OVER LAN OR A VIRTUAL LAN
 -------------------------------------
@@ -125,9 +127,10 @@ drive works too). To back up your progress, copy resources\userdata.
 SETUP AGAIN, UPDATING AND OLDER RELEASES
 ----------------------------------------
 
-To change your extras or import your package again, start the game with
---setup (for example from a shortcut whose target ends in
-"GoldenEye 007.exe" --setup). Importing again replaces resources\assets only;
+To change your extras or import your package again, open the setup window:
+hold Shift while opening GoldenEye 007.exe (or its shortcut), or choose
+Help & Options > Video Settings > Run Setup Again in the game. Starting
+GoldenEye 007.exe with --setup works too. Importing again replaces resources\assets only;
 saves and settings in resources\userdata are kept. If a needed file goes
 missing, opening GoldenEye 007.exe shows the setup window again by itself.
 
@@ -166,6 +169,21 @@ Reporting slowdowns, stutter or freezes:
      writes more often and is only needed while reporting.
 The 20 newest logs are kept; older ones are deleted automatically.
 
+Reporting a character that gets stuck (an ally or enemy who should walk
+somewhere and doesn't, so the mission can't finish): do the same with
+npc_path_log = true instead, play until it happens, wait a minute, then
+close the game and send the newest log.
+
+The renderer: the game draws with its new native renderer. The first time
+each level loads, it translates the level's shaders on your PC, so that
+first load can take a moment longer; later loads are quick (the results
+are kept in resources\userdata\native_shaders). If the game shows wrong
+or missing graphics, black screens or crashes that the classic renderer
+of earlier versions did not, add this line to resources\userdata\ge.toml
+to go back to it, and please report the problem with the newest log:
+     gpu_native = false
+Delete the line again to return to the new renderer.
+
 LEGAL
 -----
 
@@ -182,3 +200,9 @@ package reader derived from Velocity and is licensed under the GNU GPL
 version 3 (licenses\LICENSE-Extract-STFS.txt); its source is in the project
 repository. The game in resources\runtime is a separate program under the
 Unlicense and MIT licences.
+
+resources\runtime also holds Microsoft's DirectX Shader Compiler, which the
+game uses to translate shaders on your PC: dxcompiler.dll (LLVM and MIT
+licences) and dxil.dll, which is Microsoft software redistributed under the
+Microsoft Software License Terms. By using it you agree to those terms, in
+licenses\LICENSE-MS-DirectXShaderCompiler.txt.

@@ -8,3 +8,8 @@ license_mask = 1
 # Online play needs a GoldenEye Recomp server; set it up in Help & Options >
 # Online Settings.
 ge_online_enable = false
+# For bug reports (see the README): set to true, play, then send the newest
+# ge_NNN.log from resources\runtime\logs. Detailed timing for slowdowns:
+performance_diagnostics = false
+# Characters that get stuck (where they stopped and which script they run):
+npc_path_log = false

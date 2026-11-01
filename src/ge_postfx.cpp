@@ -60,6 +60,7 @@ REXCVAR_DEFINE_BOOL(ge_show_fps, false, "Video",
                     "Show the game's frame rate in the top-left corner");
 
 namespace ge {
+bool BackdropActiveNow();  // ge_native_menu.cpp: the desk goes behind this frame
 
 
 namespace {
@@ -284,7 +285,7 @@ void BackdropBars::OnDraw(ImGuiIO& io) {
     reported_aspect_ = window;
     rex::cvar::SetFlagByName("ge_backdrop_window_aspect", std::to_string(window));
   }
-  if (rex::cvar::GetFlagByName("ge_backdrop_active") != "true" ||
+  if (!ge::BackdropActiveNow() ||
       rex::cvar::GetFlagByName("ge_backdrop_ready") != "true" ||
       rex::cvar::GetFlagByName("present_letterbox") != "true") {
     return;
