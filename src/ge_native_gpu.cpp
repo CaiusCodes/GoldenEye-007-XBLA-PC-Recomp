@@ -741,6 +741,9 @@ float3 backdrop(float3 c, uint2 id) {
   bool clip = hi > 0.25 && hi - lo < 0.08;
   bool crosshair = c.r > 0.6 && c.g < c.r * 0.3 && c.b < c.r * 0.3;
   float2 p = pos * float2(1280.0, 720.0);
+  // A 4:3 front end is the middle 960 units of the 16:9 one, stretched to the
+  // frame: map back so the folder outline measured for 16:9 trims it the same.
+  [branch] if (layout_4x3 != 0u) p.x = 160.0 + p.x * 0.75;
   float px_per_unit = float(size.y) / 720.0;
   // Only where the main menu's (left) or a briefing's (right) photo clip is.
   bool clip_area = (p.x > 320.0 && p.x < 370.0) || (p.x > 744.0 && p.x < 794.0);
@@ -757,10 +760,6 @@ float3 backdrop(float3 c, uint2 id) {
   bool top_left = p.x > kSpineEnd && p.x < 232.0;
   float top_edge = top_left ? 27.5 : kBoardTop;
   bool top_cut = !left_zone && p.y < top_edge && !crosshair && !keep_clip;
-  [branch] if (layout_4x3 != 0u) {
-    top_cut = false;
-    soft_edge = false;
-  }
   [branch] if (!key && !top_cut && !soft_edge) {
     return c;
   }
