@@ -88,6 +88,8 @@ REXCVAR_DECLARE(bool, gpu_native_translate);  // ge_native_shaders.cpp
 REXCVAR_DECLARE(bool, ge_hide_button_icons);  // ge_native_menu.cpp
 REXCVAR_DEFINE_STRING(gpu_native_skip_ps, "", "GPU",
                       "Native renderer test: skip draws whose pixel shader has this cache hash (16 hex digits)");
+REXCVAR_DEFINE_STRING(gpu_native_hide, "", "GPU",
+                      "Native renderer test: hide draws ""a-b"" of each frame, or triangles ""d:a-b"" of draw d");
 REXCVAR_DEFINE_STRING(gpu_native_api, "auto", "GPU",
                       "Native renderer API: auto (Direct3D 12, Vulkan if that cannot start), d3d12 or vulkan");
 REXCVAR_DEFINE_STRING(gpu_native_adapter, "", "GPU",
@@ -3124,8 +3126,11 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
     ientry = &g.index_cache[key];
     ientry->last_frame = g.frames;
   }
-  const bool ihit = ientry && ientry->buffer && ientry->content == icontent;
+  // A traced frame decodes every draw afresh (the geometry log below needs the indices and vertices).
+  const std::string hide = REXCVAR_GET(gpu_native_hide);  // test: see gpu_native_hide
+  const bool ihit = !tracing() && hide.empty() && ientry && ientry->buffer && ientry->content == icontent;
   std::vector<uint32_t> idx;
+  std::vector<uint32_t> hidden_tris;  // gpu_native_hide's triangles, traced below
   int64_t lo = 0;
   uint32_t vcount = 0, icount = 0;
   RenderPrimitiveTopology topo = RenderPrimitiveTopology::TRIANGLE_LIST;
@@ -3172,6 +3177,23 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
   }
   idx.swap(list);
   if (idx.empty()) return;
+  if (!hide.empty()) {  // gpu_native_hide: "a-b" draws, or "d:a-b" triangles of draw d
+    unsigned d = 0, a = 0, b = 0;
+    if (std::sscanf(hide.c_str(), "%u:%u-%u", &d, &a, &b) == 3) {
+      if (g.draws == d && prim != 1 && prim != 2 && prim != 3) {
+        std::vector<uint32_t> kept;
+        hidden_tris.clear();
+        for (size_t t = 0; t + 2 < idx.size(); t += 3)
+          if (t / 3 < a || t / 3 > b) kept.insert(kept.end(), {idx[t], idx[t + 1], idx[t + 2]});
+          else hidden_tris.insert(hidden_tris.end(), {idx[t], idx[t + 1], idx[t + 2]});
+        if (kept.empty()) { ++g.draws; return; }
+        idx.swap(kept);
+      }
+    } else if (std::sscanf(hide.c_str(), "%u-%u", &a, &b) == 2 && g.draws >= a && g.draws <= b) {
+      ++g.draws;
+      return;
+    }
+  }
   lo = INT64_MAX;
   int64_t hi = INT64_MIN;
   for (uint32_t i : idx) { lo = std::min<int64_t>(lo, int64_t(i) + base_vertex); hi = std::max<int64_t>(hi, int64_t(i) + base_vertex); }
@@ -3244,7 +3266,7 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
     ++g.skipped; ++g.skip_reason[4]; return;
   }
   RenderBufferReference vref;
-  const bool hit = entry && entry->buffer && entry->content == content;
+  const bool hit = !tracing() && entry && entry->buffer && entry->content == content;
   if (entry) entry->last_frame = g.frames;
   if (hit) ++g.vcache_hits; else ++g.vcache_misses;
   const uint64_t voff = hit ? 0 : upload_alloc(vbytes, 16);
@@ -3365,6 +3387,62 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
       raw += fmt::format(" {:08X}", g32(sources[0].addr + uint32_t(lo) * sources[0].stride + i * 4));
     NTRACE("  source0 {:08X} stride {} endian {} {} first vertex:{}", sources[0].addr, sources[0].stride,
            sources[0].endian, up_data ? "UP" : "", raw);
+    // Stretched triangles (one edge far longer than the draw's usual edge):
+    // a vertex out of place in the data, e.g. a spike across the sky.
+    size_t pe = els.size();
+    for (size_t e = 0; e < els.size(); ++e)
+      if (els[e].usage == 0 && hfmts[e].size >= 12 && pe == els.size()) pe = e;
+    // Triangles hidden by gpu_native_hide, with their vertices' guest addresses.
+    if (pe < els.size() && !sources.empty())
+      for (size_t t = 0; t + 2 < hidden_tris.size(); t += 3) {
+        uint32_t src_addr = 0, src_stride = 0;
+        for (size_t k = 0; k < keys.size(); ++k)
+          if (keys[k] == els[pe].stream) { src_addr = sources[k].addr; src_stride = sources[k].stride; }
+        std::string vs;
+        for (int k = 0; k < 3; ++k) {
+          const uint32_t gv = uint32_t(int64_t(hidden_tris[t + k]) + base_vertex);
+          const uint32_t ga = src_addr ? src_addr + gv * src_stride + els[pe].offset : 0;
+          vs += fmt::format(" v{} at {:08X}: {:08X} {:08X} {:08X}", gv, ga, ga ? g32(ga) : 0, ga ? g32(ga + 4) : 0,
+                            ga ? g32(ga + 8) : 0);
+        }
+        NTRACE("  HIDDEN tri of draw#{}:{}", g.draws, vs);
+      }
+    if (pe < els.size() && topo == RenderPrimitiveTopology::TRIANGLE_LIST && idx.size() >= 3) {
+      auto pos = [&](uint32_t i) {
+        const float* f = reinterpret_cast<const float*>(g.upload_ptr + voff +
+                                                        uint64_t(int64_t(i) + base_vertex - lo) * host_stride +
+                                                        hoffsets[pe]);
+        return std::array<float, 3>{f[0], f[1], f[2]};
+      };
+      auto dist = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+        return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+      };
+      std::vector<float> edges;
+      for (size_t t = 0; t + 2 < idx.size(); t += 3)
+        for (int k = 0; k < 3; ++k) edges.push_back(dist(pos(idx[t + k]), pos(idx[t + (k + 1) % 3])));
+      std::vector<float> sorted = edges;
+      std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+      const float median = std::max(sorted[sorted.size() / 2], 1e-3f);
+      int reported = 0;
+      uint32_t src_addr = 0, src_stride = 0;
+      for (size_t k = 0; k < keys.size(); ++k)
+        if (keys[k] == els[pe].stream) { src_addr = sources[k].addr; src_stride = sources[k].stride; }
+      for (size_t t = 0; t + 2 < idx.size() && reported < 8; t += 3) {
+        const float m = std::max({edges[t], edges[t + 1], edges[t + 2]});
+        if (m < median * 8.0f) continue;
+        ++reported;
+        std::string vs;
+        for (int k = 0; k < 3; ++k) {
+          const auto q = pos(idx[t + k]);
+          const uint32_t gv = uint32_t(int64_t(idx[t + k]) + base_vertex);
+          const uint32_t ga = src_addr ? src_addr + gv * src_stride + els[pe].offset : 0;
+          vs += fmt::format(" v{} ({:.1f} {:.1f} {:.1f}) at {:08X}: {:08X} {:08X} {:08X}", gv, q[0], q[1], q[2], ga,
+                            ga ? g32(ga) : 0, ga ? g32(ga + 4) : 0, ga ? g32(ga + 8) : 0);
+        }
+        NTRACE("  STRETCHED tri {} of draw#{}: longest edge {:.1f} vs median {:.1f}, fmt {:X}:{}", t / 3, g.draws, m,
+               median, els[pe].type, vs);
+      }
+    }
   }
   g.cmd->setPipeline(pipe);
   g.cmd->setVertexBuffers(0, views.data(), uint32_t(views.size()), slots.data());

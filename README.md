@@ -148,6 +148,7 @@ console.
 - Fixed LAN games not finding each other over virtual LAN adapters such as Radmin VPN and Hamachi, or on PCs with several network adapters.
 - Fixed the automatic shotgun's muzzle flash showing all the time on guns held by players and lying on the floor.
 - Fixed shotgun and automatic shotgun shots never reaching other players in multiplayer.
+- Fixed the spike, fin and flat band sticking out of Dam's mountains with old graphics.
 - Other Misc fixes.
 
 ## Known limitations
