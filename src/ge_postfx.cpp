@@ -281,10 +281,34 @@ void BackdropBars::OnDraw(ImGuiIO& io) {
   DrawFps(W, H);
   DrawCenterDot(W, H);
   const float window = W / H;
-  if (std::fabs(window - reported_aspect_) > 0.0005f) {
-    reported_aspect_ = window;
-    rex::cvar::SetFlagByName("ge_backdrop_window_aspect", std::to_string(window));
+  // Where the presenter shows the front end's picture (16:9, or the
+  // present_aspect_x/y override), centred with bars on the long side.
+  float shown = 16.0f / 9.0f;
+  {
+    const float ax = float(std::atof(rex::cvar::GetFlagByName("present_aspect_x").c_str()));
+    const float ay = float(std::atof(rex::cvar::GetFlagByName("present_aspect_y").c_str()));
+    if (ax > 0.0f && ay > 0.0f) shown = ax / ay;
   }
+  // The desk fills the bars only where the menus are narrower than the game's
+  // own picture: Screen Ratio 21:9, whose menus stay 16:9. With 4:3 or 16:9 on
+  // a wider screen the game itself has black bars, so the menus keep them too,
+  // and the desk inside the picture is laid out for the picture's shape (as on
+  // a screen of that shape), not cropped from a window-wide desk.
+  const std::string ratio = rex::cvar::GetFlagByName("ge_screen_ratio");
+  const float game_shape = ratio == "4:3"    ? 4.0f / 3.0f
+                           : ratio == "16:9" ? 16.0f / 9.0f
+                           : ratio == "21:9" ? 21.0f / 9.0f
+                           : window < 1.55f  ? 4.0f / 3.0f  // auto: the window's shape
+                           : window >= 2.2f  ? 21.0f / 9.0f
+                                             : 16.0f / 9.0f;
+  const bool desk_bars = game_shape > shown + 0.01f && std::fabs(window - shown) >= 0.01f;
+  // The shape the renderers lay the desk out for (ge_backdrop_window_aspect).
+  const float desk_shape = desk_bars ? window : shown;
+  if (std::fabs(desk_shape - reported_aspect_) > 0.0005f) {
+    reported_aspect_ = desk_shape;
+    rex::cvar::SetFlagByName("ge_backdrop_window_aspect", std::to_string(desk_shape));
+  }
+  if (!desk_bars) return;
   if (!ge::BackdropActiveNow() ||
       rex::cvar::GetFlagByName("ge_backdrop_ready") != "true" ||
       rex::cvar::GetFlagByName("present_letterbox") != "true") {
@@ -332,24 +356,6 @@ void BackdropBars::OnDraw(ImGuiIO& io) {
   }
   const float image_aspect = image_aspect_[kind];
 
-  // Where the presenter shows the front end's picture (16:9, or the
-  // present_aspect_x/y override), centred with bars on the long side.
-  float shown = 16.0f / 9.0f;
-  const float ax = float(std::atof(rex::cvar::GetFlagByName("present_aspect_x").c_str()));
-  const float ay = float(std::atof(rex::cvar::GetFlagByName("present_aspect_y").c_str()));
-  if (ax > 0.0f && ay > 0.0f) shown = ax / ay;
-  if (std::fabs(window - shown) < 0.01f) return;  // no bars
-  // The desk fills the bars only where the menus are narrower than the game's
-  // own picture: Screen Ratio 21:9, whose menus stay 16:9. With 4:3 or 16:9 on
-  // a wider screen the game itself has black bars, so the menus keep them too.
-  const std::string ratio = rex::cvar::GetFlagByName("ge_screen_ratio");
-  const float game_shape = ratio == "4:3"    ? 4.0f / 3.0f
-                           : ratio == "16:9" ? 16.0f / 9.0f
-                           : ratio == "21:9" ? 21.0f / 9.0f
-                           : window < 1.55f  ? 4.0f / 3.0f  // auto: the window's shape
-                           : window >= 2.2f  ? 21.0f / 9.0f
-                                             : 16.0f / 9.0f;
-  if (game_shape <= shown + 0.01f) return;
 
   // The picture covers the whole window, cropped evenly (as the renderer does).
   float scale_x = 1.0f, scale_y = 1.0f;
