@@ -1079,7 +1079,10 @@ int fill_output_constants(OutputConstants& c, const BackdropFn& backdrop) {
       c.key[1] = 0.0f;
       c.key[2] = 96.0f / 1023.0f;
       c.key_tolerance = 0.5f / 1023.0f;
-      c.layout_4x3 = window > 0.1f && window < 1.55f ? 1u : 0u;
+      // The game lays the front end out for the Screen Ratio it was given, which is the
+      // presented shape, not the window's: 4:3 in a wider window or fullscreen kept the
+      // 16:9 folder outline, and the desk covered the 4:3 folder's right side.
+      c.layout_4x3 = shown < 1.55f ? 1u : 0u;
     }
   }
   if (rex::cvar::GetFlagByName("postfx_enabled") == "true") {

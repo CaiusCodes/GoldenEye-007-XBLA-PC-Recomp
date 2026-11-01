@@ -1612,7 +1612,7 @@ index a744375..c9a97c4 100644
          rex::thread::SyncMemory();
          ReturnFromWait();
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..9a6b96d 100644
+index 19874a5..25d4071 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -31,6 +31,10 @@
@@ -1863,7 +1863,7 @@ index 19874a5..9a6b96d 100644
            return false;
          }
          // Must not call anything that can change the descriptor heap from now
-@@ -2243,6 +2433,141 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2243,6 +2433,140 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                  apply_gamma_dest_initial_state);
          }
  
@@ -1935,11 +1935,10 @@ index 19874a5..9a6b96d 100644
 +          c.key[1] = 0.0f;
 +          c.key[2] = 96.0f / 1023.0f;
 +          c.key_tolerance = 0.5f / 1023.0f;
-+          {
-+            const float window_shape =
-+                float(std::atof(rex::cvar::GetFlagByName("ge_backdrop_window_aspect").c_str()));
-+            c.layout_4x3 = (window_shape > 0.1f && window_shape < 1.55f) ? 1u : 0u;
-+          }
++          // ge: the front end's layout follows the presented shape (the Screen Ratio
++          // the game was given), not the window's: 4:3 in a wider window kept the 16:9
++          // folder outline and the desk covered the 4:3 folder's right side.
++          c.layout_4x3 = shown < 1.55f ? 1u : 0u;
 +          c.fill_black = boot_cover ? 1u : 0u;
 +          deferred_command_list_.D3DSetComputeRootSignature(backdrop_root_signature_.Get());
 +          deferred_command_list_.D3DSetComputeRoot32BitConstants(
@@ -2005,7 +2004,7 @@ index 19874a5..9a6b96d 100644
          // Need to submit all the commands before giving the image back to the
          // presenter so it can submit its own commands for displaying it to the
          // queue.
-@@ -2256,6 +2581,106 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2256,6 +2580,106 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
    EndSubmission(true);
  }
  
@@ -2112,7 +2111,7 @@ index 19874a5..9a6b96d 100644
  void D3D12CommandProcessor::OnPrimaryBufferEnd() {
    if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
        CanEndSubmissionImmediately()) {
-@@ -2880,8 +3305,11 @@ bool D3D12CommandProcessor::IssueCopy() {
+@@ -2880,8 +3304,11 @@ bool D3D12CommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -2126,7 +2125,7 @@ index 19874a5..9a6b96d 100644
    }
    return IssueCopy_ReadbackResolvePath();
  }
-@@ -3114,9 +3542,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+@@ -3114,9 +3541,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
      if (queue_operations_done_since_submission_signal_) {
        UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
        ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
@@ -2141,7 +2140,7 @@ index 19874a5..9a6b96d 100644
          PROFILE_CMD_BUFFER_STALL();
          WaitForSingleObject(fence_completion_event_, INFINITE);
          queue_operations_done_since_submission_signal_ = false;
-@@ -3295,8 +3725,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3295,8 +3724,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
      }
    }
  
@@ -2152,7 +2151,7 @@ index 19874a5..9a6b96d 100644
  
      // Start a new deferred command list - will submit it to the real one in the
      // end of the submission (when async pipeline creation requests are
-@@ -3366,11 +3798,167 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3366,11 +3797,167 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
      primitive_processor_->BeginFrame();
  
      texture_cache_->BeginFrame();
@@ -2320,7 +2319,7 @@ index 19874a5..9a6b96d 100644
  bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
  
-@@ -3410,6 +3998,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3410,6 +3997,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
  
      pipeline_cache_->EndSubmission();
  
@@ -5333,7 +5332,7 @@ index ec0df7c..d90dfdd 100644
  }
  
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..bfe2840 100644
+index 001f36b..b602b29 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -21,7 +21,12 @@
@@ -5685,7 +5684,7 @@ index 001f36b..bfe2840 100644
 +            c.key[1] = 0.0f;
 +            c.key[2] = 96.0f / 1023.0f;
 +            c.key_tolerance = 0.5f / 1023.0f;
-+            c.layout_4x3 = (window > 0.1f && window < 1.55f) ? 1u : 0u;
++            c.layout_4x3 = shown < 1.55f ? 1u : 0u;  // ge: the presented shape, not the window's
 +            c.fill_black = boot_cover ? 1u : 0u;
 +            deferred_command_buffer_.CmdVkPushConstants(swap_backdrop_pipeline_layout_,
 +                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(c),

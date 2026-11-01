@@ -205,8 +205,8 @@ int DesiredRenderScale() {
 }
 
 // Window sizes for the Resolution row, each with its Screen Ratio shape. The
-// row offers only the sizes of the chosen Screen Ratio (Auto: all of them)
-// that fit on the screen, so the window and the picture keep the same shape.
+// row offers only the sizes of the chosen Screen Ratio, so the window and the
+// picture keep the same shape.
 struct WindowSize {
   int w, h;
   const char* ratio;
@@ -237,28 +237,14 @@ std::string EffectiveScreenRatio() {
   return aspect < 1.55f ? "4:3" : aspect >= 2.2f ? "21:9" : "16:9";
 }
 
+// Every size of the shape, whether or not it fits on this screen: a size bigger
+// than the screen is the player's choice (Windows then trims the window to it).
 std::vector<WindowSize> OfferedWindowSizes(const std::string& ratio) {
-  // Room for the window's picture: the screen's work area (no taskbar) less
-  // the window frame. A bigger size was cut down by Windows to a different
-  // shape (3440x1440 became 3424x1353 on a 3440x1440 screen).
-  int screen_w = 0, screen_h = 0;
-  MONITORINFO mi{sizeof(mi)};
-  HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
-  if (mon && GetMonitorInfoW(mon, &mi)) {
-    RECT frame{0, 0, 0, 0};
-    AdjustWindowRectEx(&frame, WS_OVERLAPPEDWINDOW, FALSE, 0);
-    screen_w = (mi.rcWork.right - mi.rcWork.left) - (frame.right - frame.left);
-    screen_h = (mi.rcWork.bottom - mi.rcWork.top) - (frame.bottom - frame.top);
-  }
-  std::vector<WindowSize> shape, fitting;
-  for (const WindowSize& s : kWindowSizes) {
-    if (ratio != "auto" && ratio != s.ratio) continue;
-    shape.push_back(s);
-    if (screen_w <= 0 || (s.w <= screen_w && s.h <= screen_h)) fitting.push_back(s);
-  }
-  return fitting.empty() ? shape : fitting;  // a small screen still gets the smallest size
-}
-void SetWindowSize(const WindowSize& s) {
+  std::vector<WindowSize> shape;
+  for (const WindowSize& s : kWindowSizes)
+    if (ratio == "auto" || ratio == s.ratio) shape.push_back(s);
+  return shape;
+}void SetWindowSize(const WindowSize& s) {
   rex::cvar::SetFlagByName("ge_window_width", std::to_string(s.w));
   rex::cvar::SetFlagByName("ge_window_height", std::to_string(s.h));
   if (g_persist) g_persist();
@@ -441,7 +427,7 @@ std::vector<Row> BuildPage(Page page) {
               HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
               if (mon && GetMonitorInfoW(mon, &mi))
                 return std::to_string(mi.rcMonitor.right - mi.rcMonitor.left) + "x" +
-                       std::to_string(mi.rcMonitor.bottom - mi.rcMonitor.top) + " (screen)";
+                       std::to_string(mi.rcMonitor.bottom - mi.rcMonitor.top);
               return std::string("Screen size");
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
