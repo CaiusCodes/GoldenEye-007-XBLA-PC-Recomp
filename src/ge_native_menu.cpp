@@ -1048,8 +1048,6 @@ constexpr uint32_t kOtherPos = 0x8272C580;    // label x, value x, first y, row 
 constexpr uint32_t kOtherHover = 0x8272C4FC;  // hovered row (screen position)
 constexpr int kCenterDotRow = 2;              // screen position of Show Crosshair
 constexpr int kSetupRow = 8;                  // screen position of Run Setup Again
-constexpr int kDoneRow = 9;                   // hover value of Done (drawn on row 8)
-constexpr uint32_t kTxtDone = 0x9D66;         // the game's "Done"
 
 // The game's value for its row 2..6 (the getters its own draw calls).
 uint32_t OtherRowValue(PPCContext& ctx, uint8_t* base, int row) {
@@ -1081,33 +1079,24 @@ void ge_other_rows_draw() {
     const float y0 = LDF32(base, kOtherPos + 8);
     const float step = LDF32(base, kOtherPos + 12);
     SetCustomText(base, kTxtFirstDynamic + 122, "Show Crosshair:");
-    // A ninth row under the game's eight: Run Setup Again (release layout
-    // only) in the label column and Done in the value column (Done alone in
-    // the label column without the launcher); a tenth row would fall off the
-    // page. The game only hovers rows 0-7 (and keeps the last one hovered
+    // Run Setup Again (release layout only) as a ninth row under the game's
+    // eight. The game only hovers rows 0-7 (and keeps the last one hovered
     // below them), so the crosshair over this row sets the hover here; the
-    // game then hands a select of it to ge_other_row_select as row 8 or 9.
+    // game then hands a select of it to ge_other_row_select as row 8.
     static const bool have_launcher = !ge::LauncherPath().empty();
-    {
+    if (have_launcher) {
       const float y8 = y0 + step * static_cast<float>(kSetupRow);
-      const float done_x = have_launcher ? value_x : label_x;
-      const float cx = LDF32(base, kCursorX), cy = LDF32(base, kCursorY);
-      if (cy >= y8 - 4.0f && cy < y8 - 4.0f + step)
-        ST32(base, kOtherHover, (!have_launcher || cx >= value_x - 12.0f) ? kDoneRow : kSetupRow);
+      const float cy = LDF32(base, kCursorY);
+      if (cy >= y8 - 4.0f && cy < y8 - 4.0f + step) ST32(base, kOtherHover, kSetupRow);
       SetCustomText(base, kTxtFirstDynamic + 123, "Run Setup Again");
-      const int hover = static_cast<int32_t>(LD32(base, kOtherHover));
-      auto item = [&](uint32_t text_id, float x, bool hovered) {
-        const uint32_t label = LookupText(*ctx, base, text_id);
-        if (hovered) {
-          int w = 0, h = 0;
-          MeasureText(*ctx, base, sp, label, w, h);
-          const float pad = LDF32(base, kHighlightPad);
-          DrawBox(*ctx, base, 50, x - pad, y8 - pad, x - pad + w + 4, y8 - pad + h + 4);
-        }
-        DrawText(*ctx, base, sp, label, x, y8, 255);
-      };
-      if (have_launcher) item(kTxtFirstDynamic + 123, label_x, hover == kSetupRow);
-      item(kTxtDone, done_x, hover == kDoneRow);
+      const uint32_t label = LookupText(*ctx, base, kTxtFirstDynamic + 123);
+      if (static_cast<int32_t>(LD32(base, kOtherHover)) == kSetupRow) {
+        int w = 0, h = 0;
+        MeasureText(*ctx, base, sp, label, w, h);
+        const float pad = LDF32(base, kHighlightPad);
+        DrawBox(*ctx, base, 50, label_x - pad, y8 - pad, label_x - pad + w + 4, y8 - pad + h + 4);
+      }
+      DrawText(*ctx, base, sp, label, label_x, y8, 255);
     }
     const int hover_now = static_cast<int32_t>(LD32(base, kOtherHover));
     for (int pos = 2; pos <= 7; ++pos) {
@@ -1156,12 +1145,6 @@ void ge_other_row_select(PPCRegister& r11) {
     // Re-run the launcher's setup (re-import the game, extras); closes the game.
     ge::PersistSettings();
     ge::RunSetupAgain();
-    r11.u64 = 0xFFFFFFFFu;
-  } else if (pos == kDoneRow) {
-    // Back to Help & Options, as the game's own B does.
-    PPCContext* ctx; uint8_t* base; getcb(ctx, base);
-    ST32(base, 0x82F61014u, 1);
-    ST32(base, 0x82F61018u, 7);
     r11.u64 = 0xFFFFFFFFu;
   } else if (pos > kCenterDotRow && pos <= 7) {
     r11.u64 = static_cast<uint32_t>(pos - 1);
