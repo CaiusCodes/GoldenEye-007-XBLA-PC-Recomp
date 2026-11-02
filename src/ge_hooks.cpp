@@ -2636,6 +2636,32 @@ void ge_mouse_camera(uint8_t* base) {
     prev_disabled = game_control_disabled;
   }
 
+  // A new stage: no mouse look until the player first has control. Mouse motion
+  // queued while the level loads (the game thread is stuck, the raw-mouse
+  // thread keeps adding) otherwise turns Bond in the frame between his spawn
+  // facing being set and the intro locking the controls; the intro's pan is
+  // built around that facing, so it swung through Dam's cliffs. Control means
+  // the intro has ended (disabled -> enabled) or, with no intro (multiplayer),
+  // 60 frames of play (frames, not time: the load itself can take seconds).
+  static uint32_t look_stage = 0;
+  static bool look_held = false, look_saw_intro = false;
+  static int look_free_frames = 0;
+  const uint32_t stage_now = LD32(base, GE_CURRENT_STAGE);
+  if (stage_now != look_stage) {
+    look_stage = stage_now;
+    look_held = true;
+    look_saw_intro = false;
+    look_free_frames = 0;
+  }
+  if (look_held) {
+    if (game_control_disabled) {
+      look_saw_intro = true;
+    } else if (look_saw_intro || ++look_free_frames > 60) {
+      look_held = false;
+    }
+    if (look_held) return;
+  }
+
   if (game_control_disabled) return;
 
   // The ordinary camera yaw is rebuilt from the tank body + turret every
