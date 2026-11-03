@@ -4297,6 +4297,40 @@ void ge_stan_edge_tick(uint8_t* base) {
     if (LD16(base, e.addr) != want) ST16(base, e.addr, want);
   }
 }
+// Silo: the two missiles (model 93 on bound pads 10032/10033) reach up through
+// the walkway rooms around their shafts, but the level has no portals between
+// those rooms and the shafts, so each missile is only listed in its shaft's
+// rooms and is culled while seen from the walkways (issue #18; the BeanTools
+// Silo data adds those portals instead). List the walkway rooms on the missiles
+// too: prop +0x30 holds up to 7 room ids ended by 0xFF.
+void ge_silo_missile_rooms_tick(uint8_t* base) {
+  if (LD32(base, GE_CURRENT_STAGE) != 0x14u) return;
+  const uint32_t player = LD32(base, GE_PLAYER_PTR);
+  const uint32_t start = player ? LD32(base, player + 0x1ACu) : 0u;
+  if (!start) return;
+  // Active props are a list (prev +0x28, next +0x2C) that holds Bond.
+  uint32_t prop = start;
+  for (int n = 0; n < 4096 && LD32(base, prop + 0x28u); ++n) prop = LD32(base, prop + 0x28u);
+  for (int n = 0; prop && n < 4096; ++n, prop = LD32(base, prop + 0x2Cu)) {
+    if (base[prop] != 1u) continue;  // objects only
+    const uint32_t obj = LD32(base, prop + 8u);
+    if (!obj || LD16(base, obj + 4u) != 93u) continue;
+    const uint16_t pad = LD16(base, obj + 6u);
+    std::string_view add;  // walkway room ids
+    if (pad == 10032u) add = std::string_view("\x1A\x1B\x1E", 3);  // shaft room 25 (by the start): 26, 27, 30
+    else if (pad == 10033u) add = std::string_view("\x11\x12", 2);  // shaft room 15: 17, 18
+    else continue;
+    uint8_t* rooms = base + prop + 0x30u;
+    int count = 0;
+    while (count < 7 && rooms[count] != 0xFFu) ++count;
+    for (const char c : add) {
+      const uint8_t room = static_cast<uint8_t>(c);
+      if (count >= 7 || std::memchr(rooms, room, count)) continue;
+      rooms[count++] = room;
+      rooms[count] = 0xFFu;
+    }
+  }
+}
 // Frigate multiplayer: five doors, at (+-206, -569), (-206, -2075) and the
 // balconies (+-597, -158), were locked (key 0x80), most of them missing the
 // open-away-from-player flag every other door has, and used door model 0x99,
@@ -4377,6 +4411,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     REXKRNL_INFO("GECE community data bug-fixes applied");
   }
   ge_stan_edge_tick(base);
+  ge_silo_missile_rooms_tick(base);
 
   // Skip the boot screen that jokes about the Nintendo logo (menu 2, drawn by
   // sub_820ED378). The current menu is at 0x8272B35C and a requested change at
