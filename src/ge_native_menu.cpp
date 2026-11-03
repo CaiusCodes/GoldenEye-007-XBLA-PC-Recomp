@@ -196,12 +196,16 @@ void SetS(const char* cvar, const std::string& v) {
 float GetF(const char* cvar) { return static_cast<float>(std::atof(GetS(cvar).c_str())); }
 
 // Render Scale (see ge::ApplyRenderScale below).
-int g_render_scale_active = 0;  // the scale this run uses (0 = not set yet)
-ge::GpuForScale g_scale_gpu;    // read once at start
-// 1x unless the player chose 2x or 3x ("auto" from an older ge.toml is 1x).
-int DesiredRenderScale() {
+float g_render_scale_active = 0;  // the scale this run uses (0 = not set yet)
+ge::GpuForScale g_scale_gpu;      // read once at start
+// 1x unless the player chose 1.5x, 2x or 3x ("auto" from an older ge.toml is 1x).
+float DesiredRenderScale() {
   const std::string v = GetS("ge_render_scale");
-  return v == "2" || v == "3" ? v[0] - '0' : 1;
+  return v == "1.5" ? 1.5f : v == "2" ? 2.0f : v == "3" ? 3.0f : 1.0f;
+}
+// "1", "1.5", "2", "3": the ge_render_scale value and the row's text.
+std::string RenderScaleText(float scale) {
+  return scale == 1.5f ? "1.5" : std::to_string(static_cast<int>(scale));
 }
 
 // Window sizes for the Resolution row, each with its Screen Ratio shape. The
@@ -465,13 +469,19 @@ std::vector<Row> BuildPage(Page page) {
       AddAction(
           rows, "Render Scale:",
           [] {
-            const int next = DesiredRenderScale() % 3 + 1;  // 1x -> 2x -> 3x -> 1x
-            SetS("ge_render_scale", std::to_string(next));
+            // 1x -> 1.5x -> 2x -> 3x -> 1x. 1.5x (1920x1080) is the native
+            // renderer's; the classic one scales by whole numbers only.
+            const float cur = DesiredRenderScale();
+            const float next = cur >= 3.0f   ? 1.0f
+                               : cur >= 2.0f ? 3.0f
+                               : cur >= 1.5f || g_renderer_active != 1 ? 2.0f
+                                                                        : 1.5f;
+            SetS("ge_render_scale", RenderScaleText(next));
           },
           [] {
-            // Any change restarts the game on Done; 2x and 3x always say so.
-            const int scale = DesiredRenderScale();
-            std::string text = std::to_string(scale) + "x";
+            // Any change restarts the game on Done; above 1x always says so.
+            const float scale = DesiredRenderScale();
+            std::string text = RenderScaleText(scale) + "x";
             if (g_render_scale_active && scale != g_render_scale_active)
               text += " - restarts";
             else if (scale > 1)
@@ -496,6 +506,9 @@ std::vector<Row> BuildPage(Page page) {
       // No Renderer row: the classic Xenos renderer stays a ge.toml fallback
       // (gpu_native = false), read when the game starts.
       AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
+      // View Bob OFF holds the camera level and steady while walking, past
+      // what the watch's Camera Roll While Walking option removes (ge_hooks.cpp).
+      rows.push_back(Row{RowKind::Toggle, "View Bob:", "ge_view_bob"});
       // No Frame Limit row: the game always runs at its own 60 FPS (its clock
       // is the 60 Hz vblank; a lower cap slowed the game itself down).
       rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
@@ -1329,13 +1342,15 @@ std::string ReadVersionText() {
 // The SDK's resolution_scale multiplies the game's 1280x720 render targets
 // (2x = 2560x1440). It is read once when the emulated GPU starts, so a change
 // applies by restarting the game (done for the player on leaving the Video
-// page). 1x by default; 2x and 3x are the player's choice.
+// page). 1x by default; 1.5x, 2x and 3x are the player's choice. The native
+// renderer sizes its own targets by the scale (1.5x = 1920x1080).
 // Upscaling (see ge::ApplyUpscaling).
 REXCVAR_DEFINE_STRING(ge_upscaling, "on", "Video", "Upscaling: on (FSR 1 / CAS) or off (bilinear)")
     .allowed({"on", "off"});
 REXCVAR_DEFINE_STRING(ge_render_scale, "1", "Video",
-                      "Render scale: 1 (1280x720, the default), 2 (2560x1440) or 3 (3840x2160)")
-    .allowed({"auto", "1", "2", "3"});  // "auto" (older ge.toml files) now means 1
+                      "Render scale: 1 (1280x720, the default), 1.5 (1920x1080, native renderer; "
+                      "2 on the classic one), 2 (2560x1440) or 3 (3840x2160)")
+    .allowed({"auto", "1", "1.5", "2", "3"});  // "auto" (older ge.toml files) now means 1
 namespace ge {
 void ApplyRenderScale() {
   g_scale_gpu = DetectGpuForScale();
@@ -1447,13 +1462,15 @@ void SetUpscalingChangedHandler(std::function<void()> handler) {
   g_upscaling_changed = std::move(handler);
 }
 // The scale this run draws at (the native renderer sizes its targets by it).
-int ActiveRenderScale() { return g_render_scale_active > 0 ? g_render_scale_active : 2; }
+float ActiveRenderScale() { return g_render_scale_active > 0 ? g_render_scale_active : 2.0f; }
 void ApplyRenderScaleToGpu() {
   // resolution_scale is the Xenos plugin's; the native renderer reads the
   // scale itself (ActiveRenderScale), so there's nothing to set (and no
   // "could not set" warning in every player's log).
   if (NativeRendererActive()) return;
-  const std::string want = std::to_string(g_render_scale_active > 0 ? g_render_scale_active : 2);
+  // The classic renderer scales by whole numbers: 1.5x draws at 2x there.
+  const float scale = g_render_scale_active > 0 ? g_render_scale_active : 2.0f;
+  const std::string want = std::to_string(static_cast<int>(std::ceil(scale)));
   const bool ok = rex::cvar::SetFlagByName("resolution_scale", want);
   const std::string now = rex::cvar::GetFlagByName("resolution_scale");
   if (ok && now == want) {

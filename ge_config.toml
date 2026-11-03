@@ -113,6 +113,13 @@ address = 0x8210D408
 name = "ge_fov_set"
 registers = ["f2"]
 after_instruction = false
+# View Bob off: level, steady head vectors before the head update hands them
+# on (ge_hooks.cpp ge_view_bob_hold).
+[[midasm_hook]]
+address = 0x820AF08C
+name = "ge_view_bob_hold"
+registers = ["r1"]
+after_instruction = false
 # LAN lobby: View Layout defaults to "single"
 [[midasm_hook]]
 address = 0x82103400

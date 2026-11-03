@@ -46,7 +46,7 @@
 #include "ge_native_vk_out.h"
 #include <rex/ui/presenter_graphics_system.h>
 namespace ge {
-int ActiveRenderScale();  // ge_native_menu.cpp
+float ActiveRenderScale();  // ge_native_menu.cpp
 bool BackdropActiveNow();  // ge_native_menu.cpp: the desk goes behind this frame
 void PersistSettings();
 [[noreturn]] void RestartSelf();  // ge_hooks.cpp
@@ -198,7 +198,8 @@ constexpr uint32_t kGuestW = 1280, kGuestH = 720;
 // The native renderer's API this run: Vulkan when gpu_native_api says so, or
 // when Direct3D 12 could not start on auto.
 bool g_vulkan = false;
-uint32_t g_scene_scale = 1, g_scene_w = kGuestW, g_scene_h = kGuestH;
+float g_scene_scale = 1.0f;  // 1, 1.5 (1920x1080), 2 or 3
+uint32_t g_scene_w = kGuestW, g_scene_h = kGuestH;
 constexpr RenderFormat kSceneFormat = RenderFormat::B8G8R8A8_UNORM;
 
 // A vertex input. For declarations: stream = D3D stream, type = D3DDECLTYPE.
@@ -1414,9 +1415,9 @@ bool ensure_device() {
   // presenter. Present(1) left frames queued behind vblanks: the game thread
   // waited 13-36 ms for a frame whose GPU work took 0.5 ms. Three buffers so
   // rendering never waits for the one being scanned out.
-  g_scene_scale = uint32_t(std::clamp(ge::ActiveRenderScale(), 1, 3));
-  g_scene_w = kGuestW * g_scene_scale;
-  g_scene_h = kGuestH * g_scene_scale;
+  g_scene_scale = std::clamp(ge::ActiveRenderScale(), 1.0f, 3.0f);
+  g_scene_w = uint32_t(std::lround(kGuestW * g_scene_scale));
+  g_scene_h = uint32_t(std::lround(kGuestH * g_scene_scale));
   REXKRNL_INFO("GENATIVE scene {}x{} (render scale {}x)", g_scene_w, g_scene_h, g_scene_scale);
   if (g_vulkan ? !setup_presenter_output_vk() : !setup_presenter_output()) {
     g.out = {};
@@ -2906,7 +2907,7 @@ void set_common_state(uint32_t dev) {
   if (f[2] <= 0 || f[3] <= 0 || (g32(dev + 10572) & 0x3F) == 0) {
     f[0] = f[1] = 0; f[2] = float(kGuestW); f[3] = float(kGuestH); f[4] = 0; f[5] = 1;
   }
-  for (int i = 0; i < 4; ++i) f[i] *= float(g_scene_scale);  // guest pixels -> scene pixels
+  for (int i = 0; i < 4; ++i) f[i] *= g_scene_scale;  // guest pixels -> scene pixels
   RenderViewport viewport(f[0], f[1], f[2], f[3], f[4], f[5] > f[4] ? f[5] : 1.0f);
   g.cmd->setViewports(&viewport, 1);
   RenderRect scissor(0, 0, g_scene_w, g_scene_h);
