@@ -496,8 +496,8 @@ std::vector<Row> BuildPage(Page page) {
       // itself (it is the classic renderer's), see ge_app.h.
       AddChoice(rows, "Texture Filtering:", "anisotropic_override",
                 {{"Bilinear", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}});
-      // Native renderer: the scene's MSAA, applied at once (Off by default, the
-      // lightest); the classic renderer's FXAA post effect does nothing there.
+      // Native renderer: the scene's MSAA, applied at once (4x by default, as the
+      // Xbox 360 renders); the classic renderer's FXAA post effect does nothing there.
       if (g_renderer_active == 1)
         AddChoice(rows, "Anti-Aliasing:", "gpu_native_msaa", {{"OFF", "1"}, {"2x", "2"}, {"4x", "4"}});
       else

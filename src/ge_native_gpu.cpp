@@ -107,8 +107,8 @@ REXCVAR_DEFINE_BOOL(gpu_native_half_pixel, true, "GPU",
                     "Native renderer: shift geometry half a pixel to match the 360's pixel centres");
 REXCVAR_DEFINE_BOOL(gpu_native_all_mips, false, "GPU",
                     "Native renderer test: build a full mip chain for every texture");
-REXCVAR_DEFINE_INT32(gpu_native_msaa, 1, "GPU",
-                     "Native renderer: scene MSAA samples, 1 (off, the lightest), 2 or 4 (as the Xbox 360); "
+REXCVAR_DEFINE_INT32(gpu_native_msaa, 4, "GPU",
+                     "Native renderer: scene MSAA samples, 1 (off, the lightest), 2 or 4 (as the Xbox 360, the default); "
                      "the Video page's Anti-Aliasing row, applied at once");
 REXCVAR_DEFINE_BOOL(gpu_native_log_creation, false, "GPU",
                     "Native renderer test: log every pipeline and texture created");
