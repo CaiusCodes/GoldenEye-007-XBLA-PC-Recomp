@@ -3229,7 +3229,7 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
       src.addr = cpu_view_of_physical(phys, (uint32_t(lo) + vcount) * src.stride);
     } else if (el.stream < 16 && g_streams[el.stream].vb) {
       const uint32_t vb = g_streams[el.stream].vb;
-      src.addr = (g32(vb + 24) & ~3u) + g_streams[el.stream].offset;
+      src.addr = gpu_view(g32(vb + 24) & ~3u) + g_streams[el.stream].offset;  // 0xE0000000+: 4 KB on, as index buffers
       src.stride = g_streams[el.stream].stride;
       src.endian = g32(vb + 28) & 3;
     }
