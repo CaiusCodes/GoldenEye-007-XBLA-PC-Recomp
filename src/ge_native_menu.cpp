@@ -506,9 +506,6 @@ std::vector<Row> BuildPage(Page page) {
       // No Renderer row: the classic Xenos renderer stays a ge.toml fallback
       // (gpu_native = false), read when the game starts.
       AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
-      // View Bob OFF holds the camera level and steady while walking, past
-      // what the watch's Camera Roll While Walking option removes (ge_hooks.cpp).
-      rows.push_back(Row{RowKind::Toggle, "View Bob:", "ge_view_bob"});
       // No Frame Limit row: the game always runs at its own 60 FPS (its clock
       // is the 60 Hz vblank; a lower cap slowed the game itself down).
       rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
@@ -1051,8 +1048,11 @@ bool ge_other_update(PPCRegister& r25) {
 // We draw rows 2-7 instead so a "Show Crosshair" row (white dot at the centre
 // of the screen when not aiming, ge_center_dot) sits third, the game's rows 2-6
 // move down one place and row 7 (Screen Ratio, set from the window shape) is
-// gone. The hovered row (0x8272C4FC) is a screen position; ge_other_row_select
-// maps it back to the game's row when one is chosen.
+// gone. A "Camera Bob" row (ge_view_bob, ge_hooks.cpp) follows Camera Roll
+// While Walking, and Run Setup Again comes last. Rows 2 and on are drawn
+// closer together than the game's own (so the last stays on the page) and are
+// hovered by our own cursor test; ge_other_row_select maps a chosen row back
+// to the game's row.
 REXCVAR_DEFINE_BOOL(ge_center_dot, false, "Controls",
                     "Show a white dot at the centre of the screen when not aiming");
 namespace {
@@ -1060,7 +1060,35 @@ constexpr uint32_t kOtherText = 0x8272C500;   // 16 bytes a row: label id, value
 constexpr uint32_t kOtherPos = 0x8272C580;    // label x, value x, first y, row spacing
 constexpr uint32_t kOtherHover = 0x8272C4FC;  // hovered row (screen position)
 constexpr int kCenterDotRow = 2;              // screen position of Show Crosshair
-constexpr int kSetupRow = 8;                  // screen position of Run Setup Again
+constexpr int kCameraBobRow = 7;              // screen position of Camera Bob
+constexpr int kSetupRow = 9;                  // screen position of Run Setup Again
+// Rows 2..9 fit where the game's rows 2..8 were.
+constexpr float kOtherSpacing = 6.0f / 7.0f;  // of the game's row spacing
+
+// The game's row shown at a screen position (-1: one of ours).
+int OtherGameRow(int pos) {
+  if (pos > kCenterDotRow && pos < kCameraBobRow) return pos - 1;  // rows 2..5
+  if (pos == kCameraBobRow + 1) return 6;                           // Screen Letterbox
+  return -1;
+}
+float OtherRowY(uint8_t* base, int pos) {
+  const float y0 = LDF32(base, kOtherPos + 8);
+  const float step = LDF32(base, kOtherPos + 12);
+  return y0 + step * (2.0f + kOtherSpacing * static_cast<float>(pos - 2));
+}
+// The row of ours under the crosshair (2..9), or -1 (the volume sliders, or
+// off the rows).
+int OtherHoverRow(uint8_t* base) {
+  static const bool have_launcher = !ge::LauncherPath().empty();
+  const int last = have_launcher ? kSetupRow : kSetupRow - 1;
+  const float step = LDF32(base, kOtherPos + 12) * kOtherSpacing;
+  const float cy = LDF32(base, kCursorY);
+  for (int pos = 2; pos <= last; ++pos) {
+    const float y = OtherRowY(base, pos);
+    if (cy >= y - 4.0f && cy < y - 4.0f + step) return pos;
+  }
+  return -1;
+}
 
 // The game's value for its row 2..6 (the getters its own draw calls).
 uint32_t OtherRowValue(PPCContext& ctx, uint8_t* base, int row) {
@@ -1089,38 +1117,35 @@ void ge_other_rows_draw() {
     const uint32_t sp = frame.sp;
     const float label_x = LDF32(base, kOtherPos);
     const float value_x = LDF32(base, kOtherPos + 4);
-    const float y0 = LDF32(base, kOtherPos + 8);
-    const float step = LDF32(base, kOtherPos + 12);
     SetCustomText(base, kTxtFirstDynamic + 122, "Show Crosshair:");
-    // Run Setup Again (release layout only) as a ninth row under the game's
-    // eight. The game only hovers rows 0-7 (and keeps the last one hovered
-    // below them), so the crosshair over this row sets the hover here; the
-    // game then hands a select of it to ge_other_row_select as row 8.
+    SetCustomText(base, kTxtFirstDynamic + 123, "Run Setup Again");
+    SetCustomText(base, kTxtFirstDynamic + 124, "Camera Bob:");
+    // Our rows are hovered by our own test (the game's assumes its spacing
+    // and only rows 0-7); over the volume sliders the game's hover stands.
+    // Below its rows the game keeps its last hover, so rows 8 and 9 are set
+    // here for its select to fire (as Run Setup Again always was).
+    const int ours = OtherHoverRow(base);
+    if (ours >= 8) ST32(base, kOtherHover, static_cast<uint32_t>(ours));
+    const int game_hover = static_cast<int32_t>(LD32(base, kOtherHover));
+    const int hover_now = ours >= 0 ? ours : game_hover < 2 ? game_hover : -1;
+    // Run Setup Again: release layout only.
     static const bool have_launcher = !ge::LauncherPath().empty();
-    if (have_launcher) {
-      const float y8 = y0 + step * static_cast<float>(kSetupRow);
-      const float cy = LDF32(base, kCursorY);
-      if (cy >= y8 - 4.0f && cy < y8 - 4.0f + step) ST32(base, kOtherHover, kSetupRow);
-      SetCustomText(base, kTxtFirstDynamic + 123, "Run Setup Again");
-      const uint32_t label = LookupText(*ctx, base, kTxtFirstDynamic + 123);
-      if (static_cast<int32_t>(LD32(base, kOtherHover)) == kSetupRow) {
-        int w = 0, h = 0;
-        MeasureText(*ctx, base, sp, label, w, h);
-        const float pad = LDF32(base, kHighlightPad);
-        DrawBox(*ctx, base, 50, label_x - pad, y8 - pad, label_x - pad + w + 4, y8 - pad + h + 4);
-      }
-      DrawText(*ctx, base, sp, label, label_x, y8, 255);
-    }
-    const int hover_now = static_cast<int32_t>(LD32(base, kOtherHover));
-    for (int pos = 2; pos <= 7; ++pos) {
-      const float y = y0 + step * static_cast<float>(pos);
-      uint32_t label_id, value_id;
+    const int last = have_launcher ? kSetupRow : kSetupRow - 1;
+    // The ON/OFF texts of the game's own toggle rows.
+    auto on_off = [&](bool on) { return LD32(base, kOtherText + 2 * 16 + 4 + (on ? 4 : 0)); };
+    for (int pos = 2; pos <= last; ++pos) {
+      const float y = OtherRowY(base, pos);
+      uint32_t label_id, value_id = 0;
+      const int row = OtherGameRow(pos);
       if (pos == kCenterDotRow) {
         label_id = kTxtFirstDynamic + 122;
-        // The ON/OFF texts of the game's own toggle rows.
-        value_id = LD32(base, kOtherText + 2 * 16 + 4 + (REXCVAR_GET(ge_center_dot) ? 4 : 0));
+        value_id = on_off(REXCVAR_GET(ge_center_dot));
+      } else if (pos == kCameraBobRow) {
+        label_id = kTxtFirstDynamic + 124;
+        value_id = on_off(GetB("ge_view_bob"));
+      } else if (pos == kSetupRow) {
+        label_id = kTxtFirstDynamic + 123;
       } else {
-        const int row = pos - 1;  // the game's row shown here
         const uint32_t entry = kOtherText + static_cast<uint32_t>(row) * 16u;
         const uint32_t value = std::min<uint32_t>(OtherRowValue(*ctx, base, row), 2u);
         label_id = LD32(base, entry);
@@ -1134,19 +1159,28 @@ void ge_other_rows_draw() {
         DrawBox(*ctx, base, 50, label_x - pad, y - pad, label_x - pad + w + 4, y - pad + h + 4);
       }
       DrawText(*ctx, base, sp, label, label_x, y, 255);
-      DrawText(*ctx, base, sp, LookupText(*ctx, base, value_id), value_x, y, 255);
+      if (value_id) DrawText(*ctx, base, sp, LookupText(*ctx, base, value_id), value_x, y, 255);
     }
   }
   *ctx = saved;
 }
 
-// A row was chosen (r11 = hovered screen position): Show Crosshair toggles
-// here; the game's rows below it are passed on as their own row numbers.
+// A row was chosen (r11 = the game's hovered row): over our rows the row is
+// the one under the crosshair. Show Crosshair and Camera Bob toggle here; the
+// game's rows are passed on as their own row numbers.
 void ge_other_row_select(PPCRegister& r11) {
-  const int pos = r11.s32;
-  if (pos == kCenterDotRow) {
-    PPCContext* ctx; uint8_t* base; getcb(ctx, base);
-    SetS("ge_center_dot", REXCVAR_GET(ge_center_dot) ? "false" : "true");
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  const int ours = OtherHoverRow(base);
+  if (ours < 0 && r11.s32 >= 2) {  // below or between our rows: nothing
+    r11.u64 = 0xFFFFFFFFu;
+    return;
+  }
+  const int pos = ours >= 0 ? ours : r11.s32;
+  if (pos == kCenterDotRow || pos == kCameraBobRow) {
+    if (pos == kCenterDotRow)
+      SetS("ge_center_dot", REXCVAR_GET(ge_center_dot) ? "false" : "true");
+    else
+      SetS("ge_view_bob", GetB("ge_view_bob") ? "false" : "true");
     const PPCContext saved = *ctx;
     {
       GuestFrame frame(*ctx);
@@ -1159,8 +1193,8 @@ void ge_other_row_select(PPCRegister& r11) {
     ge::PersistSettings();
     ge::RunSetupAgain();
     r11.u64 = 0xFFFFFFFFu;
-  } else if (pos > kCenterDotRow && pos <= 7) {
-    r11.u64 = static_cast<uint32_t>(pos - 1);
+  } else if (pos >= 2) {
+    r11.u64 = static_cast<uint32_t>(OtherGameRow(pos));
   }
 }
 

@@ -1835,15 +1835,16 @@ bool ge_skip_joke_screen(PPCRegister& /*r3*/) { return true; }
 // following the Xbox profile's Y inversion.
 void ge_look_default(PPCRegister& r5) { r5.u64 = 1; }
 
-// View Bob (Video page). The head update sub_820AEB80 (the N64's bheadUpdate)
-// builds the eye's offset (r1+96), look (r1+112) and up (r1+80) vectors from
+// Camera Bob (Other Settings; the setting is ge_view_bob). The head update
+// sub_820AEB80 (the N64's bheadUpdate) builds the eye's offset (r1+96), look
+// (r1+112) and up (r1+80) vectors from
 // Bond's walk animation and idle breathing, then hands them on at 0x820AF08C.
 // The game's "Camera Roll While Walking" option only straightens the up
 // vector, so the eye still bobs and sways. Off, the eye stays at the resting
 // height (player+1656, the value it has standing still) looking straight ahead
 // with no roll; the offset's x and z stay, as they are what moves Bond.
 REXCVAR_DEFINE_BOOL(ge_view_bob, true, "Video",
-                    "View bob while walking (off = the camera stays level and steady)");
+                    "Camera bob while walking (off = the camera stays level and steady)");
 
 void ge_view_bob_hold(PPCRegister& r1) {
   if (REXCVAR_GET(ge_view_bob)) return;
