@@ -1925,9 +1925,12 @@ void decode_element(const Element& el, uint32_t addr, uint32_t endian, uint8_t* 
 
 // Physical address -> a guest address the CPU can read. Physical memory shows
 // up through several aliases and not every page is mapped in every one: the
-// 0xA0000000 view, the 0xE0000000 view (whose CPU addresses are 4 KB behind
-// the physical address), and 0xC0000000. Pick the first whose first and last
-// bytes of [phys, phys+size) can be read.
+// 0xA0000000, 0xE0000000 and 0xC0000000 views, all at view + phys in the
+// membase. (Guest pointers into the 0xE0000000 view are 4 KB behind: that is
+// gpu_view's +0x1000, not this.) Pick the first whose first and last bytes of
+// [phys, phys+size) can be read. A vertex buffer running past the A view's
+// mapped pages used to fall back to view + phys - 4 KB: the Rare logo read
+// from 4 KB early and drew as a flat sliver.
 bool readable_seh(uint32_t a, uint32_t b) {
   __try {
     volatile uint8_t x = gmem()[a];
@@ -1942,7 +1945,7 @@ bool readable_seh(uint32_t a, uint32_t b) {
 uint32_t cpu_view_of_physical(uint32_t phys, uint32_t size) {
   if (!phys) return 0;
   const uint32_t last = size ? size - 1 : 0;
-  for (uint32_t base : {0xA0000000u + phys, 0xE0000000u + phys - 0x1000u, 0xC0000000u + phys})
+  for (uint32_t base : {0xA0000000u + phys, 0xE0000000u + phys, 0xC0000000u + phys})
     if (readable_seh(base, base + last)) return base;
   return 0;
 }
