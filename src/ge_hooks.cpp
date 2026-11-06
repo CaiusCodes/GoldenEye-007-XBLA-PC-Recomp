@@ -4425,33 +4425,41 @@ void ge_stan_edge_tick(uint8_t* base) {
     if (LD16(base, e.addr) != want) ST16(base, e.addr, want);
   }
 }
-// Egyptian: the stone door models (cryptdoor1a..4: secret doors, the panels over
-// the four autoguns around the golden gun, the golden gun's pedestal) carry
-// vertex alpha 0 (some 0x3F/0x40) in Rare's files. The N64 ignored that alpha;
-// the 360 shader multiplies the output alpha by it and blends, so they drew
-// nothing while their collision worked (issue #19: "invisible walls", missing
-// textures). Their vertex buffers sit page-aligned in physical memory as copies
-// of the file's vertex block: find each block by its file bytes and make it opaque.
+// See-through door models (issue #19). Some of Rare's converted N64 door models
+// store vertex alpha 0 (some 0x3F/0x40) and near-black colours. The N64 ignored
+// that alpha; the 360 prop shader multiplies the output alpha by it and blends,
+// so those parts drew nothing while their collision worked:
+// - Egyptian's stone models cryptdoor1a/2a/2b/3/4: the secret doors, the panels
+//   over the four autoguns around the golden gun, the golden gun's pedestal
+//   ("invisible walls", missing textures).
+// - doordest2 (model 0x99, multiplayer Frigate): the door's back drew nothing,
+//   so it looked one-sided.
+// Their vertex buffers are copies of the file's vertex block in physical memory:
+// find each block by the bytes in the player's own file and make the broken
+// vertices opaque. Both graphics modes draw these blocks, so their colour follows
+// the mode and is redone when it changes. Vertices that were opaque keep theirs.
 namespace {
-struct CryptModel {
+struct SeeThroughModel {
   const char* rel;  // under assets
   uint32_t size;    // stock file size, so other data is left alone
-  uint32_t offset;  // vertex block in the file (24-byte vertices, ARGB colour at +20)
+  uint32_t offset;  // vertex block in the file (24-byte vertices, colour A, B, G, R at +20)
   uint32_t count;
+  bool stone;       // Egyptian stone (colour per graphics mode) or the Frigate door
 };
-constexpr CryptModel kCryptModels[] = {
-    {"files/original/prop/cryptdoor1a/default.bin", 31704, 0x708, 24},
-    {"files/new/prop/cryptdoor1a/default.bin", 31676, 0x6F4, 24},
-    {"files/original/prop/cryptdoor2a/default.bin", 31704, 0x708, 24},
-    {"files/new/prop/cryptdoor2a/default.bin", 31676, 0x6F4, 24},
-    {"files/original/prop/cryptdoor2b/default.bin", 31704, 0x708, 24},
-    {"files/new/prop/cryptdoor2b/default.bin", 31676, 0x6F4, 24},
-    {"files/original/prop/cryptdoor3/default.bin", 41072, 0x84C, 48},
-    {"files/new/prop/cryptdoor3/default.bin", 41044, 0x834, 48},
-    {"files/original/prop/cryptdoor4/default.bin", 22284, 0x5B8, 24},
-    {"files/new/prop/cryptdoor4/default.bin", 22268, 0x5AC, 24},
+constexpr SeeThroughModel kSeeThroughModels[] = {
+    {"files/original/prop/cryptdoor1a/default.bin", 31704, 0x708, 24, true},
+    {"files/new/prop/cryptdoor1a/default.bin", 31676, 0x6F4, 24, true},
+    {"files/original/prop/cryptdoor2a/default.bin", 31704, 0x708, 24, true},
+    {"files/new/prop/cryptdoor2a/default.bin", 31676, 0x6F4, 24, true},
+    {"files/original/prop/cryptdoor2b/default.bin", 31704, 0x708, 24, true},
+    {"files/new/prop/cryptdoor2b/default.bin", 31676, 0x6F4, 24, true},
+    {"files/original/prop/cryptdoor3/default.bin", 41072, 0x84C, 48, true},
+    {"files/new/prop/cryptdoor3/default.bin", 41044, 0x834, 48, true},
+    {"files/original/prop/cryptdoor4/default.bin", 22284, 0x5B8, 24, true},
+    {"files/new/prop/cryptdoor4/default.bin", 22268, 0x5AC, 24, true},
+    {"files/original/prop/doordest2/default.bin", 72320, 0xE7C, 52, false},
+    {"files/new/prop/doordest2/default.bin", 72280, 0xE58, 52, false},
 };
-constexpr uint32_t kEgyptStage = 0x20u;
 constexpr uint32_t kVertexStride = 24u;
 
 std::filesystem::path ge_assets_root() {
@@ -4463,13 +4471,13 @@ std::filesystem::path ge_assets_root() {
 }
 
 // The stock vertex blocks (read once from the player's files; empty if a file differs).
-const std::vector<std::vector<uint8_t>>& crypt_blocks() {
+const std::vector<std::vector<uint8_t>>& see_through_blocks() {
   static std::vector<std::vector<uint8_t>> blocks;
   static bool read = false;
   if (read) return blocks;
   read = true;
   const std::filesystem::path root = ge_assets_root();
-  for (const CryptModel& m : kCryptModels) {
+  for (const SeeThroughModel& m : kSeeThroughModels) {
     std::vector<uint8_t> block;
     std::error_code ec;
     const std::filesystem::path p = root / m.rel;
@@ -4482,16 +4490,49 @@ const std::vector<std::vector<uint8_t>>& crypt_blocks() {
         std::fclose(f);
       }
     }
-    if (block.empty()) REXKRNL_WARN("GECRYPT {} not as expected: left alone", m.rel);
+    if (block.empty()) REXKRNL_WARN("GEDOORS {} not as expected: left alone", m.rel);
     blocks.push_back(std::move(block));
   }
   return blocks;
 }
 
-// Scans the 0xA0000000 physical view (page starts only) for the stock blocks and
-// sets every vertex alpha to 0xFF. Returns how many blocks it changed.
-int crypt_patch_pass(uint8_t* base) {
-  const auto& blocks = crypt_blocks();
+// Blocks patched since the stage loaded: guest address, model index.
+std::vector<std::pair<uint32_t, size_t>> g_see_through_found;
+
+// Makes the broken vertices of a found block opaque in the colour for the mode:
+// Egyptian stone as sandstone like the N64's in classic graphics and a warm
+// stone grey with the remastered temple; the Frigate door in the grey of its
+// other side. Which vertices were broken comes from the stock block.
+void see_through_colour(uint8_t* base, const std::pair<uint32_t, size_t>& f, bool classic) {
+  const auto& stock = see_through_blocks()[f.second];
+  const SeeThroughModel& m = kSeeThroughModels[f.second];
+  uint8_t bgr[3] = {0xA0, 0xA0, 0xA0};
+  if (m.stone) {
+    const uint8_t sand[3] = {0x78, 0x98, 0xB0}, grey[3] = {0x70, 0x7C, 0x88};
+    std::memcpy(bgr, classic ? sand : grey, 3);
+  }
+  uint8_t* q = base + f.first;
+  for (size_t v = 0; v < stock.size(); v += kVertexStride) {
+    if (stock[v + 20] >= 0x80) continue;
+    // Still our block (the game may have reused the memory): position unchanged.
+    if (std::memcmp(q + v, stock.data() + v, 12) != 0) return;
+    q[v + 20] = 0xFF;
+    std::memcpy(q + v + 21, bgr, 3);
+  }
+}
+
+// Scans the 0xA0000000 physical view (16-byte steps) for the stock blocks and
+// patches them. Returns how many blocks it changed.
+int see_through_patch_pass(uint8_t* base, bool classic) {
+  const auto& blocks = see_through_blocks();
+  uint32_t firsts[std::size(kSeeThroughModels)] = {};
+  bool any = false;
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    if (blocks[i].empty()) continue;
+    std::memcpy(&firsts[i], blocks[i].data(), 4);
+    any = true;
+  }
+  if (!any) return 0;
   int changed = 0;
   uint8_t* lo = base + 0xA0000000ull;
   uint8_t* hi = base + 0xC0000000ull;
@@ -4500,26 +4541,22 @@ int crypt_patch_pass(uint8_t* base) {
     if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
     uint8_t* end = std::min(static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize, hi);
     const DWORD prot = mbi.Protect & 0xFF;
+    // Read-only pages here are the GPU caches' write watches: a store into them is
+    // caught and invalidates the cached copy, exactly as for the game's own stores.
     const bool readable = mbi.State == MEM_COMMIT &&
                           (prot == PAGE_READWRITE || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READWRITE ||
                            prot == PAGE_EXECUTE_READ || prot == PAGE_WRITECOPY);
-    // Read-only pages here are the GPU caches' write watches: a store into them is
-    // caught and invalidates the cached copy, exactly as for the game's own stores.
     if (readable) {
-      uint8_t* first = lo + ((static_cast<uint8_t*>(mbi.BaseAddress) - lo + 0xFFF) & ~uintptr_t(0xFFF));
-      for (uint8_t* q = first; q + 64 <= end; q += 0x1000) {
-        for (const auto& b : blocks) {
-          if (b.empty() || q + b.size() > end || std::memcmp(q, b.data(), b.size()) != 0) continue;
-          // Colour bytes are A, B, G, R. The see-through vertices also carry
-          // near-black colours (0x11-0x33): give them a warm stone grey that
-          // suits the temple; vertices that were already opaque keep theirs.
-          for (size_t v = 0; v < b.size(); v += kVertexStride) {
-            if (q[v + 20] >= 0x80) continue;
-            q[v + 20] = 0xFF;
-            q[v + 21] = 0x70;
-            q[v + 22] = 0x7C;
-            q[v + 23] = 0x88;
-          }
+      uint8_t* first = lo + ((static_cast<uint8_t*>(mbi.BaseAddress) - lo + 15) & ~uintptr_t(15));
+      for (uint8_t* q = first; q + 4 <= end; q += 16) {
+        uint32_t w;
+        std::memcpy(&w, q, 4);
+        for (size_t i = 0; i < blocks.size(); ++i) {
+          const auto& b = blocks[i];
+          if (b.empty() || w != firsts[i] || q + b.size() > end || std::memcmp(q, b.data(), b.size()) != 0)
+            continue;
+          g_see_through_found.emplace_back(static_cast<uint32_t>(q - base), i);
+          see_through_colour(base, g_see_through_found.back(), classic);
           ++changed;
           break;
         }
@@ -4531,24 +4568,37 @@ int crypt_patch_pass(uint8_t* base) {
 }
 }  // namespace
 
-// Each frame (input poll): in Egyptian, look for the stone door blocks soon after
-// the stage loads and every 2 s after (the other graphics mode loads its own copy).
-void ge_crypt_door_alpha_tick(uint8_t* base) {
-  static uint32_t frames = 0;
-  static uint32_t last_setup = 0;
-  if (LD32(base, GE_CURRENT_STAGE) != kEgyptStage) {
+// Each frame (input poll): look for the blocks soon after a stage loads (and once
+// more after a graphics mode switch), and recolour them when the mode changes.
+void ge_see_through_doors_tick(uint8_t* base) {
+  static uint32_t frames = 0, last_setup = 0;
+  static int toggle_wait = -1;
+  static uint8_t last_classic = 0xFF;
+  if (LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE) {
     last_setup = 0;
+    g_see_through_found.clear();
     return;
   }
   const uint32_t setup = LD32(base, 0x82F30398u);
   if (setup != last_setup) {
     last_setup = setup;
     frames = 0;
+    g_see_through_found.clear();
+  }
+  const uint8_t classic = base[0x82F0DF11u];  // old graphics flag (1 = classic)
+  if (classic != last_classic) {
+    if (last_classic != 0xFF) {
+      for (const auto& f : g_see_through_found) see_through_colour(base, f, classic != 0);
+      toggle_wait = 10;
+    }
+    last_classic = classic;
   }
   ++frames;
-  if (frames != 2 && frames != 30 && frames % 120 != 0) return;
-  const int changed = crypt_patch_pass(base);
-  if (changed) REXKRNL_INFO("GECRYPT {} stone door vertex blocks made opaque", changed);
+  bool scan = frames == 2 || frames == 30 || frames == 120;
+  if (toggle_wait >= 0 && toggle_wait-- == 0) scan = true;
+  if (!scan) return;
+  const int changed = see_through_patch_pass(base, classic != 0);
+  if (changed) REXKRNL_INFO("GEDOORS {} see-through door blocks made solid", changed);
 }
 
 // Silo: the two missiles (model 93 on bound pads 10032/10033) reach up through
@@ -4667,7 +4717,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   ge_stan_edge_tick(base);
   ge_silo_missile_rooms_tick(base);
   ge_corpse_slots_tick(base);
-  ge_crypt_door_alpha_tick(base);
+  ge_see_through_doors_tick(base);
 
   // Skip the boot screen that jokes about the Nintendo logo (menu 2, drawn by
   // sub_820ED378). The current menu is at 0x8272B35C and a requested change at
