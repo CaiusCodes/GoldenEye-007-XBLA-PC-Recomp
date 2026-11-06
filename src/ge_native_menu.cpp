@@ -860,10 +860,20 @@ void SetRowCount(size_t count) {
 
 float RowY(int i) { return kRowY0 + g_row_spacing * static_cast<float>(i); }
 
+// Text drawn at row y has its middle this far below it, where the crosshair
+// sits when it points at the text (measured on Other Settings: 12-14 units).
+// A row is hovered over the band one row spacing tall centred there, so the
+// next row only lights up once the crosshair is past the gap between them.
+constexpr float kTextMiddle = 13.0f;
+bool InRowBand(float cursor_y, float row_y, float spacing) {
+  const float top = row_y + kTextMiddle - spacing * 0.5f;
+  return cursor_y >= top && cursor_y < top + spacing;
+}
+
 int RowAtCursor(uint8_t* base, int count) {
   const float y = LDF32(base, kCursorY);
   for (int i = 0; i < count; ++i) {
-    if (y >= RowY(i) - 4.0f && y < RowY(i) - 4.0f + g_row_spacing) return i;
+    if (InRowBand(y, RowY(i), g_row_spacing)) return i;
   }
   return -1;
 }
@@ -1257,8 +1267,7 @@ int OtherHoverRow(uint8_t* base) {
   const float step = LDF32(base, kOtherPos + 12) * kOtherSpacing;
   const float cy = LDF32(base, kCursorY);
   for (int pos = 2; pos <= last; ++pos) {
-    const float y = OtherRowY(base, pos);
-    if (cy >= y - 4.0f && cy < y - 4.0f + step) return pos;
+    if (InRowBand(cy, OtherRowY(base, pos), step)) return pos;
   }
   return -1;
 }
