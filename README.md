@@ -69,8 +69,10 @@ neither setup nor the game contacts Xbox Live.
   renderer of earlier versions stays available (`gpu_native = false` in
   `ge.toml`)
 - **Up to 4K**: windowed sizes from 1024×768 to 3840×2160, or fullscreen at
-  your screen's resolution; render scale 1x (1280×720, the default), 2x or 3x
-  with FSR upscaling
+  your screen's resolution; render scale 1x (1280×720, the default), 1.5x
+  (1920×1080, new renderer), 2x or 3x with FSR upscaling
+- **Smooth edges**: the new renderer uses 4x anti-aliasing by default, as the
+  Xbox 360 did
 - **Widescreen**: 4:3, 16:9 and 21:9 (Screen Ratio in Video Settings, which
   also picks matching window sizes), with a desk backdrop around the menus on
   wide screens
@@ -90,8 +92,9 @@ neither setup nor the game contacts Xbox Live.
 - **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
   (display mode, resolution, screen ratio, V-Sync, render scale, FSR
   upscaling, texture filtering, anti-aliasing, field of view, FPS counter,
-  post-processing colour filter), Online Settings, and Other Settings (with Run
-  Setup Again). The new renderer uses
+  post-processing colour filter), Online Settings, Other Settings (with Camera
+  Bob to turn off the head bob while walking, and Run Setup Again) and Check
+  for Updates. The new renderer uses
   Direct3D 12 and switches to Vulkan by itself if Direct3D 12 can't start;
   `gpu_native_api = "vulkan"` in `ge.toml` picks Vulkan
   ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)
@@ -99,6 +102,9 @@ neither setup nor the game contacts Xbox Live.
   original up to +30)
 - Optional **100% game completion** in setup: every mission, difficulty,
   007 mode and cheat unlocked
+- **Check for Updates** (Help & Options): asks GitHub for a newer release only
+  when you choose it, then downloads, verifies and installs it, keeping your
+  saves, settings and imported game data
 - **Portable**: one program to open, no installer, no administrator rights;
   saves and settings stay in the game folder
   ![LAN lobby with two players joined](docs/screenshots/lan-lobby.jpg)
@@ -135,7 +141,14 @@ console.
 - Frigate, both small balconies can be walked onto and players can drop off the large ledge onto the deck below (multiplayer).
 - Bunker: the entrance out to the snow is walled off again, so players can’t leave the map (multiplayer).
 - Music fixed watch/pause theme, Mission Select music after a mission ends and the Control and Caverns elevator music which now resumes where it left off.
-- Dead guards stay 10 seconds before they fade out (the original faded them after 1.5 seconds).
+- Dead guards stay 10 seconds before they fade out (the original faded them after 1.5 seconds). Characters a mission objective waits on still fade at once, so the objective completes straight away, and when the level runs short of guard slots the oldest body fades first so reinforcements arrive on time.
+- Egyptian: the stone secret doors, the panels around the four autoguns and the golden gun's pedestal are visible again instead of acting as invisible walls; they match the N64 in classic graphics and use the temple's remastered textures in enhanced graphics. The golden gun's glass case no longer shows through the pedestal once it has dropped.
+- Silo: the missiles no longer disappear when seen from the walkways.
+- Frigate: the door that only drew one side is solid from both sides (multiplayer).
+- Pause watch: Bond's arm wears only the sleeve for the level's outfit instead of every outfit's sleeve at once, and the winder knobs no longer sit in black squares with old graphics.
+- Fixed guards who got the "Dave" face (also Dr. Doak's) being drawn headless with a floating hat in old graphics.
+- A guard's missed shot that hits a wall right beside you no longer bursts in mid air at your head.
+- Fixed a hang on some Intel integrated graphics; if the graphics driver resets, the game restarts by itself and logs why.
 - Cradle: killing Trevelyan at the final showdown now ends the mission.
 - Tank turret aiming with the mouse.
 - Fixed two different characters both being called "Scientist" on character select.

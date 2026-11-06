@@ -83,13 +83,15 @@ Help & Options on the main menu holds the PC settings:
   Video Settings     windowed or fullscreen, window size (up to 3840x2160),
                      screen ratio (4:3, 16:9 or 21:9; the window sizes
                      offered follow it), V-Sync, render scale (1x =
-                     1280x720 by default; 2x and 3x look sharper, need a
-                     stronger graphics card and restart the game),
-                     upscaling (FSR or off), texture filtering,
-                     anti-aliasing, post-processing (colour filter), field
-                     of view, FPS counter
+                     1280x720 by default; 1.5x (new renderer), 2x and 3x
+                     look sharper, need a stronger graphics card and
+                     restart the game), upscaling (FSR or off), texture
+                     filtering, anti-aliasing (4x by default with the new
+                     renderer), post-processing
+                     (colour filter), field of view, FPS counter
   Online Settings    player name and the online server options
-  Other Settings     the game's own options, plus Run Setup Again
+  Other Settings     the game's own options, Camera Bob (turn off the head
+                     bob while walking) and Run Setup Again
   Check for Updates  asks GitHub for a newer version (see UPDATING)
 
 MULTIPLAYER OVER LAN OR A VIRTUAL LAN
