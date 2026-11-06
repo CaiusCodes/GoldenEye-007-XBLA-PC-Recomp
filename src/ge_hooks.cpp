@@ -5748,6 +5748,30 @@ void ge_select_cuff(uint8_t* base, uint32_t res, bool remastered) {
 }
 }  // namespace
 
+// Old graphics: Rare's original\head\headdave (the Dr. Doak face, also in the
+// random guard faces) was exported with rigid shaders (c_modelviewprojection)
+// on a skinned head, so the face never reaches the neck: the guard is drawn
+// headless with his hat floating. The new\head\headdave is fine. A model's
+// files are named when it is set up (sub_8211DB38(model, name, kind): the
+// original file first, at 0x8211DB78, sprintf "game:\files\original\%s\%s\..."
+// with r6 = kind, r7 = name), so the original file of headdave is taken from
+// headgrant, the closest classic face; the remastered file stays Dave's.
+void ge_classic_head_swap(PPCRegister& r6, PPCRegister& r7) {
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  if (r6.u32 < 0x80000000u || r7.u32 < 0x80000000u) return;
+  if (std::strcmp(reinterpret_cast<const char*>(base + r6.u32), "head") != 0) return;
+  if (std::strcmp(reinterpret_cast<const char*>(base + r7.u32), "headdave") != 0) return;
+  // The body/head table (0x82729020, 36-byte entries, name pointer at +4) names headgrant at entry 52.
+  const uint32_t name = LD32(base, 0x82729020u + 36u * 52u + 4u);
+  if (name < 0x80000000u || std::strcmp(reinterpret_cast<const char*>(base + name), "headgrant") != 0) return;
+  r7.u64 = name;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXKRNL_INFO("GEHEADS classic headdave is drawn with headgrant (its own file has rigid shaders)");
+  }
+}
+
 bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
