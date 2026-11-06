@@ -6,6 +6,11 @@ Play at **up to 4K and 60 FPS**, with 16:9 and 21:9 widescreen support, enhanced
 
 **Free and open-source.**
 
+Like the recomp and want to support future projects? You can
+tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
+
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
+
 ![GoldenEye 007 Main Menu](docs/screenshots/main-menu.jpg)
 
 > **You must provide your own copy of GoldenEye 007 XBLA.** No original game files or assets are distributed with this project. The launcher imports the required files from your Xbox 360 game package during first-time setup.
@@ -46,10 +51,10 @@ The installation is portable, with imported game files, saves and settings store
 - **Render Scale:** 1x, 1.5x, 2x or 3x
 - **AMD FSR** upscaling and texture filtering options
 - **4x Anti-Aliasing** by default with the native renderer
-- **Adjustable Field of View**, colour filters and Camera Bob toggle
+- **Adjustable Field of View**, color filters and Camera Bob toggle
 - **Classic and Enhanced Graphics:** Switch instantly using F or RB
 
-The native renderer significantly reduces CPU and GPU overhead compared with the previous renderer, making the game more accessible on older laptops and integrated graphics.
+The native renderer PLUME significantly reduces CPU and GPU overhead compared with the previous renderer, making the game more accessible on older laptops and integrated graphics.
 
 ![GoldenEye 007 Ultrawide Gameplay](docs/screenshots/gameplay-ultrawide.jpg)
 
@@ -60,8 +65,6 @@ The native renderer significantly reduces CPU and GPU overhead compared with the
 - Native PC settings menus
 - Optional 100% completion unlocks for missions, difficulties and cheats
 - Improved aiming, including mouse-controlled tank turret and sniper zoom
-- Optional FPS and frame-time counter
-- Removed outdated Xbox Live menus and prompts
 - Built-in update checker
 - Portable installation with local saves and settings
 
@@ -71,8 +74,6 @@ The native renderer significantly reduces CPU and GPU overhead compared with the
 - Compatible with Radmin VPN, ZeroTier, Tailscale and Hamachi
 - Multiplayer music synchronised between players
 - Fixes for map boundaries, collision, weapons and character selection
-
-No Xbox Live connection is required.
 
 ![GoldenEye 007 LAN Multiplayer](docs/screenshots/lan-match.jpg)
 
@@ -108,7 +109,6 @@ Alongside the PC enhancements, several issues from the original unreleased build
 - Fixed multiplayer collision issues in Bunker and Frigate.
 - Fixed multiplayer shotgun damage and character selection problems.
 - Corrected music playback, sound effects and menu issues.
-- Removed obsolete Xbox Live functionality.
 - Improved performance and stability on integrated graphics.
 
 For detailed changes, see the [GitHub Releases](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/releases).
@@ -127,7 +127,7 @@ Older installations using a separate setup executable and `Game` folder can also
 
 - Windows only.
 - Only the supported GoldenEye 007 XBLA build (Title ID `584108A9`) is accepted.
-- Some issues inherited from the original unreleased build may remain.
+- Some issues inherited from the original incomplete unreleased build may remain.
 - Windows SmartScreen may warn about the unsigned executable.
 - Windows Firewall may request permission for multiplayer connections.
 
@@ -160,10 +160,6 @@ This project builds upon the work of:
 - [Plume](https://github.com/zolaware/plume) and [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) – Native rendering and shader translation.
 
 The project's own game-port code is released under [The Unlicense](LICENSE). The launcher includes GPL-3.0 components derived from [Velocity](https://github.com/hetelek/Velocity), and third-party dependencies retain their respective licences. See [packaging/licenses](packaging/licenses) and [packaging/licenses-native](packaging/licenses-native) for additional terms.
-
-## Support Development
-
-If you enjoy the project and would like to support future PC recompilation projects, you can [support me on Ko-fi](https://ko-fi.com/caiuscodes).
 
 ---
 
