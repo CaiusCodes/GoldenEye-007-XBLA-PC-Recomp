@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <thread>
@@ -47,6 +48,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include <atomic>
+#include <mutex>
+
+#include "ge_update.h"      // Check for Updates
+#include "ge_version_rc.h"  // GE_VERSION_STR, from VERSION
 
 namespace ge {
 void SetRebindCapturing(bool v);  // ge_hooks.cpp: swallow pad input while capturing
@@ -151,7 +158,7 @@ std::function<void()> g_restart;
 std::function<void(int, int)> g_window_size;
 
 // ---------------------------------------------------------------- pages ---
-enum class Page { None, Keyboard, Video, PostFx, Online, Bindings1, Bindings2 };
+enum class Page { None, Keyboard, Video, PostFx, Online, Bindings1, Bindings2, Update };
 Page g_page = Page::None;
 bool g_leave_page = false;  // a Done row asked to go back to Help & Options
 
@@ -362,6 +369,157 @@ void AddAction(std::vector<Row>& rows, const char* label, std::function<void()> 
   rows.push_back(r);
 }
 
+// ---------------------------------------------------- Check for Updates ---
+// Online Settings > Check for Updates opens Page::Update, and only then is
+// GitHub asked (on a worker thread, src/ge_update.h) whether a newer release
+// exists; nothing is checked at start or in the background. "Update Now"
+// (front end only, never in a LAN / online game) starts the launcher with
+// --update and ends the game; the launcher downloads, verifies and installs
+// the release and offers Play.
+enum class UpdateState { Idle, Checking, UpToDate, Failed, NoLauncher, Available, Blocked };
+struct UpdateStatus {
+  UpdateState state = UpdateState::Idle;
+  std::string latest, error;  // the latest release's version; why a check failed
+  uint64_t size = 0;          // its ZIP's size in bytes (0 unknown)
+};
+std::mutex g_update_mutex;
+UpdateStatus g_update;
+uint32_t g_update_check = 0;  // which check the worker's answer belongs to
+
+UpdateStatus CurrentUpdate() {
+  std::lock_guard<std::mutex> lock(g_update_mutex);
+  return g_update;
+}
+
+void StartUpdateCheck() {
+  uint32_t check;
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update = UpdateStatus{};
+    g_update.state = ge::LauncherPath().empty() ? UpdateState::NoLauncher : UpdateState::Checking;
+    if (g_update.state != UpdateState::Checking) return;
+    check = ++g_update_check;
+  }
+  REXLOG_INFO("[update] asking {} for the latest release", ge::update::Narrow(ge::update::ApiUrl()));
+  std::thread([check] {
+    ge::update::Release release;
+    std::string error;
+    const int newer = ge::update::CheckForNewer(release, ge::update::Agent(GE_VERSION_STR), GE_VERSION_STR, error);
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    if (check != g_update_check || g_update.state != UpdateState::Checking) return;  // left meanwhile
+    g_update.latest = release.version;
+    g_update.size = release.zip_size;
+    g_update.error = error;
+    g_update.state = newer > 0 ? UpdateState::Available : newer == 0 ? UpdateState::UpToDate : UpdateState::Failed;
+    REXLOG_INFO("[update] latest release {} (this copy {}): {}", release.version.empty() ? "?" : release.version,
+                GE_VERSION_STR, newer > 0 ? "newer" : newer == 0 ? "not newer" : error);
+  }).detach();
+}
+
+void LeaveUpdatePage() {
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update.state = UpdateState::Idle;
+  }
+  g_page = Page::Online;
+}
+
+// Restarting is safe on the front end only, and never in a LAN / online game.
+bool UpdateIsSafeNow() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks || !ks->memory()) return false;
+  uint8_t* base = ks->memory()->virtual_membase();
+  return LD32(base, 0x82423E00u) == 90u && !rex::kernel::xam::GeNetworkGameActive();
+}
+
+// Opens the launcher's update window and ends the game (settings saved first).
+void StartUpdater() {
+  if (!UpdateIsSafeNow()) {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update.state = UpdateState::Blocked;
+    return;
+  }
+  const std::wstring launcher = ge::LauncherPath();
+  if (launcher.empty()) return;
+  ge::PersistSettings();
+  const std::wstring folder = std::filesystem::path(launcher).parent_path().wstring();
+  std::wstring command = L"\"" + launcher + L"\" --update";
+  STARTUPINFOW startup = {sizeof(startup)};
+  PROCESS_INFORMATION process = {};
+  if (!CreateProcessW(launcher.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, folder.c_str(),
+                      &startup, &process)) {
+    REXLOG_ERROR("[update] could not start the launcher (error {})", GetLastError());
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update.state = UpdateState::Failed;
+    g_update.error = "the launcher (GoldenEye 007.exe) could not be started";
+    return;
+  }
+  AllowSetForegroundWindow(process.dwProcessId);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  REXLOG_INFO("Game closing for the launcher to install an update");
+  rex::FlushLogging();
+  TerminateProcess(GetCurrentProcess(), 0);
+}
+
+// The page's text, in lines short enough for the page (the game's own font
+// and size; the text slots hold 63 characters).
+constexpr size_t kUpdateLineChars = 38;
+void AddTextLines(std::vector<Row>& rows, const std::string& text) {
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = std::min(text.size(), start + kUpdateLineChars);
+    if (end < text.size()) {
+      const size_t space = text.rfind(' ', end);
+      if (space != std::string::npos && space > start) end = space;
+    }
+    rows.push_back(Row{RowKind::Label, text.substr(start, end - start)});
+    start = end;
+    while (start < text.size() && text[start] == ' ') ++start;
+  }
+}
+
+void BuildUpdatePage(std::vector<Row>& rows) {
+  const UpdateStatus s = CurrentUpdate();
+  const std::string current = GE_VERSION_STR;
+  rows.push_back(Row{RowKind::Label, "CHECK FOR UPDATES"});
+  switch (s.state) {
+    case UpdateState::Idle:
+    case UpdateState::Checking:
+      AddTextLines(rows, "Asking GitHub for the latest release...");
+      AddAction(rows, "Cancel", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::UpToDate:
+      AddTextLines(rows, "GoldenEye 007 is up to date (v" + current + ").");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::Failed:
+      AddTextLines(rows, "Could not check for updates: " + s.error + ".");
+      AddTextLines(rows, "Please try again later.");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::NoLauncher:
+      AddTextLines(rows, "Updates work in the release folder, with GoldenEye 007.exe beside the resources folder.");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::Available: {
+      AddTextLines(rows, "v" + s.latest + " is available. You have v" + current + ".");
+      char size[32] = "";
+      if (s.size) std::snprintf(size, sizeof(size), " (%.0f MB)", s.size / 1048576.0);
+      AddTextLines(rows, std::string("The game closes, the update downloads") + size +
+                             " and installs, then you can play. Saves and settings are kept.");
+      AddAction(rows, "Update Now", [] { StartUpdater(); });
+      AddAction(rows, "Not Now", [] { LeaveUpdatePage(); });
+      break;
+    }
+    case UpdateState::Blocked:
+      AddTextLines(rows, "Updating closes the game. Quit to the main menu (and leave any network game) first, "
+                         "then try again.");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+  }
+}
+
 std::vector<Row> BuildPage(Page page) {
   std::vector<Row> rows;
   switch (page) {
@@ -542,9 +700,20 @@ std::vector<Row> BuildPage(Page page) {
       Row name{RowKind::Text, "Player Name:", "ge_username"};
       name.max_len = 15;
       rows.push_back(name);
+      // Asks GitHub only when pressed (Page::Update above); shows this copy's version.
+      AddAction(
+          rows, "Check for Updates",
+          [] {
+            g_page = Page::Update;
+            StartUpdateCheck();
+          },
+          [] { return std::string("v") + GE_VERSION_STR; });
       AddAction(rows, "Done", [] { g_leave_page = true; });
       break;
     }
+    case Page::Update:
+      BuildUpdatePage(rows);
+      break;
     case Page::None:
       break;
   }
@@ -801,7 +970,7 @@ void DrawPage(PPCContext& ctx, uint8_t* base) {
     SetCustomText(base, value_id, ValueText(r, static_cast<int>(i)));
     const float y = RowY(static_cast<int>(i));
     const uint32_t label = LookupText(ctx, base, label_id);
-    if (static_cast<int>(i) == g_hover) {
+    if (static_cast<int>(i) == g_hover && r.kind != RowKind::Label) {
       int w = 0, h = 0;
       MeasureText(ctx, base, sp, label, w, h);
       const float pad = LDF32(base, kHighlightPad);
@@ -887,6 +1056,10 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
                         : (g_page >= Page::Bindings1 && g_page <= Page::Bindings2) ? Page::Keyboard
                                                                                    : Page::None;
     PlaySelectSound(ctx, base);
+    if (g_page == Page::Update) {
+      LeaveUpdatePage();
+      return false;
+    }
     if (parent != Page::None) {
       g_page = parent;
       return false;
@@ -907,7 +1080,7 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
       return false;
     }
   }
-  if (g_hover >= 0 && ButtonPressed(ctx, base, kSelectMask)) {
+  if (g_hover >= 0 && rows[g_hover].kind != RowKind::Label && ButtonPressed(ctx, base, kSelectMask)) {
     Row& r = rows[g_hover];
     PlaySelectSound(ctx, base);
     if (r.kind == RowKind::Slider) {

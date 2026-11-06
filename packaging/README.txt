@@ -46,8 +46,9 @@ FIRST-TIME SETUP
 From then on, opening "GoldenEye 007.exe" starts the game straight away.
 Setup only reads your package; it never changes, moves or deletes it, and
 it is not needed again. Nothing is installed outside this folder and no
-administrator rights are needed. It does not download anything and does
-not contact Xbox LIVE.
+administrator rights are needed. Setup does not download anything and
+nothing contacts Xbox LIVE. The only time the game goes online on its own
+behalf is when you choose Check for Updates (see UPDATING below).
 
 CONTROLS
 --------
@@ -87,7 +88,8 @@ Help & Options on the main menu holds the PC settings:
                      upscaling (FSR or off), texture filtering,
                      anti-aliasing, post-processing (colour filter), field
                      of view, FPS counter
-  Online Settings    player name and the online server options
+  Online Settings    player name, the online server options and
+                     Check for Updates
   Other Settings     the game's own options, plus Run Setup Again
 
 MULTIPLAYER OVER LAN OR A VIRTUAL LAN
@@ -135,9 +137,23 @@ GoldenEye 007.exe with --setup works too. Importing again replaces resources\ass
 saves and settings in resources\userdata are kept. If a needed file goes
 missing, opening GoldenEye 007.exe shows the setup window again by itself.
 
-To update, extract a new release over this folder (your resources\assets
-and resources\userdata are kept), or into a new folder: setup finds the old
-copy next to it and imports from it.
+UPDATING: Help & Options > Online Settings > Check for Updates asks this
+project's GitHub page (github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp)
+whether a newer release exists. Nothing is checked unless you choose it, and
+nothing is sent but that one request (no personal data). If there is a
+newer version, "Update Now" (from the main menu, not during a mission or a
+network game) closes the game and opens the update window, which downloads
+the release, checks it against the checksum GitHub publishes for it, and
+replaces only the program files: GoldenEye 007.exe, README.txt, licenses\
+and resources\runtime (not its logs). Your imported game data
+(resources\assets), saves, settings and caches (resources\userdata) are
+never touched, and no game data is ever downloaded. If anything goes wrong,
+the old files are put back. Then click Play. Details are in
+resources\runtime\logs\setup.log.
+
+To update by hand, extract a new release over this folder (your
+resources\assets and resources\userdata are kept), or into a new folder:
+setup finds the old copy next to it and imports from it.
 
 Coming from an older release (Setup GoldenEye 007.exe and a Game folder):
 extract this release into the old release folder or next to it. Setup finds

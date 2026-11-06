@@ -104,6 +104,8 @@ target_compile_options(ge PRIVATE -march=x86-64-v3 -ffp-contract=off)
 # Character pictures are read with WIC (ge_portraits.cpp).
 if(WIN32)
     target_link_libraries(ge PRIVATE windowscodecs ole32)
+    # Check for Updates (src/ge_update.h): WinHTTP and CNG's SHA-256.
+    target_link_libraries(ge PRIVATE winhttp bcrypt)
 endif()
 
 # ge_version_rc.h for GoldenEye.rc (see the VERSION block above).

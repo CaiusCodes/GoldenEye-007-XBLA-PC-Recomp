@@ -6,6 +6,12 @@
 //   GoldenEye 007.exe --setup         open the setup window (as does holding
 //                                     Shift while opening it, or the game's
 //                                     Video Settings > Run Setup Again)
+//   GoldenEye 007.exe --update        the update window (the game's Online
+//                                     Settings > Check for Updates > Update Now):
+//                                     installs the latest release's program files
+//
+// GE_UPDATE_API (environment, for testing) points --update and the game's
+// check at another releases URL (https, or http on 127.0.0.1).
 //
 // For automated tests (no window):
 //   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,complete]
@@ -66,13 +72,15 @@ int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstrin
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  bool setup = false, unattended = false;
+  bool setup = false, unattended = false, update = false;
   std::wstring extras;
   SetupOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::wstring arg = argv[i];
     if (arg == L"--setup") {
       setup = true;
+    } else if (arg == L"--update") {
+      update = true;
     } else if (arg == L"--unattended") {
       unattended = true;
     } else if (arg == L"--package" && i + 1 < argc) {
@@ -93,6 +101,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
   const Paths p = MakePaths();
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+  // What an update cut off half-way (or the old launcher exe it could not
+  // delete while running) left behind is put back or cleared first: a cheap
+  // look at the program folders only.
+  RecoverInterruptedUpdate(p);
+  // --update: the latest release replaces the program files. One window at a time.
+  if (update) {
+    HANDLE update_mutex = CreateMutexW(nullptr, TRUE, L"Local\\GoldenEye007Update");
+    if (update_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+      if (HWND other = FindWindowW(L"GoldenEye007Update", nullptr)) {
+        ShowWindow(other, SW_RESTORE);
+        SetForegroundWindow(other);
+      }
+      CloseHandle(update_mutex);
+      CoUninitialize();
+      return 0;
+    }
+    LogTo(p.logs);
+    const int code = RunUpdateWindow(instance, p);
+    if (update_mutex) {
+      ReleaseMutex(update_mutex);
+      CloseHandle(update_mutex);
+    }
+    CoUninitialize();
+    return code;
+  }
 
   // The normal case: everything is in place, so start the game at once.
   std::wstring missing;
