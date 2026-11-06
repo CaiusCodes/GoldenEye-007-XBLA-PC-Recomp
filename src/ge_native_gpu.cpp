@@ -2900,6 +2900,17 @@ RenderBlend to_blend(uint8_t b) {
     default: return RenderBlend::ONE;
   }
 }
+// D3D12/Vulkan reject colour factors in the alpha blend; on the Xbox 360 a
+// colour factor used for alpha reads that colour's alpha, so it is the same.
+RenderBlend to_blend_alpha(uint8_t b) {
+  switch (b) {
+    case 4: return RenderBlend::SRC_ALPHA;
+    case 5: return RenderBlend::INV_SRC_ALPHA;
+    case 8: return RenderBlend::DEST_ALPHA;
+    case 9: return RenderBlend::INV_DEST_ALPHA;
+    default: return to_blend(b);
+  }
+}
 RenderBlendOperation to_blend_op(uint8_t o) {
   switch (o) {
     case 1: return RenderBlendOperation::SUBTRACT;
@@ -3204,7 +3215,7 @@ RenderPipeline* pipeline_for(RenderShader* vs, RenderShader* ps, uint32_t decl,
   RenderBlendDesc blend = RenderBlendDesc::Copy();
   blend.blendEnabled = st.blend;
   blend.srcBlend = to_blend(st.src); blend.dstBlend = to_blend(st.dst); blend.blendOp = to_blend_op(st.op);
-  blend.srcBlendAlpha = to_blend(st.src_a); blend.dstBlendAlpha = to_blend(st.dst_a); blend.blendOpAlpha = to_blend_op(st.op_a);
+  blend.srcBlendAlpha = to_blend_alpha(st.src_a); blend.dstBlendAlpha = to_blend_alpha(st.dst_a); blend.blendOpAlpha = to_blend_op(st.op_a);
   blend.renderTargetWriteMask = st.write_mask;
   d.renderTargetBlend[0] = blend;
   d.depthEnabled = g.bound_scene && st.z_enable;

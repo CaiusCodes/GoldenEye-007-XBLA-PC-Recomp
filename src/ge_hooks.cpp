@@ -5478,12 +5478,285 @@ bool model_has_own_head(const char* guest_path) {
   cache.emplace(guest_path, own_head);
   return own_head;
 }
+
+// The pause watch arm (char\suitlfhand) holds every sleeve Bond can wear. The
+// N64 showed one, picked by the player's outfit (bondviewSelectCuff and its
+// switches SW_BOILER..SW_SNOW); both Xbox arm models lost those switches, so
+// every sleeve was drawn at once and the bulky ones poked through. The outfit
+// is still set from the stage setup (player +0x544, the N64 CUFF_* values:
+// 0 blue suit, 1 Brosnan tuxedo, 2 jungle, 3 boiler suit, 4 snow, 5 Connery,
+// 6 Dalton, 7 Moore, 8 folder). The arm's command list, loaded at res+8 ->
+// +0xEC -> {start, end}, draws each texture's pieces in a block opened by an
+// op 0x16 (3 render passes); a sleeve block of another outfit has its first
+// 8 bytes turned into op 0x19 (goto) to the next block, restored on change.
+struct CuffArm {
+  uint32_t stream = 0;              // command list start, to notice a reload
+  std::vector<uint32_t> blocks;     // every op 0x16 in order
+  std::vector<std::pair<int, std::array<uint8_t, 8>>> saved;  // patched block -> original bytes
+  int outfit = -2;
+};
+constexpr uint32_t kCurrentPlayer = 0x82F1FAACu;
+constexpr uint32_t kPlayerCuff = 0x544u;
+
+// Sleeve blocks (index into the op 0x16 list) and which of them each outfit wears.
+// Classic: blocks 2.. are the arm's 22 textures in order; 10 is the shirt cuff
+// shared by the three suits (checked against each sleeve's length in game). Remastered: blocks 6..10 are its five sleeves.
+std::vector<int> cuff_blocks(bool remastered) {
+  if (remastered) return {6, 7, 8, 9, 10};
+  return {8, 9, 10, 11, 12, 13, 14, 15};
+}
+std::vector<int> cuff_worn(bool remastered, int outfit) {
+  if (remastered) {
+    switch (outfit) {
+      case 0: return {10};      // blue suit, light blue shirt cuff
+      case 2: return {7};       // jungle
+      case 3: return {9};       // boiler suit, knitted cuff
+      case 4: return {8};       // snow parka
+      default: return {6};      // the tuxedos (no white jacket in this model)
+    }
+  }
+  switch (outfit) {
+    case 0: return {13, 10};    // blue suit + shirt cuff
+    case 2: return {14};        // jungle (rolled sleeve)
+    case 3: return {8, 9};      // boiler suit: knitted cuff + short sleeve
+    case 4: return {15};        // snow parka
+    case 5: return {12, 10};    // Connery's white jacket + shirt cuff
+    default: return {11, 10};   // black tuxedo + shirt cuff
+  }
+}
+
+// Classic watch winder knobs: the arm's last block (texture 21, two quads, one
+// each side of the watch). Rare's conversion of the N64 picture lost its
+// transparency (every DXT1 block is opaque, the background solid black) and
+// the classic shader writes alpha 1, so neither a cut-out nor alpha blending
+// can hide the black squares around the knobs on the pause watch. The knob's
+// own colour is the mask instead:
+//   - the picture is touched up once: the knob's darkest texels are lifted to
+//     at least kKnobFloor, the background stays exactly black (knob_texture);
+//   - the knob is drawn kKnobMaskPasses times blended ZERO / INVSRCCOLOR, each
+//     pass scaling what is behind it by (1 - knob colour): behind the knob it
+//     goes to black (at most (1 - floor)^passes, about 2%), around it nothing
+//     changes;
+//   - then once blended ONE / ONE: the knob lands on that black at full
+//     strength and its black squares add nothing.
+// Depth writes are off throughout. The block's bone/primitive ops are copied to
+// a guest buffer between render-state ops (op 0x0C {offset, value}, Xbox 360
+// D3DRS byte offsets) and the original bone op becomes a goto there. The states
+// end on the values the game's own command lists use (blend off, SRCALPHA /
+// INVSRCALPHA, depth writes on).
+constexpr int kKnobFloor = 24;       // of 255, per channel
+constexpr int kKnobMaskPasses = 40;  // (1 - 24/255)^40 = 2%
+
+// DXT1, 8-in-16 byte order (as the CAFF textures are stored): lifts every
+// non-black texel to kKnobFloor per channel and keeps black texels black,
+// using the 3-colour mode (index 3 = black) where a block holds both.
+void knob_texture(uint8_t* p, uint32_t bytes) {
+  using Rgb = std::array<int, 3>;
+  auto rgb = [](uint16_t c) {
+    return Rgb{((c >> 11) & 31) * 255 / 31, ((c >> 5) & 63) * 255 / 63, (c & 31) * 255 / 31};
+  };
+  auto pack = [](const Rgb& c) {
+    return static_cast<uint16_t>(((c[0] * 31 + 127) / 255) << 11 | ((c[1] * 63 + 127) / 255) << 5 |
+                                 ((c[2] * 31 + 127) / 255));
+  };
+  auto black = [](const Rgb& c) { return c[0] == 0 && c[1] == 0 && c[2] == 0; };
+  for (uint32_t i = 0; i + 8 <= bytes; i += 8) {
+    uint8_t* b = p + i;
+    const uint16_t c0 = static_cast<uint16_t>(b[1] | b[0] << 8), c1 = static_cast<uint16_t>(b[3] | b[2] << 8);
+    const uint32_t idx = static_cast<uint32_t>(b[5] | b[4] << 8 | b[7] << 16 | b[6] << 24);
+    if (c0 == 0 && c1 == 0) continue;  // all black: background
+    std::array<Rgb, 4> pal{rgb(c0), rgb(c1), Rgb{}, Rgb{}};
+    const bool four = c0 > c1;
+    for (int k = 0; k < 3; ++k) {
+      pal[2][k] = four ? (2 * pal[0][k] + pal[1][k]) / 3 : (pal[0][k] + pal[1][k]) / 2;
+      pal[3][k] = four ? (pal[0][k] + 2 * pal[1][k]) / 3 : 0;
+    }
+    std::array<Rgb, 16> px;
+    bool any_black = false;
+    for (int j = 0; j < 16; ++j) {
+      px[j] = pal[(idx >> (2 * j)) & 3];
+      any_black |= black(px[j]);
+    }
+    Rgb lo{255, 255, 255}, hi{0, 0, 0};
+    bool any_knob = false;
+    for (Rgb& c : px) {
+      if (black(c)) continue;
+      any_knob = true;
+      for (int k = 0; k < 3; ++k) {
+        c[k] = std::max(c[k], kKnobFloor);
+        lo[k] = std::min(lo[k], c[k]);
+        hi[k] = std::max(hi[k], c[k]);
+      }
+    }
+    if (!any_knob) continue;
+    uint16_t e0 = pack(hi), e1 = pack(lo);
+    std::array<Rgb, 4> out;
+    int colours;
+    if (any_black) {  // 3-colour mode: c0 <= c1, index 3 = black
+      if (e0 > e1) std::swap(e0, e1);
+      out = {rgb(e0), rgb(e1), Rgb{}, Rgb{}};
+      for (int k = 0; k < 3; ++k) out[2][k] = (out[0][k] + out[1][k]) / 2;
+      colours = 3;
+    } else {  // 4-colour mode: c0 > c1
+      if (e0 == e1) {
+        if (e0 < 0xFFFF) ++e0; else --e1;
+      }
+      if (e0 < e1) std::swap(e0, e1);
+      out = {rgb(e0), rgb(e1), Rgb{}, Rgb{}};
+      for (int k = 0; k < 3; ++k) {
+        out[2][k] = (2 * out[0][k] + out[1][k]) / 3;
+        out[3][k] = (out[0][k] + 2 * out[1][k]) / 3;
+      }
+      colours = 4;
+    }
+    uint32_t ni = 0;
+    for (int j = 0; j < 16; ++j) {
+      int q = 3;
+      if (!black(px[j])) {
+        int best = INT32_MAX;
+        for (int t = 0; t < colours; ++t) {
+          int d = 0;
+          for (int k = 0; k < 3; ++k) d += (px[j][k] - out[t][k]) * (px[j][k] - out[t][k]);
+          if (d < best) { best = d; q = t; }
+        }
+      }
+      ni |= static_cast<uint32_t>(q) << (2 * j);
+    }
+    b[0] = static_cast<uint8_t>(e0 >> 8); b[1] = static_cast<uint8_t>(e0);
+    b[2] = static_cast<uint8_t>(e1 >> 8); b[3] = static_cast<uint8_t>(e1);
+    b[4] = static_cast<uint8_t>(ni >> 8); b[5] = static_cast<uint8_t>(ni);
+    b[6] = static_cast<uint8_t>(ni >> 24); b[7] = static_cast<uint8_t>(ni >> 16);
+  }
+}
+
+void ge_watch_knob_blend(uint8_t* base, uint32_t rg, uint32_t block, uint32_t end) {
+  uint32_t bones = 0, prim = 0, stop = 0;
+  bool material = false;
+  for (uint32_t p = block; p + 4 <= end;) {
+    const uint32_t size = LD32(base, p) >> 16;
+    const uint8_t op = base[p + 2];
+    if (size < 4) return;
+    if (op == 0x2D && !material) {  // the first pass's texture: the knob's is 21
+      if (LD32(base, p + 12) != 21) return;
+      material = true;
+    }
+    if (op == 0x13) bones = p;
+    else if (op == 0x01 && bones && !prim) prim = p;
+    else if (op == 0x1D) { stop = p; break; }
+    else if (prim) return;  // more than one primitive: not the block we know
+    p += size;
+  }
+  if (!bones || !prim || !stop || prim != bones + 16 || stop != prim + 16) {
+    REXKRNL_WARN("GEKNOB classic watch knob block not as expected; left as it is");
+    return;
+  }
+  // The knob picture: texture 21 of the arm (table at rendergraph +0x7C, each
+  // entry a "texture" resource with its D3D texture object at +0x34; the
+  // fetch constant at object +28). 64x64 DXT1, tiled, 8-in-16, CAFF-loaded
+  // (0xE0000000 range, data 4 KB on).
+  if (LD32(base, rg + 0x1C) != 22) return;
+  const uint32_t tex_res = LD32(base, LD32(base, rg + 0x7C) + 21 * 4);
+  const uint32_t tex_obj = tex_res ? LD32(base, tex_res + 0x34) : 0;
+  if (!tex_obj) return;
+  const uint32_t f0 = LD32(base, tex_obj + 28), f1 = LD32(base, tex_obj + 32), f2 = LD32(base, tex_obj + 36);
+  const uint32_t phys = f1 & 0xFFFFF000u;
+  if ((f1 & 0x3F) != 18 || ((f1 >> 6) & 3) != 1 || !(f0 >> 31) || phys < 0xE0000000u || (f2 & 0x1FFF) != 63 ||
+      ((f2 >> 13) & 0x1FFF) != 63) {
+    REXKRNL_WARN("GEKNOB classic watch knob picture not as expected; left as it is");
+    return;
+  }
+  knob_texture(base + phys + 0x1000, 32 * 32 * 8);  // 16x16 blocks, tiled in a 32x32-block area
+  static uint32_t cave = 0;
+  constexpr uint32_t kCaveBytes = 4 * 12 + kKnobMaskPasses * 32 + 2 * 12 + 32 + 4 * 12 + 8;
+  if (!cave) cave = rex::system::kernel_state()->memory()->SystemHeapAlloc(kCaveBytes);
+  if (!cave) return;
+  uint32_t w = cave;
+  auto state = [&](uint32_t offset, uint32_t value) {
+    ST32(base, w, 0x000C0C00u); ST32(base, w + 4, offset); ST32(base, w + 8, value); w += 12;
+  };
+  auto draw = [&]() {
+    std::memcpy(base + w, base + bones, 32);  // the bone op and the primitive op
+    const uint32_t bone_list = LD32(base, w + 4);  // points into the bone op itself
+    if (bone_list >= bones && bone_list < bones + 16) ST32(base, w + 4, w + (bone_list - bones));
+    w += 32;
+  };
+  state(0x3C, 1);  // D3DRS_ALPHABLENDENABLE
+  state(0x30, 0);  // D3DRS_ZWRITEENABLE
+  state(0x48, 0);  // D3DRS_SRCBLEND = ZERO
+  state(0x4C, 5);  // D3DRS_DESTBLEND = INVSRCCOLOR
+  for (int i = 0; i < kKnobMaskPasses; ++i) draw();
+  state(0x48, 1);  // ONE
+  state(0x4C, 1);  // ONE
+  draw();
+  state(0x3C, 0);
+  state(0x48, 6);  // SRCALPHA
+  state(0x4C, 7);  // INVSRCALPHA
+  state(0x30, 1);
+  ST32(base, w, 0x00081900u); ST32(base, w + 4, stop);  // goto the list's end
+  // The bone op becomes a goto to the copy; its other 8 bytes another (never
+  // reached) goto, so the list still walks op by op.
+  for (uint32_t p = bones; p < prim; p += 8) { ST32(base, p, 0x00081900u); ST32(base, p + 4, cave); }
+  REXKRNL_INFO("GEKNOB classic watch knobs drawn without their black squares");
+}
+
+void ge_select_cuff(uint8_t* base, uint32_t res, bool remastered) {
+  static std::unordered_map<uint32_t, CuffArm> arms;
+  const uint32_t player = LD32(base, kCurrentPlayer);
+  if (!player) return;
+  const int outfit = static_cast<int>(LD32(base, player + kPlayerCuff));
+  if (outfit < 0 || outfit > 8) return;
+  const uint32_t rg = LD32(base, res + 8);
+  const uint32_t hdr = rg ? LD32(base, rg + 0xEC) : 0;
+  const uint32_t start = hdr ? LD32(base, hdr) : 0;
+  const uint32_t end = hdr ? LD32(base, hdr + 4) : 0;
+  if (!start || end <= start || end - start > 0x10000) return;
+  CuffArm& arm = arms[res];
+  if (arm.stream != start) {  // first draw, or the model was loaded again
+    arm = CuffArm{};
+    arm.stream = start;
+    for (uint32_t p = start; p + 4 <= end;) {
+      const uint32_t size = LD32(base, p) >> 16;
+      const uint8_t op = base[p + 2];
+      if (size < 4 || base[p + 3] != 0) { arm.blocks.clear(); break; }
+      if (op == 0x16) arm.blocks.push_back(p);
+      if (op == 0x1D) break;
+      p += size;
+    }
+    const size_t expected = remastered ? 17 : 24;
+    if (arm.blocks.size() != expected) {
+      REXKRNL_WARN("GECUFF {} arm: {} blocks, expected {}; sleeves left as they are",
+                   remastered ? "remastered" : "classic", arm.blocks.size(), expected);
+      arm.blocks.clear();
+    } else if (!remastered) {
+      ge_watch_knob_blend(base, rg, arm.blocks.back(), end);
+    }
+  }
+  if (arm.blocks.empty() || arm.outfit == outfit) return;
+  for (const auto& [b, bytes] : arm.saved) std::memcpy(base + arm.blocks[b], bytes.data(), 8);
+  arm.saved.clear();
+  const std::vector<int> worn = cuff_worn(remastered, outfit);
+  for (int b : cuff_blocks(remastered)) {
+    if (std::find(worn.begin(), worn.end(), b) != worn.end()) continue;
+    std::array<uint8_t, 8> bytes;
+    std::memcpy(bytes.data(), base + arm.blocks[b], 8);
+    arm.saved.emplace_back(b, bytes);
+    ST32(base, arm.blocks[b], 0x00081900u);  // op 0x19, size 8: goto
+    ST32(base, arm.blocks[b] + 4, arm.blocks[b + 1]);
+  }
+  arm.outfit = outfit;
+  REXKRNL_INFO("GECUFF {} arm wears outfit {}", remastered ? "remastered" : "classic", outfit);
+}
 }  // namespace
 
 bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
   if (g_egypt_glass_down && std::strstr(path, "\\prop\\doorwin\\")) return true;  // see ge_egypt_glass_tick
+  if (std::strstr(path, "\\char\\suitlfhand\\")) {  // the watch arm: one sleeve, not a body
+    g_body_has_head = false;
+    ge_select_cuff(base, r31.u32, std::strstr(path, "\\new\\") != nullptr);
+    return false;
+  }
   static std::string last_body;
   if (std::strstr(path, "\\original\\head\\")) {
     const bool skip = g_body_has_head;
