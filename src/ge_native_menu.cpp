@@ -1,9 +1,9 @@
 // ge - native PC settings pages inside the game's own Help & Options menu.
 //
 // Help & Options (menu 33) normally lists five rows from a table of text ids at
-// 0x8272C344. We give it eight:
+// 0x8272C344. We give it nine:
 //   How to Play | Gamepad Settings | Keyboard & Mouse | Video Settings |
-//   Online Settings | Other Settings | Credits | Done
+//   Online Settings | Other Settings | Credits | Check for Updates | Done
 // The three PC rows open the game's Other Settings page (menu 35) with a page
 // flag set; while the flag is set, the Other Settings draw and update
 // functions are skipped and our own rows are drawn with the game's own text,
@@ -120,7 +120,7 @@ bool EnsureGuestBlocks(uint8_t* base) {
   if (g_string_block) return true;
   auto* mem = rex::system::kernel_state()->memory();
   g_string_block = mem->SystemHeapAlloc(kCustomCount * kCustomChars * 2);
-  g_help_table = mem->SystemHeapAlloc(8 * 4);
+  g_help_table = mem->SystemHeapAlloc(16 * 4);  // Help & Options rows (nine used)
   if (!g_string_block || !g_help_table) return false;
   std::memset(base + g_string_block, 0, kCustomCount * kCustomChars * 2);
   return true;
@@ -148,6 +148,7 @@ enum : uint32_t {
   kTxtOnline,
   kTxtRefresh,
   kTxtVersion,
+  kTxtUpdates,
   kTxtFirstDynamic = kCustomBase + 16,  // page labels and values, rewritten per frame
 };
 
@@ -416,12 +417,13 @@ void StartUpdateCheck() {
   }).detach();
 }
 
+// Back to Help & Options, where Check for Updates is.
 void LeaveUpdatePage() {
   {
     std::lock_guard<std::mutex> lock(g_update_mutex);
     g_update.state = UpdateState::Idle;
   }
-  g_page = Page::Online;
+  g_leave_page = true;
 }
 
 // Restarting is safe on the front end only, and never in a LAN / online game.
@@ -700,14 +702,6 @@ std::vector<Row> BuildPage(Page page) {
       Row name{RowKind::Text, "Player Name:", "ge_username"};
       name.max_len = 15;
       rows.push_back(name);
-      // Asks GitHub only when pressed (Page::Update above); shows this copy's version.
-      AddAction(
-          rows, "Check for Updates",
-          [] {
-            g_page = Page::Update;
-            StartUpdateCheck();
-          },
-          [] { return std::string("v") + GE_VERSION_STR; });
       AddAction(rows, "Done", [] { g_leave_page = true; });
       break;
     }
@@ -1068,7 +1062,8 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
     PlaySelectSound(ctx, base);
     if (g_page == Page::Update) {
       LeaveUpdatePage();
-      return false;
+      g_leave_page = false;
+      return true;
     }
     if (parent != Page::None) {
       g_page = parent;
@@ -1145,9 +1140,9 @@ bool ge_str_lookup(PPCRegister& r3) {
 
 // --- Help & Options (menu 33) ---------------------------------------------
 // Rows: 0 How to Play, 1 Gamepad, 2 Keyboard & Mouse, 3 Video, 4 Online,
-//       5 Other Settings, 6 Credits, 7 Done.
+//       5 Other Settings, 6 Credits, 7 Check for Updates, 8 Done.
 namespace {
-constexpr int kHelpRows = 8;
+constexpr int kHelpRows = 9;
 void PrepareHelpTable(uint8_t* base) {
   if (!EnsureGuestBlocks(base)) return;
   static bool done = false;
@@ -1157,12 +1152,14 @@ void PrepareHelpTable(uint8_t* base) {
   SetCustomText(base, kTxtKeyboard, "Keyboard & Mouse");
   SetCustomText(base, kTxtVideo, "Video Settings");
   SetCustomText(base, kTxtOnline, "Online Settings");
-  const uint32_t ids[kHelpRows] = {0x9D55, kTxtGamepad, kTxtKeyboard, kTxtVideo,
-                                   kTxtOnline, 0x9D54, 0x9D67, 0x9D66};
+  SetCustomText(base, kTxtUpdates, "Check for Updates");
+  const uint32_t ids[kHelpRows] = {0x9D55, kTxtGamepad, kTxtKeyboard, kTxtVideo, kTxtOnline,
+                                   0x9D54, 0x9D67, kTxtUpdates, 0x9D66};
   for (int i = 0; i < kHelpRows; ++i) ST32(base, g_help_table + i * 4, ids[i]);
-  // Eight rows need a tighter column than the original five.
-  STF32(base, kHelpY0, 118.0f);
-  STF32(base, kHelpSpacing, 24.0f);
+  // Nine rows need a tighter column than the original five; Done stays where
+  // it was with eight rows (118 + 7 * 24).
+  STF32(base, kHelpY0, 114.0f);
+  STF32(base, kHelpSpacing, 21.5f);
 }
 }  // namespace
 
@@ -1195,6 +1192,11 @@ void ge_help_route(PPCRegister& r9) {
     case 4: g_page = Page::Online; r9.u64 = 2; break;
     case 5: g_page = Page::None; r9.u64 = 2; break;             // Other Settings
     case 6: r9.u64 = 3; break;                                  // Credits
+    case 7:                                                     // Check for Updates
+      g_page = Page::Update;
+      StartUpdateCheck();
+      r9.u64 = 2;
+      break;
     default: r9.u64 = 4; break;                                 // Done
   }
   g_hover = -1;
