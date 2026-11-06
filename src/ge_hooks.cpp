@@ -3024,7 +3024,56 @@ bool ge_is_missing_texture(uint8_t* base, uint32_t tex) {
 }
 }  // namespace
 
+// Egyptian stone pieces (cryptdoor models, see ge_see_through_doors_tick) have
+// only their N64 textures, in both graphics modes. With remastered graphics,
+// SetTexture is given remastered temple textures of the same level instead:
+// the 32x32 sandstone pair becomes the big sandstone blocks, the 64x64 carved
+// panel becomes the carved relief panel. Textures are told apart by a hash of
+// their first 256 bytes of picture data (the same in every load); the temple
+// textures are picked up as the level sets them.
+namespace {
+uint32_t ge_tex_hash(uint8_t* base, const GeTexInfo& t) {
+  uint32_t h = 0x811C9DC5u;
+  for (uint32_t i = 0; i < 256; ++i) h = (h ^ base[t.data + i]) * 0x01000193u;
+  return h;
+}
+}  // namespace
+REXCVAR_DEFINE_BOOL(ge_egypt_stone_textures, true, "Video",
+                    "Egyptian: remastered textures on the stone doors and panels with remastered graphics");
+bool ge_egypt_set_texture(uint8_t* base, PPCRegister& r5) {
+  constexpr uint32_t kSandSmallA = 0x190BEAD6u, kSandSmallB = 0xA3CF8E73u, kPanel = 0x6717A4A1u;
+  constexpr uint32_t kBlocks = 0x854BE3D1u, kRelief = 0x7081B850u;  // remastered temple textures
+  static std::unordered_map<uint32_t, uint32_t> hashes;               // object -> hash (0 = not a candidate)
+  static uint32_t stage_seen = 0, blocks = 0, relief = 0;
+  const uint32_t tex = r5.u32;
+  const uint32_t stage = LD32(base, GE_CURRENT_STAGE);
+  if (stage != stage_seen) {  // a new level: its textures are new objects
+    stage_seen = stage;
+    hashes.clear();
+    blocks = relief = 0;
+  }
+  if (stage != 0x20u || !REXCVAR_GET(ge_egypt_stone_textures)) return false;
+  auto it = hashes.find(tex);
+  if (it == hashes.end()) {
+    const GeTexInfo t = ge_tex_info(base, tex);
+    uint32_t h = 0;
+    const bool is_small = t.width == t.height && (t.width == 32 || t.width == 64);
+    const bool is_big = (t.width == 256 && t.height == 256) || (t.width == 1024 && t.height == 1024);
+    if (t.fmt == 18 && t.data && (is_small || is_big)) h = ge_tex_hash(base, t);
+    it = hashes.emplace(tex, h).first;
+    if (h == kBlocks && !blocks) blocks = tex;
+    if (h == kRelief && !relief) relief = tex;
+  }
+  if (base[0x82F0DF11u] != 0) return false;  // classic graphics: the N64 look
+  const uint32_t h = it->second;
+  const uint32_t to = (h == kSandSmallA || h == kSandSmallB) ? blocks : h == kPanel ? relief : 0;
+  if (!to) return false;
+  r5.u64 = to;
+  return true;
+}
+
 void ge_jungle_set_texture(PPCRegister& r5) {
+  if (r5.u32 && ge_egypt_set_texture(rex::system::kernel_state()->memory()->virtual_membase(), r5)) return;
   // The level's checker objects (it has two) and the leaf each one becomes.
   struct Swap { uint32_t missing, leaf; };
   static Swap swaps[4];
