@@ -88,9 +88,9 @@ Help & Options on the main menu holds the PC settings:
                      upscaling (FSR or off), texture filtering,
                      anti-aliasing, post-processing (colour filter), field
                      of view, FPS counter
-  Online Settings    player name, the online server options and
-                     Check for Updates
+  Online Settings    player name and the online server options
   Other Settings     the game's own options, plus Run Setup Again
+  Check for Updates  asks GitHub for a newer version (see UPDATING)
 
 MULTIPLAYER OVER LAN OR A VIRTUAL LAN
 -------------------------------------
@@ -137,7 +137,7 @@ GoldenEye 007.exe with --setup works too. Importing again replaces resources\ass
 saves and settings in resources\userdata are kept. If a needed file goes
 missing, opening GoldenEye 007.exe shows the setup window again by itself.
 
-UPDATING: Help & Options > Online Settings > Check for Updates asks this
+UPDATING: Help & Options > Check for Updates asks this
 project's GitHub page (github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp)
 whether a newer release exists. Nothing is checked unless you choose it, and
 nothing is sent but that one request (no personal data). If there is a
