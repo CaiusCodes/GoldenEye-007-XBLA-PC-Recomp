@@ -687,7 +687,7 @@ index 7642601..1b1df31 100644
    AchievementIconCache icon_cache_;
  };
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index afb4a30..fedbae9 100644
+index afb4a30..4942af3 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
 @@ -1,4 +1,12 @@
@@ -711,7 +711,17 @@ index afb4a30..fedbae9 100644
  #include <condition_variable>
  #include <cstddef>
  #include <cstdint>
-@@ -367,6 +376,14 @@ class Presenter {
+@@ -187,6 +196,9 @@ class Presenter {
+   using HostGpuLossCallback =
+       std::function<void(bool is_responsible, bool statically_from_ui_thread)>;
+   static void FatalErrorHostGpuLossCallback(bool is_responsible, bool statically_from_ui_thread);
++  // Set by the app: called by FatalErrorHostGpuLossCallback before it ends the
++  // process, so the loss can be logged (or the app restarted) instead.
++  static void SetFatalGpuLossHook(void (*hook)(bool is_responsible));
+ 
+   class GuestOutputRefreshContext {
+    public:
+@@ -367,6 +379,14 @@ class Presenter {
    }
    // For simplicity, may be called repeatedly even if no changes have been made.
    void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
@@ -726,7 +736,7 @@ index afb4a30..fedbae9 100644
  
    void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
    void RemoveUIDrawerFromUIThread(UIDrawer* drawer);
-@@ -1051,6 +1068,22 @@ class Presenter {
+@@ -1051,6 +1071,22 @@ class Presenter {
  
    std::thread dxgi_ui_tick_thread_;
  #endif  // XE_PLATFORM
@@ -8434,7 +8444,7 @@ index 9822f3b..33495f9 100644
  
  VirtualKey ParseVirtualKey(std::string_view name) {
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..9838290 100644
+index 7360ed9..acffa3d 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -12,12 +12,16 @@
@@ -8492,7 +8502,23 @@ index 7360ed9..9838290 100644
  REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                      "Allow overscan cutoff based on safe area settings")
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-@@ -286,6 +314,7 @@ Presenter::~Presenter() {
+@@ -277,8 +305,15 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+ namespace rex {
+ namespace ui {
+ 
++namespace {
++void (*fatal_gpu_loss_hook)(bool is_responsible) = nullptr;
++}  // namespace
++
++void Presenter::SetFatalGpuLossHook(void (*hook)(bool is_responsible)) { fatal_gpu_loss_hook = hook; }
++
+ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
+                                               [[maybe_unused]] bool statically_from_ui_thread) {
++  if (fatal_gpu_loss_hook) fatal_gpu_loss_hook(is_responsible);
+   rex::FatalError("Graphics device lost (probably due to an internal error)");
+ }
+ 
+@@ -286,6 +321,7 @@ Presenter::~Presenter() {
    // No intrusive lifetime management must be performed from UI drawers - defer
    // it if needed.
    assert_false(is_executing_ui_drawers_);
@@ -8500,7 +8526,7 @@ index 7360ed9..9838290 100644
  
  #if REX_PLATFORM_WIN32
    if (dxgi_ui_tick_thread_.joinable()) {
-@@ -613,6 +642,187 @@ bool Presenter::RefreshGuestOutput(
+@@ -613,6 +649,187 @@ bool Presenter::RefreshGuestOutput(
      guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
    }
  
@@ -8688,7 +8714,7 @@ index 7360ed9..9838290 100644
    // Trigger the presentation on the host.
    PaintResult paint_result = PaintResult::kNotPresented;
    {
-@@ -645,8 +855,10 @@ bool Presenter::RefreshGuestOutput(
+@@ -645,8 +862,10 @@ bool Presenter::RefreshGuestOutput(
        host_gpu_loss_callback_(false, false);
      }
    }
@@ -8700,7 +8726,7 @@ index 7360ed9..9838290 100644
  }
  
  void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
-@@ -895,12 +1107,19 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -895,12 +1114,19 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                     old_scale);
    };
  
@@ -8722,7 +8748,7 @@ index 7360ed9..9838290 100644
      // The window is wider that the source - crop along Y to preserve the aspect
      // ratio while stretching throughout the entire surface's width, then limit
      // the Y cropping via letterboxing or stretching along X.
-@@ -914,8 +1133,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -914,8 +1140,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      // Scale the desired width by the H:W aspect ratio (inverse of W:H) to get
      // the height.
      output_height =
@@ -8733,7 +8759,7 @@ index 7360ed9..9838290 100644
      bool letterbox = false;
      if (output_height * present_safe_area > surface_height_in_paint_connection_ * 100) {
        // Don't crop out more than the safe area margin - letterbox or stretch.
-@@ -924,8 +1143,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -924,8 +1150,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      }
      if (letterbox && REXCVAR_GET(present_letterbox)) {
        output_width = rescale_unsigned(surface_height_in_paint_connection_ * 100,
@@ -8744,7 +8770,7 @@ index 7360ed9..9838290 100644
        // output_width might have been rounded up already by rescale_unsigned, so
        // rounding down in this division.
        flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
-@@ -949,8 +1168,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -949,8 +1175,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      }
      // Scale the desired height by the W:H aspect ratio to get the width.
      output_width =
@@ -8755,7 +8781,7 @@ index 7360ed9..9838290 100644
      bool letterbox = false;
      if (output_width * present_safe_area > surface_width_in_paint_connection_ * 100) {
        // Don't crop out more than the safe area margin - letterbox or stretch.
-@@ -959,8 +1178,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+@@ -959,8 +1185,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      }
      if (letterbox && REXCVAR_GET(present_letterbox)) {
        output_height = rescale_unsigned(surface_width_in_paint_connection_ * 100,
@@ -8766,7 +8792,7 @@ index 7360ed9..9838290 100644
        // output_height might have been rounded up already by rescale_unsigned,
        // so rounding down in this division.
        flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
-@@ -1313,7 +1532,8 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+@@ -1313,7 +1539,8 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
    if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
      return PaintMode::kUIThreadOnRequest;
    }
@@ -8776,7 +8802,7 @@ index 7360ed9..9838290 100644
      // Don't be causing host vertical sync CPU waits in the thread generating
      // the guest output.
      return PaintMode::kUIThreadOnRequest;
-@@ -1600,7 +1820,17 @@ void Presenter::WaitForUITickFromUIThread() {
+@@ -1600,7 +1827,17 @@ void Presenter::WaitForUITickFromUIThread() {
            std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
        return;
      }

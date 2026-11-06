@@ -34,10 +34,13 @@
 #include <rex/system/xmemory.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/ui/presenter.h>  // SetFatalGpuLossHook
 #include <rex/system/xthread.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <cstdio>
+#include <csignal>
+#include <cstdlib>
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -46,6 +49,8 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
+#include <winevt.h>    // EvtQuery: Windows' crash records, copied into the log
+#pragma comment(lib, "wevtapi.lib")
 #include <string>
 #include <set>
 #include <rex/filesystem.h>
@@ -178,7 +183,23 @@ void ResizeGameWindow(int w, int h) {
 // close ends with the SDK's own lines), or (for a crash, which otherwise just cut the log off) the exception
 // and where it happened. The SDK's own vectored handler sees faults first and
 // handles the expected ones; this filter only runs for a real crash.
+void RestartSelf();
+void NativeReportDeviceLost();  // ge_native_gpu.cpp
+bool NativeDeviceLost();
+void NativeEnableDred();
 namespace {
+// The device loss is seen by the presenter's hook and, when drawing faults on
+// the lost device, by the crash filter: the first one restarts the game.
+void restart_after_device_loss(const char* how) {
+  static std::atomic<bool> restarting{false};
+  if (restarting.exchange(true)) {
+    Sleep(INFINITE);  // the other thread is restarting the game
+  }
+  REXLOG_ERROR("Graphics device lost ({}): restarting the game", how);
+  rex::FlushLogging();
+  NativeReportDeviceLost();
+  RestartSelf();
+}
 LONG WINAPI ge_crash_filter(EXCEPTION_POINTERS* ep) {
   const EXCEPTION_RECORD* r = ep->ExceptionRecord;
   HMODULE mod = nullptr;
@@ -199,15 +220,123 @@ LONG WINAPI ge_crash_filter(EXCEPTION_POINTERS* ep) {
                  at - reinterpret_cast<uintptr_t>(mod), GetCurrentThreadId());
   }
   rex::FlushLogging();
+  if (NativeDeviceLost()) restart_after_device_loss("a fault while drawing on it");
   return EXCEPTION_CONTINUE_SEARCH;
 }
 void log_closing(const char* why) {
   REXLOG_INFO("Game {}", why);
   rex::FlushLogging();
 }
+// Ends the C runtime takes without an exception the filter above sees: abort()
+// (std::terminate, an uncaught exception on a noexcept path), a bad argument to
+// a CRT function, a pure virtual call. Each logs, then ends the game as before.
+void ge_abort_signal(int) {
+  REXLOG_ERROR("Game crashed: abort (std::terminate or a failed check), thread {}", GetCurrentThreadId());
+  rex::FlushLogging();
+}
+void ge_invalid_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {
+  REXLOG_ERROR("Game crashed: invalid argument to a C runtime function, thread {}", GetCurrentThreadId());
+  rex::FlushLogging();
+  __fastfail(FAST_FAIL_INVALID_ARG);
+}
+void ge_purecall() {
+  REXLOG_ERROR("Game crashed: pure virtual call, thread {}", GetCurrentThreadId());
+  rex::FlushLogging();
+  __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+// Windows' own records of earlier ends (the last 7 days), copied into this log so
+// a player only has to send the log: Application Error / Windows Error
+// Reporting entries naming the game (exception code, faulting module), and
+// display driver resets (4101 "display driver stopped responding").
+std::string event_summary(EVT_HANDLE ev) {
+  DWORD used = 0, props = 0;
+  EvtRender(nullptr, ev, EvtRenderEventXml, 0, nullptr, &used, &props);
+  std::wstring xml(used / sizeof(wchar_t) + 1, L'\0');
+  if (!EvtRender(nullptr, ev, EvtRenderEventXml, DWORD(xml.size() * sizeof(wchar_t)), xml.data(), &used, &props))
+    return {};
+  auto narrow = [](std::wstring_view w) {
+    std::string s;
+    for (wchar_t c : w) s += c < 128 ? char(c) : '?';
+    return s;
+  };
+  auto attr = [&](std::wstring_view tag, std::wstring_view name) -> std::string {
+    const size_t t = xml.find(tag);
+    if (t == std::wstring::npos) return {};
+    const size_t a = xml.find(std::wstring(name) + L"='", t);
+    if (a == std::wstring::npos) return {};
+    const size_t b = a + name.size() + 2, e = xml.find(L'\'', b);
+    return narrow(std::wstring_view(xml).substr(b, e - b));
+  };
+  auto element = [&](std::wstring_view tag) -> std::string {
+    const size_t t = xml.find(std::wstring(L"<") + std::wstring(tag) + L">");
+    if (t == std::wstring::npos) return {};
+    const size_t b = t + tag.size() + 2, e = xml.find(L'<', b);
+    return narrow(std::wstring_view(xml).substr(b, e - b));
+  };
+  std::string out = attr(L"<TimeCreated", L"SystemTime") + " " + attr(L"<Provider", L"Name") + " event " +
+                    element(L"EventID") + ":";
+  for (size_t p = xml.find(L"<Data"); p != std::wstring::npos && out.size() < 900; p = xml.find(L"<Data", p + 1)) {
+    const size_t gt = xml.find(L'>', p);
+    if (gt == std::wstring::npos || xml[gt - 1] == L'/') continue;  // empty <Data/>
+    const size_t end = xml.find(L"</Data>", gt);
+    if (end == std::wstring::npos) break;
+    std::string v = narrow(std::wstring_view(xml).substr(gt + 1, end - gt - 1));
+    if (v.empty()) continue;
+    if (v.size() > 160) v = v.substr(0, 160) + "...";
+    out += " | " + v;
+  }
+  return out;
+}
+
+void log_windows_events(const wchar_t* channel, const wchar_t* query, const char* must_contain) {
+  EVT_HANDLE q = EvtQuery(nullptr, channel, query, EvtQueryChannelPath | EvtQueryReverseDirection);
+  if (!q) return;
+  EVT_HANDLE evs[16];
+  DWORD n = 0;
+  int logged = 0;
+  while (logged < 8 && EvtNext(q, 16, evs, 1000, 0, &n)) {
+    for (DWORD i = 0; i < n; ++i) {
+      if (logged < 8) {
+        const std::string s = event_summary(evs[i]);
+        if (!s.empty() && (!must_contain || s.find(must_contain) != std::string::npos)) {
+          REXLOG_INFO("Windows log: {}", s);
+          ++logged;
+        }
+      }
+      EvtClose(evs[i]);
+    }
+  }
+  EvtClose(q);
+  if (!logged) REXLOG_INFO("Windows log: no matching {} entries in the last 7 days", must_contain ? "game crash" : "display driver");
+}
 }  // namespace
 
-void InstallCrashLog() { SetUnhandledExceptionFilter(ge_crash_filter); }
+void InstallCrashLog() {
+  // The graphics device lost (a GPU hang the driver reset, as on an HD 620 in
+  // Dam): the presenter would abort with nothing in the log. Log why (the
+  // native renderer adds D3D12's breadcrumbs), then start the game again.
+  NativeEnableDred();
+  rex::ui::Presenter::SetFatalGpuLossHook([](bool is_responsible) {
+    restart_after_device_loss(is_responsible ? "reset by a bad command" : "removed");
+  });
+  std::thread([] {
+    // 1000 Application Error, 1001 Windows Error Reporting, 1002 Application Hang.
+    log_windows_events(L"Application",
+                       L"*[System[(EventID=1000 or EventID=1001 or EventID=1002) and "
+                       L"TimeCreated[timediff(@SystemTime) <= 604800000]]]",
+                       "GoldenEye 007.exe");
+    // 4101 display driver stopped responding and recovered; 4116/4117 it failed to.
+    log_windows_events(L"System",
+                       L"*[System[(EventID=4101 or EventID=4116 or EventID=4117) and "
+                       L"TimeCreated[timediff(@SystemTime) <= 604800000]]]",
+                       nullptr);
+    rex::FlushLogging();
+  }).detach();
+  SetUnhandledExceptionFilter(ge_crash_filter);
+  std::signal(SIGABRT, ge_abort_signal);
+  _set_invalid_parameter_handler(ge_invalid_parameter);
+  _set_purecall_handler(ge_purecall);
+}
 
 void RestartSelf() {
   LaunchSelfDetached();

@@ -75,6 +75,7 @@ int NativeAnisotropy() { return g_native_aniso.load(std::memory_order_relaxed); 
 
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
+#include <psapi.h>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -99,6 +100,10 @@ REXCVAR_DEFINE_BOOL(gpu_native_presenter, true, "GPU",
                     "scaling) instead of a swap chain of its own");
 REXCVAR_DEFINE_BOOL(gpu_native_debug_layer, false, "GPU",
                     "Native renderer test: enable the D3D12 debug layer and log its messages");
+REXCVAR_DEFINE_INT32(gpu_native_test_remove, 0, "GPU",
+                     "Native renderer test: remove the D3D12 device (as a driver reset does) after this many frames");
+REXCVAR_DEFINE_BOOL(gpu_native_dred, true, "GPU",
+                    "Native renderer: D3D12 breadcrumbs and page-fault data, logged if the graphics device is lost");
 REXCVAR_DEFINE_INT32(gpu_native_trace_frame, 0, "GPU",
                      "Native renderer test: log every draw, clear, resolve and target change of this frame (0 = off)");
 REXCVAR_DEFINE_BOOL(gpu_native_dump_textures, false, "GPU",
@@ -116,6 +121,8 @@ REXCVAR_DEFINE_BOOL(gpu_native_bc_textures, true, "GPU",
                     "Native renderer: keep DXT textures compressed (BC1-3) with the game's own mips");
 REXCVAR_DEFINE_BOOL(gpu_native_depth_copy, true, "GPU",
                     "Native renderer: copy the scene depth for depth resolves (off: the last clear value)");
+REXCVAR_DEFINE_BOOL(gpu_native_depth_copy_intel, false, "GPU",
+                    "Native renderer: copy the scene depth on Intel integrated graphics too (it hung an HD 620)");
 REXCVAR_DEFINE_BOOL(gpu_native_skip_resolves, false, "GPU",
                     "Native renderer test: ignore resolves (wrong picture; for timing only)");
 REXCVAR_DEFINE_INT32(gpu_native_profile_frame, 0, "GPU",
@@ -308,6 +315,8 @@ struct Native {
   std::vector<Retired> retired;  // returned to their pool 2 frames later
   struct RetiredTexture { uint64_t frame; std::unique_ptr<RenderTexture> texture; uint32_t slot; };
   std::vector<RetiredTexture> retired_textures;  // re-uploaded dynamic textures: freed kFrames frames later
+  struct RetiredSet { uint64_t frame; std::unique_ptr<RenderDescriptorSet> set; };
+  std::vector<RetiredSet> retired_sets;  // replaced depth-copy sets: a frame in flight may still use them
   std::vector<uint32_t> free_slots;
   BufferPool vertex_pool, index_pool;
   std::unique_ptr<RenderCommandSemaphore> acquire;
@@ -1361,6 +1370,170 @@ bool copy_to_presenter_texture(uint32_t k) {
   return true;
 }
 
+// Last-gasp diagnostics. A lost graphics device (a driver reset after a GPU
+// hang, or the GPU running out of memory) can end the game without an
+// exception the crash log sees: a watchdog thread logs frame stalls, video
+// memory use, and the device-removed reason with D3D12's breadcrumbs (the
+// command list the GPU was in) and page-fault data, flushing each line.
+std::atomic<double> g_last_present_ms{0};
+std::atomic<uint64_t> g_present_count{0};
+
+const char* removed_reason_name(HRESULT hr) {
+  switch (hr) {
+    case DXGI_ERROR_DEVICE_HUNG: return "device hung (GPU stopped responding)";
+    case DXGI_ERROR_DEVICE_REMOVED: return "device removed";
+    case DXGI_ERROR_DEVICE_RESET: return "device reset (bad command)";
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR: return "driver internal error";
+    case DXGI_ERROR_INVALID_CALL: return "invalid call";
+    case E_OUTOFMEMORY: return "out of memory";
+    default: return "?";
+  }
+}
+
+void log_dred(ID3D12Device* dev) {
+  ID3D12DeviceRemovedExtendedData* dred = nullptr;
+  if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dred)))) {
+    REXKRNL_ERROR("GENATIVE lost: no breadcrumb data (gpu_native_dred off or unsupported)");
+    return;
+  }
+  static const char* const kOps[] = {"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced",
+                                     "ExecuteIndirect", "Dispatch", "CopyBufferRegion", "CopyTextureRegion",
+                                     "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
+                                     "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier",
+                                     "ExecuteBundle", "Present", "ResolveQueryData", "BeginSubmission", "EndSubmission"};
+  auto op_name = [&](D3D12_AUTO_BREADCRUMB_OP op) {
+    return uint32_t(op) < std::size(kOps) ? std::string(kOps[op]) : fmt::format("op{}", uint32_t(op));
+  };
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs = {};
+  if (const HRESULT hr = dred->GetAutoBreadcrumbsOutput(&crumbs); FAILED(hr)) {
+    REXKRNL_ERROR("GENATIVE lost: no breadcrumbs ({:08X})", uint32_t(hr));
+  } else {
+    int n = 0;
+    for (const D3D12_AUTO_BREADCRUMB_NODE* node = crumbs.pHeadAutoBreadcrumbNode; node && n < 16; node = node->pNext) {
+      const uint32_t done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+      if (done >= node->BreadcrumbCount) continue;  // finished command lists say nothing
+      ++n;
+      std::string ops;
+      for (uint32_t i = done > 3 ? done - 3 : 0; i < std::min(node->BreadcrumbCount, done + 4); ++i)
+        ops += fmt::format("{}{}{}", i == done ? " [" : " ", op_name(node->pCommandHistory[i]), i == done ? "]" : "");
+      REXKRNL_ERROR("GENATIVE lost: command list {} finished {} of {} operations; around the stop:{}",
+                    node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "(unnamed)", done,
+                    node->BreadcrumbCount, ops);
+    }
+    if (!n) REXKRNL_ERROR("GENATIVE lost: every recorded command list had finished");
+  }
+  D3D12_DRED_PAGE_FAULT_OUTPUT fault = {};
+  if (const HRESULT hr = dred->GetPageFaultAllocationOutput(&fault); FAILED(hr) || !fault.PageFaultVA) {
+    REXKRNL_ERROR("GENATIVE lost: no GPU page fault recorded ({:08X})", uint32_t(hr));
+  } else {
+    std::string live, freed;
+    int k = 0;
+    for (auto* a = fault.pHeadExistingAllocationNode; a && k < 8; a = a->pNext, ++k)
+      live += fmt::format(" {}(type {})", a->ObjectNameA ? a->ObjectNameA : "?", uint32_t(a->AllocationType));
+    k = 0;
+    for (auto* a = fault.pHeadRecentFreedAllocationNode; a && k < 8; a = a->pNext, ++k)
+      freed += fmt::format(" {}(type {})", a->ObjectNameA ? a->ObjectNameA : "?", uint32_t(a->AllocationType));
+    REXKRNL_ERROR("GENATIVE lost: GPU page fault at {:X}; live there:{}; recently freed there:{}", fault.PageFaultVA,
+                  live.empty() ? " none" : live, freed.empty() ? " none" : freed);
+  }
+  dred->Release();
+}
+
+std::string memory_line(IDXGIAdapter3* adapter) {
+  PROCESS_MEMORY_COUNTERS_EX pmc = {sizeof(pmc)};
+  K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+  std::string s = fmt::format("private {} MB", pmc.PrivateUsage >> 20);
+  DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, shared = {};
+  if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+      SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+    s += fmt::format(", video local {}/{} MB, shared {}/{} MB (used/budget)", local.CurrentUsage >> 20,
+                     local.Budget >> 20, shared.CurrentUsage >> 20, shared.Budget >> 20);
+  return s;
+}
+
+// Depth resolves get the real scene depth (a compute copy). Not on Intel
+// integrated graphics: an HD 620 (driver 31.0.101.2145) hung every 5-30 minutes
+// in Dam on the draw that reads that copy back; the depth is cleared right
+// after it, so the resolve's clear value draws the same.
+bool g_depth_copy = true;
+
+void choose_depth_copy() {
+  const RenderDeviceDescription& d = g.device->getDescription();
+  const bool intel_igpu = d.vendor == RenderDeviceVendor::INTEL &&
+                          (d.type == RenderDeviceType::INTEGRATED || d.dedicatedVideoMemory < (1ull << 30));
+  g_depth_copy = REXCVAR_GET(gpu_native_depth_copy) && (!intel_igpu || REXCVAR_GET(gpu_native_depth_copy_intel));
+  if (intel_igpu) REXKRNL_INFO("GENATIVE Intel integrated graphics: depth copy {}", g_depth_copy ? "on" : "off");
+}
+
+ID3D12Device* g_watch_dev = nullptr;
+IDXGIAdapter3* g_watch_adapter = nullptr;
+std::mutex g_lost_mutex;
+bool g_lost_reported = false;
+
+// Logs the device-removed reason and the breadcrumbs once, from whichever
+// thread notices first (the watchdog, or the presenter's loss callback,
+// which ends the process right after).
+void report_device_lost() {
+  std::lock_guard<std::mutex> lock(g_lost_mutex);
+  if (g_lost_reported || !g_watch_dev) return;
+  const HRESULT hr = g_watch_dev->GetDeviceRemovedReason();
+  if (hr == S_OK) return;
+  g_lost_reported = true;
+  REXKRNL_ERROR("GENATIVE graphics device lost: {:08X} {} after {} frames, stage {}; {}", uint32_t(hr),
+                removed_reason_name(hr), g_present_count.load(), g32(0x82423E00u), memory_line(g_watch_adapter));
+  rex::FlushLogging();
+  log_dred(g_watch_dev);
+  rex::FlushLogging();
+}
+
+void start_watchdog() {
+  ID3D12Device* dev = nullptr;
+  IDXGIAdapter3* adapter = nullptr;
+  if (!g_vulkan) {
+    dev = static_cast<D3D12Device*>(g.device.get())->d3d;
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+      factory->EnumAdapterByLuid(dev->GetAdapterLuid(), IID_PPV_ARGS(&adapter));
+      factory->Release();
+    }
+  }
+  g_watch_dev = dev;
+  g_watch_adapter = adapter;
+  std::thread([dev, adapter] {
+    double stall_logged = 0;
+    double last_mem = 0;
+    for (;;) {
+      Sleep(250);
+      const double now = now_ms(), last = g_last_present_ms.load();
+      if (const int at = REXCVAR_GET(gpu_native_test_remove); dev && at > 0 && g_present_count.load() >= uint64_t(at)) {
+        static bool removed = false;
+        ID3D12Device5* d5 = nullptr;
+        if (!removed && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d5)))) {
+          REXKRNL_WARN("GENATIVE test: removing the graphics device");
+          rex::FlushLogging();
+          d5->RemoveDevice();
+          d5->Release();
+        }
+        removed = true;
+      }
+      if (dev && dev->GetDeviceRemovedReason() != S_OK) {
+        report_device_lost();
+        return;
+      }
+      if (last > 0 && now - last > 1500 && stall_logged != last) {
+        stall_logged = last;
+        REXKRNL_WARN("GENATIVE no frame for {:.0f} ms (after {} frames, stage {}); {}", now - last,
+                     g_present_count.load(), g32(0x82423E00u), memory_line(adapter));
+        rex::FlushLogging();
+      }
+      if (now - last_mem > 60000) {
+        last_mem = now;
+        REXKRNL_INFO("GENATIVE memory: {}", memory_line(adapter));
+      }
+    }
+  }).detach();
+}
+
 bool ensure_device() {
   if (g.swapchain || g.out.presenter) return true;
   if (g.failed) return false;
@@ -1431,6 +1604,8 @@ bool ensure_device() {
   g.cmd = g.cmds[0].get();
   g.fence = g.fences[0].get();
   g.acquire = g.device->createCommandSemaphore();
+  choose_depth_copy();
+  start_watchdog();
   if (g.swapchain) create_swap_framebuffers();
 
   // Binding model expected by XenosRecomp's shader_common.h: bindless
@@ -3517,6 +3692,8 @@ void pace_present() {
 // frame stats line (double steps as in the 0.9.6c "ge frames" line).
 void note_present() {
   const double now = now_ms();
+  g_last_present_ms.store(now);
+  g_present_count.fetch_add(1);
   if (g.pace_last_present > 0) g.present_intervals.push_back(now - g.pace_last_present);
   g.pace_last_present = now;
   g.pace_wait_sum += g.pace_waited_ms;
@@ -3698,6 +3875,7 @@ void present_frame() {
     if (r.slot) g.free_slots.push_back(r.slot);
     return true;
   });
+  std::erase_if(g.retired_sets, [](const auto& r) { return r.frame + kFrames <= g.frames; });
   std::erase_if(g.retired, [](const auto& r) {
     if (r.frame + kFrames > g.frames) return false;
     r.pool->free_lists[r.alloc.size_class].push_back(r.alloc);
@@ -3811,7 +3989,7 @@ bool ensure_depth_pass() {
 
 void native_depth_resolve(uint32_t dest) {
   ResolvedTexture& r = g.resolved[dest];
-  if (!g.depth_written || !REXCVAR_GET(gpu_native_depth_copy)) {  // every texel is the clear value
+  if (!g.depth_written || !g_depth_copy) {  // every texel is the clear value
     const float value = g.depth_clear;
     r.depth_pending = false;
     if (r.texture && r.span == 1 && r.content == uint64_t(std::bit_cast<uint32_t>(value))) return;
@@ -3848,6 +4026,7 @@ void native_depth_resolve(uint32_t dest) {
     sb.addReadWriteTexture(1);
     sb.end();
     std::unique_ptr<RenderDescriptorSet>& set = g.depth_sets[dest];
+    if (set) g.retired_sets.push_back({g.frames, std::move(set)});
     set = sb.create(g.device.get());
     set->setTexture(0, g.scene_depth.get(), RenderTextureLayout::SHADER_READ, g.depth_view.get());
     set->setTexture(1, r.texture.get(), RenderTextureLayout::GENERAL);
@@ -3932,6 +4111,22 @@ void native_resolve(uint32_t dest, uint32_t flags) {
 }  // namespace
 
 namespace ge { bool NativeRendererActive(); }  // ge_native_menu.cpp: fixed for the run
+namespace ge {  // ge_hooks.cpp: GPU loss hook and crash log
+void NativeReportDeviceLost() { report_device_lost(); }
+// D3D12 breadcrumbs and page-fault data for the devices made from here on. Called
+// before the presenter makes its device: the native renderer's D3D12CreateDevice
+// on the same GPU gets that same device back.
+void NativeEnableDred() {
+  if (!REXCVAR_GET(gpu_native_dred)) return;
+  ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
+  if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+    dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->Release();
+  }
+}
+bool NativeDeviceLost() { return g_watch_dev && g_watch_dev->GetDeviceRemovedReason() != S_OK; }
+}  // namespace ge
 #define NATIVE_ON() ge::NativeRendererActive()
 
 // The game's frame limiter (native/native_hooks.toml): it spins until
