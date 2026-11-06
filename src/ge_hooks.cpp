@@ -4549,8 +4549,9 @@ const std::vector<std::vector<uint8_t>>& see_through_blocks() {
 std::vector<std::pair<uint32_t, size_t>> g_see_through_found;
 
 // Makes the broken vertices of a found block opaque in the colour for the mode.
-// Egyptian stone, classic graphics: Rare's own per-face shade (0x00-0x33) lifted
-// to 0x30 + 4.5x, neutral, so the faces keep the N64's light and dark sides.
+// Egyptian stone, classic graphics: from Rare's per-face value (0x00-0x33), as
+// 0xE0 - 2x with a slightly cool tint, which matches N64 footage: the carved
+// panels darker blue-grey, the plain sides lighter.
 // Remastered (with the temple textures swapped in): a flat warm stone grey.
 // The Frigate door: the grey of its other side. Which vertices were broken
 // comes from the stock block.
@@ -4564,7 +4565,9 @@ void see_through_colour(uint8_t* base, const std::pair<uint32_t, size_t>& f, boo
     if (std::memcmp(q + v, stock.data() + v, 12) != 0) return;
     uint8_t bgr[3] = {0xA0, 0xA0, 0xA0};
     if (m.stone && classic) {
-      for (int c = 0; c < 3; ++c) bgr[c] = static_cast<uint8_t>(std::min(255, 0x30 + stock[v + 21 + c] * 9 / 2));
+      constexpr int tint[3] = {255, 240, 224};  // B, G, R: slightly cool, like the N64's
+      for (int c = 0; c < 3; ++c)
+        bgr[c] = static_cast<uint8_t>(std::clamp(0xE0 - stock[v + 21 + c] * 2, 0, 255) * tint[c] / 255);
     } else if (m.stone) {
       const uint8_t grey[3] = {0x70, 0x7C, 0x88};
       std::memcpy(bgr, grey, 3);
@@ -4660,6 +4663,41 @@ void ge_see_through_doors_tick(uint8_t* base) {
 // rooms and is culled while seen from the walkways (issue #18; the BeanTools
 // Silo data adds those portals instead). List the walkway rooms on the missiles
 // too: prop +0x30 holds up to 7 room ids ended by 0xFF.
+// Egyptian: the golden gun's glass case is four sliding glass doors (model
+// 0x146, doorwin) that drop into the stone pedestal. The 360 draws props with
+// blending, so the pedestal doesn't hide the glass inside it: lowered, the
+// panels stood just above the top and showed through the pedestal's sides.
+// While all four are down (at least 90% of their travel), their draws are
+// skipped (ge_model_draw_fixes), as the N64's pedestal hid them.
+bool g_egypt_glass_down = false;
+void ge_egypt_glass_tick(uint8_t* base) {
+  static int countdown = 0;
+  if (LD32(base, GE_CURRENT_STAGE) != 0x20u) {
+    g_egypt_glass_down = false;
+    return;
+  }
+  if (--countdown > 0) return;
+  countdown = 4;
+  const uint32_t player = LD32(base, GE_PLAYER_PTR);
+  const uint32_t start = player ? LD32(base, player + 0x1ACu) : 0u;
+  if (!start) return;
+  uint32_t prop = start;
+  for (int n = 0; n < 4096 && LD32(base, prop + 0x28u); ++n) prop = LD32(base, prop + 0x28u);
+  int glass = 0, down = 0;
+  for (int n = 0; prop && n < 4096; ++n, prop = LD32(base, prop + 0x2Cu)) {
+    if (base[prop] != 2u) continue;  // doors only
+    const uint32_t obj = LD32(base, prop + 8u);
+    if (!obj || LD16(base, obj + 4u) != 0x146u) continue;
+    ++glass;
+    float max_frac, frac;
+    const uint32_t mf = LD32(base, obj + 0x84u), f = LD32(base, obj + 0xB4u);
+    std::memcpy(&max_frac, &mf, 4);
+    std::memcpy(&frac, &f, 4);
+    if (max_frac > 0.f && frac >= 0.9f * max_frac) ++down;
+  }
+  g_egypt_glass_down = glass > 0 && down == glass;
+}
+
 void ge_silo_missile_rooms_tick(uint8_t* base) {
   if (LD32(base, GE_CURRENT_STAGE) != 0x14u) return;
   const uint32_t player = LD32(base, GE_PLAYER_PTR);
@@ -4771,6 +4809,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   ge_silo_missile_rooms_tick(base);
   ge_corpse_slots_tick(base);
   ge_see_through_doors_tick(base);
+  ge_egypt_glass_tick(base);
 
   // Skip the boot screen that jokes about the Nintendo logo (menu 2, drawn by
   // sub_820ED378). The current menu is at 0x8272B35C and a requested change at
@@ -5315,6 +5354,7 @@ bool model_has_own_head(const char* guest_path) {
 bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
+  if (g_egypt_glass_down && std::strstr(path, "\\prop\\doorwin\\")) return true;  // see ge_egypt_glass_tick
   static std::string last_body;
   if (std::strstr(path, "\\original\\head\\")) {
     const bool skip = g_body_has_head;
