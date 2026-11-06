@@ -1,295 +1,170 @@
 # GoldenEye 007 XBLA PC Recomp
 
-A native Windows PC version of **GoldenEye 007** based on the unreleased
-Xbox 360/XBLA remaster, created through static recompilation with
-[ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs at up to 4K with
-16:9 and 21:9 widescreen at a steady 60 FPS and switches between the original and enhanced graphics at the
-press of a key. Keyboard and mouse, Xbox controllers and online multiplayer
-through LAN and virtual LAN services are all supported.
+A native Windows PC port of **GoldenEye 007**, based on the unreleased Xbox 360 remaster by Rare and 4J Studios, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation.
 
-> **You need your own copy of GoldenEye 007 XBLA.** This project contains no
-> original game executable, graphics, sound, music or other game data. The
-> first time you start it, it reads the Xbox 360 GoldenEye 007 package you
-> provide, checks that it is the supported version and imports the game data
-> from it into the game's folder on your PC. This is different
-> from the Bean build which had a fake build date only adding updated generic skydomes
-> which did not match the level day/night and unlock rows which was common for most
-> XBLA trial games.
+Play at **up to 4K and 60 FPS**, with 16:9 and 21:9 widescreen support, enhanced graphics, keyboard and mouse controls, and LAN / Virtual LAN multiplayer. Switch between the original N64 and remastered graphics at any time. No emulator required.
 
-Like the GoldenEye 007 XBLA PC Recomp and to support future
-projects, you can tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
+**Free and open-source.**
 
-[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
+![GoldenEye 007 Main Menu](docs/screenshots/main-menu.jpg)
 
-![Main menu](docs/screenshots/main-menu.jpg)
+> **You must provide your own copy of GoldenEye 007 XBLA.** No original game files or assets are distributed with this project. The launcher imports the required files from your Xbox 360 game package during first-time setup.
 
-## Requirements
+## Download & Installation
 
-- Windows 10 or 11, 64-bit
-- A graphics card with DirectX 12 or Vulkan support (integrated laptop
-  graphics such as Intel HD 620 or AMD Radeon included)
-- Your own GoldenEye 007 Xbox Live Arcade package (the Xbox 360 game file for
-  Title ID `584108A9`)
+**[Download the latest release](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/releases)**
 
-## Install and play
-
-1. Download the latest release ZIP from the
-   [Releases](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/releases)
-   page and extract the **GoldenEye 007** folder to a location of your choice (not Program Files).
-2. Open **GoldenEye 007.exe**. The first time, the setup window opens.
-3. **Browse package** and select your game package or place the package file besides `GoldenEye 007.exe` or in
-   a `Game Package` folder next to it and will be found and imported automatically.
-7. Tick any optional extras: start in fullscreen, desktop shortcut, 100% game completion.
-8. **Play**.
+1. Download the latest ZIP and extract the **GoldenEye 007** folder.
+2. Run `GoldenEye 007.exe`.
+3. Select your GoldenEye 007 XBLA package using **Browse Package**, or place it alongside the executable for automatic detection.
+4. Choose your preferred options, including fullscreen, desktop shortcut and optional 100% game completion.
+5. Click **Play**.
 
 ![Setup window](docs/screenshots/setup.png)
 
-From then on opening `GoldenEye 007.exe` starts the game straight away; the
-package is not needed again. Everything stays inside the extracted folder
-(`resources\assets` for the imported game data, `resources\userdata` for user save data
-and settings), so it can be moved or backed up as a whole.
-To open setup again (change extras, re-import), hold **Shift** while opening
-`GoldenEye 007.exe`, or choose Help & Options > Other Settings > **Run Setup
-Again** in the game.
-Coming from an older release with `Setup GoldenEye 007.exe` and a `Game`
-folder? Extract into or next to the old folder and setup imports straight
-from the old install, saves and settings included.
+After setup, simply run `GoldenEye 007.exe` to play. Your original game package is no longer needed.
 
-Setup only reads your package and never changes it. It downloads nothing and
-neither setup nor the game contacts Xbox Live.
+**To reopen setup:** Hold **Shift** while launching, or select **Help & Options → Other Settings → Run Setup Again**.
+
+The installation is portable, with imported game files, saves and settings stored inside the game folder.
+
+### System Requirements
+
+- Windows 10 or 11 (64-bit)
+- DirectX 12 or Vulkan-compatible graphics card
+- Integrated graphics supported, including Intel HD 620
+- Your own GoldenEye 007 XBLA package (Title ID `584108A9`, supported build only)
 
 ## Features
 
-- **Native Windows PC build**: no emulator, runs as a normal Windows program
-- **New native renderer**: the game is drawn directly with Direct3D 12 (or
-  Vulkan) instead of emulating the Xbox 360's graphics chip, using about half
-  the CPU and graphics power, so it runs at a steady 60 FPS on laptops and
-  integrated graphics too. The first time a level loads, its shaders are
-  translated on your PC (a moment longer; later loads are quick). The classic
-  renderer of earlier versions stays available (`gpu_native = false` in
-  `ge.toml`)
-- **Up to 4K**: windowed sizes from 1024×768 to 3840×2160, or fullscreen at
-  your screen's resolution; render scale 1x (1280×720, the default), 1.5x
-  (1920×1080, new renderer), 2x or 3x with FSR upscaling
-- **Smooth edges**: the new renderer uses 4x anti-aliasing by default, as the
-  Xbox 360 did
-- **Widescreen**: 4:3, 16:9 and 21:9 (Screen Ratio in Video Settings, which
-  also picks matching window sizes), with a desk backdrop around the menus on
-  wide screens
-  ![GoldenEye 007 running in 21:9 widescreen](docs/screenshots/gameplay-ultrawide.jpg)
-- **Steady 60 FPS** (the game's own rate), with tear-free V-Sync and an
-  optional FPS / frame-time counter
-- **Original and enhanced graphics**: switch between the two at any time (F,
-  or RB on a controller)
-- **Keyboard and mouse**: mouse look, rebindable keys, mouse sensitivity,
-  separate precise-aim sensitivity, invert look, mouse wheel zoom on the
-  sniper rifle and the mouse in the menus and the pause watch
-- **Xbox controller** support, working alongside keyboard and mouse
-- **LAN multiplayer** (Multiplayer → LAN or Virtual LAN), and **online
-  multiplayer** through virtual LAN services such as Radmin VPN, ZeroTier,
-  Tailscale and Hamachi
-  ![Two players in a LAN match](docs/screenshots/lan-match.jpg)
-- **Settings menu** (Help & Options): Keyboard & Mouse, Video Settings
-  (display mode, resolution, screen ratio, V-Sync, render scale, FSR
-  upscaling, texture filtering, anti-aliasing, field of view, FPS counter,
-  post-processing colour filter), Online Settings, Other Settings (with Camera
-  Bob to turn off the head bob while walking, and Run Setup Again) and Check
-  for Updates. The new renderer uses
-  Direct3D 12 and switches to Vulkan by itself if Direct3D 12 can't start;
-  `gpu_native_api = "vulkan"` in `ge.toml` picks Vulkan
-  ![Help & Options menu with the PC settings pages](docs/screenshots/help-options.jpg)
-- **Wider field of view** (10 degrees wider by default, adjustable from the
-  original up to +30)
-- Optional **100% game completion** in setup: every mission, difficulty,
-  007 mode and cheat unlocked
-- **Check for Updates** (Help & Options): asks GitHub for a newer release only
-  when you choose it, then downloads, verifies and installs it, keeping your
-  saves, settings and imported game data
-- **Portable**: one program to open, no installer, no administrator rights;
-  saves and settings stay in the game folder
-  ![LAN lobby with two players joined](docs/screenshots/lan-lobby.jpg)
+### Graphics & Performance
 
-### Controls
+- **Native PC Rendering:** DirectX 12 with automatic Vulkan fallback
+- **Up to 4K resolution** with fullscreen and windowed modes
+- **60 FPS** gameplay with V-Sync and optional FPS counter
+- **Widescreen:** 4:3, 16:9 and 21:9 ultrawide
+- **Render Scale:** 1x, 1.5x, 2x or 3x
+- **AMD FSR** upscaling and texture filtering options
+- **4x Anti-Aliasing** by default with the native renderer
+- **Adjustable Field of View**, colour filters and Camera Bob toggle
+- **Classic and Enhanced Graphics:** Switch instantly using F or RB
 
-| Key / button | Action |
+The native renderer significantly reduces CPU and GPU overhead compared with the previous renderer, making the game more accessible on older laptops and integrated graphics.
+
+![GoldenEye 007 Ultrawide Gameplay](docs/screenshots/gameplay-ultrawide.jpg)
+
+### Controls & Quality of Life
+
+- Full **keyboard and mouse** support with rebindable keys and adjustable sensitivity
+- **Xbox controller** support
+- Native PC settings menus
+- Optional 100% completion unlocks for missions, difficulties and cheats
+- Improved aiming, including mouse-controlled tank turret and sniper zoom
+- Optional FPS and frame-time counter
+- Removed outdated Xbox Live menus and prompts
+- Built-in update checker
+- Portable installation with local saves and settings
+
+### Multiplayer
+
+- **LAN multiplayer** and online play through Virtual LAN services
+- Compatible with Radmin VPN, ZeroTier, Tailscale and Hamachi
+- Multiplayer music synchronised between players
+- Fixes for map boundaries, collision, weapons and character selection
+
+No Xbox Live connection is required.
+
+![GoldenEye 007 LAN Multiplayer](docs/screenshots/lan-match.jpg)
+
+## Keyboard & Mouse Controls
+
+| Key | Action |
 |---|---|
 | W, A, S, D | Move |
-| Mouse | Look and aim; moves the crosshair in menus |
-| Left click | Fire |
-| Right click | Aim and precise aim; back in menus |
-| E | Activate (A button); select in menus |
-| Q | Cycle gadgets |
+| Mouse | Look / Aim |
+| Left Click | Fire |
+| Right Click | Aim / Precise Aim |
+| E | Interact |
 | R | Reload |
-| Mouse wheel | Cycle weapons; zoom while aiming the sniper rifle |
-| F | Toggle graphics (original / enhanced) |
+| Q | Cycle gadgets |
+| Mouse Wheel | Switch weapons / Sniper zoom |
+| F | Toggle original / enhanced graphics |
 | Ctrl | Crouch |
-| Escape, Enter | Start: pause with the watch menu; Escape is back in menus |
-| Tab | Objectives / scores |
-| Arrow keys | D-pad |
+| Tab | Objectives / Scores |
+| Esc / Enter | Pause |
+| Arrow Keys | D-pad |
 
-Keys can be changed in Help & Options → Keyboard & Mouse, or on the watch's
-Keyboard Controls page during a mission. An Xbox controller works as on the
-console.
+Keys can be customised under **Help & Options → Keyboard & Mouse** or through the in-game watch menu.
 
-### Fixes implemented so far
+Xbox controllers use the original console controls.
 
-- Removed the beta text on the logo screen and the blur in original graphics mode.
-- Dam intro camera fix.
-- Level bug fix, guards spawning without weapons on Runway.
-- Frigate's water now drawn correctly in enhanced graphics, including near the speedboat.
-- Frigate, five invisible locked doors that blocked walkways are now normal doors that open both ways (multiplayer).
-- Frigate, both small balconies can be walked onto and players can drop off the large ledge onto the deck below (multiplayer).
-- Bunker: the entrance out to the snow is walled off again, so players can’t leave the map (multiplayer).
-- Music fixed watch/pause theme, Mission Select music after a mission ends and the Control and Caverns elevator music which now resumes where it left off.
-- Dead guards stay 10 seconds before they fade out (the original faded them after 1.5 seconds). Characters a mission objective waits on still fade at once, so the objective completes straight away, and when the level runs short of guard slots the oldest body fades first so reinforcements arrive on time.
-- Egyptian: the stone secret doors, the panels around the four autoguns and the golden gun's pedestal are visible again instead of acting as invisible walls; they match the N64 in classic graphics and use the temple's remastered textures in enhanced graphics. The golden gun's glass case no longer shows through the pedestal once it has dropped.
-- Silo: the missiles no longer disappear when seen from the walkways.
-- Frigate: the door that only drew one side is solid from both sides (multiplayer).
-- Pause watch: Bond's arm wears only the sleeve for the level's outfit instead of every outfit's sleeve at once, and the winder knobs no longer sit in black squares with old graphics.
-- Fixed guards who got the "Dave" face (also Dr. Doak's) being drawn headless with a floating hat in old graphics.
-- A guard's missed shot that hits a wall right beside you no longer bursts in mid air at your head.
-- Fixed a hang on some Intel integrated graphics; if the graphics driver resets, the game restarts by itself and logs why.
-- Cradle: killing Trevelyan at the final showdown now ends the mission.
-- Tank turret aiming with the mouse.
-- Fixed two different characters both being called "Scientist" on character select.
-- Fixed multiplayer characters icons "?" now show character models in character select.
-- Fixed Bond and the Russian infantry guard showing two heads with old graphics.
-- Removed Xbox-only messages that don't apply on PC.
-- Removed Xbox LIVE-only menu entries and the player card's View Gamercard and Add To Friends List rows which led nowhere.
-- Every player now hears the same music in LAN matches.
-- Fixed the watch volume sliders' range and door sounds that went silent at a distance.
-- Fixed LAN games not finding each other over virtual LAN adapters such as Radmin VPN and Hamachi, or on PCs with several network adapters.
-- Fixed the automatic shotgun's muzzle flash showing all the time on guns held by players and lying on the floor.
-- Fixed shotgun and automatic shotgun shots never reaching other players in multiplayer.
-- Fixed the spike, fin and flat band sticking out of Dam's mountains with old graphics.
-- Other Misc fixes.
+## Improvements & Fixes
 
-## Known limitations
+Alongside the PC enhancements, several issues from the original unreleased build have been addressed:
 
-- Windows only for now.
-- Only the GoldenEye 007 Xbox Live Arcade package with Title ID `584108A9`
-  and the exact game program this port was recompiled from is supported;
-  setup refuses other builds.
-- The game is not digitally signed, so Windows SmartScreen may warn the first
-  time; choose *More info* → *Run anyway*. Windows also asks for network
-  access the first time you host or join a LAN game.
-- Issues remaining relating to the original build.
+- Fixed mission progression issues, including Cradle and Runway.
+- Restored missing geometry and visual effects across several levels.
+- Improved NPC behaviour, guard bodies and weapon effects.
+- Fixed multiplayer collision issues in Bunker and Frigate.
+- Fixed multiplayer shotgun damage and character selection problems.
+- Corrected music playback, sound effects and menu issues.
+- Removed obsolete Xbox Live functionality.
+- Improved performance and stability on integrated graphics.
 
-**If something goes wrong include the newest files from
-`resources\runtime\logs` when reporting it.**
+For detailed changes, see the [GitHub Releases](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/releases).
 
-For slowdowns, stutter or freezes, a detailed log helps most:
+## Updates
 
-1. Close the game and add `performance_diagnostics = true` to
-   `resources\userdata\ge.toml` (open it in Notepad).
-2. Start the game, do what shows the problem for a minute or two, then close it.
-3. Attach the newest `ge_NNN.log` from `resources\runtime\logs`. It lists the
-   settings and graphics card at the top, then frame timing; it holds no saves
-   or passwords.
-4. Set it back to `false` afterwards.
+Check for new versions through **Help & Options → Check for Updates**.
 
-Every log, detailed or not, has a line a minute with the frame rate and the
-frames that took too long. The 20 newest logs are kept.
+Updates are downloaded and installed without affecting your imported game files, saves or settings.
 
-For a character that gets stuck (someone who should walk somewhere and doesn't,
-so the mission can't finish), do the same with `npc_path_log = true`: play until
-it happens, wait a minute, close the game and attach the newest log. It records
-where characters stopped and which part of the mission script they were running.
+Alternatively, download the latest release ZIP and extract it over your existing installation.
 
-## For Developers
+Older installations using a separate setup executable and `Game` folder can also be imported during setup.
 
-Building from source. You need Git, CMake 3.25 or newer, Ninja, LLVM/Clang 18
-or newer (installed in `C:\Program Files\LLVM`), Python 3, Visual Studio 2022
-or newer with the C++ workload (Windows SDK and the Visual C++ runtime that
-releases ship) and Windows PowerShell, plus your own GoldenEye 007 package.
+## Known Limitations
 
-ReXGlue is the `rexglue-sdk` submodule, pinned to upstream v0.10.0. This
-project's changes to it, including the GoldenEye Recomp ReXGlue fork, are kept
-in `patches/rexglue.patch`, which CMake applies automatically. The native
-renderer's libraries are submodules too: `thirdparty/plume`
-([Plume](https://github.com/zolaware/plume)) and `thirdparty/XenosRecomp`
-([XenosRecomp](https://github.com/hedge-dev/XenosRecomp), which brings
-Microsoft's DirectX Shader Compiler binaries), with small changes in
-`patches/plume.patch` and `patches/xenosrecomp.patch`, also applied by CMake.
-The dependencies are nested deeply, so enable long paths when cloning:
+- Windows only.
+- Only the supported GoldenEye 007 XBLA build (Title ID `584108A9`) is accepted.
+- Some issues inherited from the original unreleased build may remain.
+- Windows SmartScreen may warn about the unsigned executable.
+- Windows Firewall may request permission for multiplayer connections.
 
-```powershell
-git -c core.longpaths=true clone --recurse-submodules --shallow-submodules https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp.git
-```
+**Renderer compatibility:** If you experience issues with the native renderer, the previous renderer can be enabled by setting `gpu_native = false` in `resources\userdata\ge.toml`.
 
-Extract your package into `game/`, generate the recompiled code from your own
-`default.xex`, then build the game:
+## Reporting Issues
 
-```powershell
-.\tools\Extract-STFS.ps1 -Path <your package> -OutputDir game
-cmake --preset win-amd64-release
-cmake --build --preset win-amd64-release --target ge_codegen
-cmake --preset win-amd64-release
-cmake --build --preset win-amd64-release
-```
+Found a bug? [Open a GitHub Issue](https://github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp/issues) and include your latest log from:
 
-The `ge_codegen` step builds ReXGlue's code generator and translates
-`game/default.xex` into C++ in `generated/`; the second configure picks that
-code up. Later builds rerun the generator by themselves when its inputs
-change. The generated code is derived from the game, so it is never committed
-(only the SDK boilerplate `generated/rexglue.cmake` is); `ge_config.toml`
-holds the function addresses and hooks the generator uses.
+`resources\runtime\logs\`
 
-The game is built to `out/build/win-amd64-release/GoldenEye 007.exe`. To run it
-from there, link your extracted package in as its `assets` folder:
+**For performance, stuttering or freezing issues:**
 
-```powershell
-New-Item -ItemType Junction -Path "out\build\win-amd64-release\assets" -Target game
-```
+1. Open `resources\userdata\ge.toml`.
+2. Set `performance_diagnostics = true`.
+3. Reproduce the issue and close the game.
+4. Attach the latest `ge_NNN.log` to your report.
+5. Set diagnostics back to `false` afterwards.
 
-ReXGlue's developer hotkeys (F3 debug overlay, backtick console, F4 settings
-overlay, F7 achievements overlay) are off. Set `developer_hotkeys = true` in
-`ge.toml` to bring them back; `ge_debug_menu = true` enables the game's hidden
-debug menu (press F9 in a mission, or set another key with `ge_debug_menu_key`,
-for example `ge_debug_menu_key = "F10"`).
+For NPC pathfinding or mission progression problems, use `npc_path_log = true` instead.
 
-`.\tools\Make-Release.ps1` (or `Make Release.bat`) builds the release ZIP,
-`out\release\GoldenEye-007-XBLA-PC-Recomp-v<version>.zip`. It holds one
-`GoldenEye 007` folder with the launcher (`GoldenEye 007.exe`, built from
-`packaging/launcher` by `packaging/Build-Launcher.ps1`), README, licences and
-`resources\runtime` (the game and its DLLs), and never any game data. The
-version comes from the `VERSION` file.
+## Development & Credits
 
-## Licence and credits
+This project builds upon the work of:
 
-This project is built on the work of others:
+- [GoldenEye Recomp](https://github.com/SunJaycy/GoldenEye-Recomp) by SunJaycy – Original ReXGlue recompilation.
+- [GoldenEye Recomp Watch Music Fix](https://github.com/mrfox-1/GoldenEye-Recomp-Watch-Music-Fix) by mrfox-1 and contributors – Community fixes.
+- BeanTools Community Edition – Original XBLA fixes.
+- [ReXGlue](https://github.com/rexglue/rexglue-sdk) by Tom Clay and contributors – Static recompilation framework.
+- [Plume](https://github.com/zolaware/plume) and [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) – Native rendering and shader translation.
 
-- [GoldenEye Recomp](https://github.com/SunJaycy/GoldenEye-Recomp) by
-  SunJaycy, the original ReXGlue recompilation of GoldenEye 007 this port is
-  based on (The Unlicense), and his
-  [ReXGlue fork](https://github.com/SunJaycy/GoldenEye-Recomp-rexglue)
-  (BSD 3-Clause), whose runtime fixes are part of `patches/rexglue.patch`.
-- [GoldenEye Recomp Watch Music Fix](https://github.com/mrfox-1/GoldenEye-Recomp-Watch-Music-Fix)
-  by mrfox-1 and contributors: music, tank, body-fading, Frigate water and
-  menu fixes (MIT, see [LICENSE-community-fixes-MIT.txt](LICENSE-community-fixes-MIT.txt)).
-- The BeanTools Community Edition GoldenEye XBLA fixes, which GoldenEye Recomp
-  carries over as code and changed values.
-- [ReXGlue](https://github.com/rexglue/rexglue-sdk) by Tom Clay and
-  contributors (BSD 3-Clause), which includes code derived from
-  [Xenia](https://xenia.jp).
-- [Plume](https://github.com/zolaware/plume) (MIT) and
-  [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) (MIT), which the
-  native renderer draws with and translates the game's shaders with.
+The project's own game-port code is released under [The Unlicense](LICENSE). The launcher includes GPL-3.0 components derived from [Velocity](https://github.com/hetelek/Velocity), and third-party dependencies retain their respective licences. See [packaging/licenses](packaging/licenses) and [packaging/licenses-native](packaging/licenses-native) for additional terms.
 
-This project's own code is released under The Unlicense, like GoldenEye
-Recomp (see [LICENSE](LICENSE), which also lists what it does not cover).
-The STFS package reader (`packaging/launcher/stfs.cpp` and
-`tools/Extract-STFS.ps1`) is derived from
-[Velocity](https://github.com/hetelek/Velocity) and is GPL-3.0, so the
-launcher it is compiled into (`GoldenEye 007.exe` in the release root) is
-distributed under the GPL-3.0; the game itself is a separate program. ReXGlue and
-its third-party libraries keep their own licences; see
-[packaging/licenses](packaging/licenses). The release ships Microsoft's
-DirectX Shader Compiler (`dxcompiler.dll`, LLVM/MIT licences, and `dxil.dll`,
-Microsoft's redistributable under the Microsoft Software License Terms); its
-terms are in [packaging/licenses-native](packaging/licenses-native), and using
-`dxil.dll` means accepting them.
+## Support Development
 
-GoldenEye 007, James Bond, Xbox and Xbox 360 are trademarks or property of
-their respective owners. This is an unofficial fan project, not affiliated
-with or endorsed by them.
+If you enjoy the project and would like to support future PC recompilation projects, you can [support me on Ko-fi](https://ko-fi.com/caiuscodes).
+
+---
+
+*GoldenEye 007, James Bond and Xbox are trademarks or property of their respective owners. This is an independent fan project and is not affiliated with or endorsed by the rights holders.*
