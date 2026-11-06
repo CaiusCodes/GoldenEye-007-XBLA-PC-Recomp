@@ -4548,23 +4548,27 @@ const std::vector<std::vector<uint8_t>>& see_through_blocks() {
 // Blocks patched since the stage loaded: guest address, model index.
 std::vector<std::pair<uint32_t, size_t>> g_see_through_found;
 
-// Makes the broken vertices of a found block opaque in the colour for the mode:
-// Egyptian stone as sandstone like the N64's in classic graphics and a warm
-// stone grey with the remastered temple; the Frigate door in the grey of its
-// other side. Which vertices were broken comes from the stock block.
+// Makes the broken vertices of a found block opaque in the colour for the mode.
+// Egyptian stone, classic graphics: Rare's own per-face shade (0x00-0x33) lifted
+// to 0x30 + 4.5x, neutral, so the faces keep the N64's light and dark sides.
+// Remastered (with the temple textures swapped in): a flat warm stone grey.
+// The Frigate door: the grey of its other side. Which vertices were broken
+// comes from the stock block.
 void see_through_colour(uint8_t* base, const std::pair<uint32_t, size_t>& f, bool classic) {
   const auto& stock = see_through_blocks()[f.second];
   const SeeThroughModel& m = kSeeThroughModels[f.second];
-  uint8_t bgr[3] = {0xA0, 0xA0, 0xA0};
-  if (m.stone) {
-    const uint8_t sand[3] = {0x78, 0x98, 0xB0}, grey[3] = {0x70, 0x7C, 0x88};
-    std::memcpy(bgr, classic ? sand : grey, 3);
-  }
   uint8_t* q = base + f.first;
   for (size_t v = 0; v < stock.size(); v += kVertexStride) {
     if (stock[v + 20] >= 0x80) continue;
     // Still our block (the game may have reused the memory): position unchanged.
     if (std::memcmp(q + v, stock.data() + v, 12) != 0) return;
+    uint8_t bgr[3] = {0xA0, 0xA0, 0xA0};
+    if (m.stone && classic) {
+      for (int c = 0; c < 3; ++c) bgr[c] = static_cast<uint8_t>(std::min(255, 0x30 + stock[v + 21 + c] * 9 / 2));
+    } else if (m.stone) {
+      const uint8_t grey[3] = {0x70, 0x7C, 0x88};
+      std::memcpy(bgr, grey, 3);
+    }
     q[v + 20] = 0xFF;
     std::memcpy(q + v + 21, bgr, 3);
   }
