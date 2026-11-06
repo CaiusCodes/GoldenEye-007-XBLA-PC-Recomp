@@ -5772,6 +5772,37 @@ void ge_classic_head_swap(PPCRegister& r6, PPCRegister& r7) {
   }
 }
 
+// A guard's missed shot is traced along its aim line to where it leaves the
+// floor (a stan edge = a wall), and the N64 code (chraction.c) puts the bullet
+// spark and impact 26 units back from that point along the shot. When Bond
+// stands near a wall, a miss that passes him lands on that wall and its spark
+// is pulled back to beside or into his head, so it looks like the shot burst
+// in mid air on him. At 0x8212DDD8 (the guard fire code; this block only runs
+// for a miss; r1 + 112 = spark position, r30 + 21268 = the prop the trace
+// stopped at, 0 = a wall) true skips the spark and the wall impact (to
+// 0x8212E128) when a wall miss lands within kNearBond units of Bond. Misses
+// that hit other guards or objects, and all hits, are left alone.
+bool ge_guard_miss_spark(PPCRegister& r1, PPCRegister& r30) {
+  constexpr float kNearBond = 60.0f;
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  if (LD32(base, r30.u32 + 21268u) != 0) return false;
+  const uint32_t pl = LD32(base, 0x82F1FA98u);  // current player
+  const uint32_t bp = pl ? LD32(base, pl + 0x1ACu) : 0;  // Bond's prop, position at +0xC
+  if (!bp) return false;
+  auto f = [&](uint32_t a) { const uint32_t v = LD32(base, a); float r; std::memcpy(&r, &v, 4); return r; };
+  const float dx = f(r1.u32 + 112) - f(bp + 0xC);
+  const float dy = f(r1.u32 + 116) - f(bp + 0x10);
+  const float dz = f(r1.u32 + 120) - f(bp + 0x14);
+  // Bond's prop sits at eye height; his body reaches about 170 below it.
+  if (dx * dx + dz * dz > kNearBond * kNearBond || dy > kNearBond || dy < -200.0f) return false;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXKRNL_INFO("GESHOTS a guard's miss landed beside Bond: its spark is left out");
+  }
+  return true;
+}
+
 bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
