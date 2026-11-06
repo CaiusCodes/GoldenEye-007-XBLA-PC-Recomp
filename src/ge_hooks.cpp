@@ -3933,28 +3933,155 @@ void ge_watch_mouse(uint8_t* base) {
 // the game starts the fade at once (fade timer +44 goes from -1 to 0, then up to
 // 90 = gone), so bodies vanished after about a second and a half. They now lie
 // for ge_body_seconds first: the timer counts up from below -1 while they lie.
-// 10 s, not longer: levels refill a guard slot (with reinforcements) only once
-// its body is gone, so a minute held reinforcements back.
+// Two things wait for a body to be gone, so lying bodies must not hold them back:
+// - Mission scripts: if_chr_does_not_exist (AI command 0x31) is true only once a
+//   character has died AND faded. Objectives, Baron Samedi's three lives in
+//   Egyptian, Trevelyan in Cradle and some respawns wait on it (issues #13, #19).
+//   Every character a stage's scripts test that way fades at once, as stock.
+// - Reinforcements: a guard spawns only while 3 guard slots are free, and a body
+//   holds its slot. When free slots run short, the oldest body starts fading.
 REXCVAR_DEFINE_INT32(ge_body_seconds, 10, "Game", "Seconds a dead guard stays before fading");
+// The game spawns a guard only with >= 3 free slots; keep 2 spare for bursts.
+REXCVAR_DEFINE_INT32(ge_body_free_slots, 5, "Debug", "Free guard slots kept by fading the oldest body");
+namespace {
+constexpr uint32_t kSetupPtr = 0x82F30398u;  // current stage setup; +0x14 = AI list table {list, id}
+constexpr uint32_t kChrSlots = 0x830612F4u;  // guard slots (0x2A4 bytes each), count at +4
+constexpr uint32_t kChrSize = 0x2A4u;
+// AI command lengths (n64decomp bondaicommands.h); 0xAD is a zero-terminated text.
+constexpr uint8_t kAiLen[256] = {
+    2, 2, 2, 1, 1, 4, 3, 1, 1, 1, 9, 2, 1, 1, 2, 2,
+    2, 2, 2, 2, 6, 6, 6, 6, 4, 4, 2, 5, 3, 1, 3, 3,
+    2, 1, 1, 2, 4, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 2,
+    3, 3, 2, 1, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 2, 2, 2, 4, 2, 2, 3, 3, 3, 3, 4, 4, 7, 7, 5,
+    5, 4, 6, 6, 5, 4, 3, 3, 4, 3, 3, 3, 3, 3, 2, 2,
+    2, 2, 2, 2, 3, 4, 2, 2, 4, 3, 3, 3, 4, 3, 3, 3,
+    3, 3, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 4, 4, 3, 3,
+    3, 2, 2, 2, 3, 2, 2, 2, 2, 3, 2, 3, 2, 2, 2, 3,
+    3, 2, 2, 2, 2, 2, 3, 3, 3, 4, 5, 5, 6, 5, 5, 6,
+    6, 6, 7, 6, 6, 7, 6, 6, 7, 2, 3, 3, 4, 50, 1, 1,
+    1, 1, 2, 5, 5, 1, 1, 3, 1, 1, 2, 4, 4, 12, 11, 9,
+    8, 5, 3, 3, 4, 5, 6, 6, 6, 2, 5, 2, 5, 5, 2, 2,
+    4, 2, 1, 1, 3, 6, 4, 2, 1, 5, 1, 1, 2, 1, 1, 2,
+    3, 3, 4, 2, 2, 3, 5, 2, 2, 1, 1, 2, 1, 1, 13, 1,
+    2, 2, 3, 2, 4, 2, 1, 3, 3, 1, 1, 1, 2, 0, 0, 0};
+std::array<bool, 256> g_scripted_chrs{};
+uint32_t g_scripted_table = 0;  // the AI list table g_scripted_chrs was read from
+std::vector<std::pair<uint32_t, int>> g_fading_for_slot;  // bodies we started fading, frames left
+// Bodies lying on our timer: chr -> g_body_tick when ge_corpse_linger last kept it.
+// +44 is not a timer while a guard lives, so only bodies seen here count.
+std::unordered_map<uint32_t, uint32_t> g_lying;
+uint32_t g_body_tick = 0;
+
+bool in_ram(uint32_t a) { return a >= 0x40000000u && a < 0x9F000000u; }
+
+// Reads every AI list of the current stage and notes the characters tested
+// with if_chr_does_not_exist. Redone when the stage's setup changes.
+void scan_scripted_chrs(uint8_t* base) {
+  const uint32_t setup = LD32(base, kSetupPtr);
+  const uint32_t table = in_ram(setup) ? LD32(base, setup + 0x14u) : 0u;
+  if (table == g_scripted_table) return;
+  g_scripted_table = table;
+  g_scripted_chrs.fill(false);
+  if (!in_ram(table)) return;
+  int lists = 0, found = 0;
+  for (uint32_t e = table; lists < 512; e += 8u, ++lists) {
+    uint32_t o = LD32(base, e);
+    if (!in_ram(o)) break;
+    for (int n = 0; n < 100000; ++n) {
+      const uint8_t c = base[o];
+      if (c == 0x04u) break;  // end of list
+      if (c == 0xADu) {       // debug text
+        int k = 1;
+        while (k < 256 && base[o + k] != 0) ++k;
+        o += k + 1;
+        continue;
+      }
+      if (kAiLen[c] == 0) {
+        REXKRNL_WARN("GEBODIES unknown AI command {:02X} at {:08X}", c, o);
+        break;
+      }
+      if (c == 0x31u && base[o + 1] < 0xF0u && !g_scripted_chrs[base[o + 1]]) {
+        g_scripted_chrs[base[o + 1]] = true;
+        ++found;
+      }
+      o += kAiLen[c];
+    }
+  }
+  REXKRNL_INFO("GEBODIES stage {}: {} AI lists, {} characters fade at once", LD32(base, GE_CURRENT_STAGE),
+               lists, found);
+}
+}  // namespace
+
+// Called each frame (input poll): when fewer than ge_body_free_slots guard slots
+// are free, the oldest lying body starts its fade so reinforcements can come.
+void ge_corpse_slots_tick(uint8_t* base) {
+  scan_scripted_chrs(base);
+  const uint32_t slots = LD32(base, kChrSlots);
+  const uint32_t count = LD32(base, kChrSlots + 4u);
+  if (!in_ram(slots) || count == 0 || count > 200) {
+    g_fading_for_slot.clear();
+    return;
+  }
+  ++g_body_tick;
+  int free_slots = 0;
+  for (uint32_t i = 0; i < count; ++i)
+    if (LD32(base, slots + i * kChrSize + 0x1Cu) == 0) ++free_slots;  // no model: free
+  uint32_t oldest = 0;
+  int32_t oldest_t = INT32_MIN;
+  for (auto it = g_lying.begin(); it != g_lying.end();) {
+    const uint32_t chr = it->first;
+    const int32_t t = static_cast<int32_t>(LD32(base, chr + 44u));
+    if (g_body_tick - it->second > 3u || LD32(base, chr + 0x1Cu) == 0 || t > -2) {
+      it = g_lying.erase(it);
+      continue;
+    }
+    if (t > oldest_t) {  // our timer counts up towards -1: the highest lay longest
+      oldest_t = t;
+      oldest = chr;
+    }
+    ++it;
+  }
+  int pending = 0;  // bodies already fading for a slot: their slots come free soon
+  for (auto it = g_fading_for_slot.begin(); it != g_fading_for_slot.end();) {
+    if (LD32(base, it->first + 0x1Cu) == 0 || --it->second <= 0) {
+      it = g_fading_for_slot.erase(it);
+    } else {
+      ++pending;
+      ++it;
+    }
+  }
+  if (oldest && free_slots + pending < REXCVAR_GET(ge_body_free_slots)) {
+    REXKRNL_INFO("GEBODIES {} guard slots free: chr {} fades now", free_slots + pending,
+                 static_cast<int16_t>(LD16(base, oldest)));
+    ST32(base, oldest + 44u, 0u);  // start the stock fade (90 frames)
+    g_fading_for_slot.emplace_back(oldest, 180);
+    g_lying.erase(oldest);
+  }
+}
+
 bool ge_corpse_linger(PPCRegister& r3) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const uint32_t chr = r3.u32;
   const int32_t t = static_cast<int32_t>(LD32(base, chr + 44u));
   if (t >= 0) return false;  // fading: the game's own code
-  // Cradle's Trevelyan (stage 41, chr 0) fades at once: if he's killed rather
-  // than shot off the platform, the mission ends only after his body is gone
-  // (if_chr_does_not_exist 00), so a lingering body held the ending back by a
-  // minute and players thought it never ended (issue #13).
-  if (LD32(base, GE_CURRENT_STAGE) == 41u && static_cast<int16_t>(LD16(base, chr)) == 0) return false;
+  const int16_t num = static_cast<int16_t>(LD16(base, chr));
+  if (num >= 0 && num < 256 && g_scripted_chrs[num]) {  // a script waits for it
+    if (t == -1) REXKRNL_INFO("GEBODIES chr {} died: a script waits for it, fades at once", num);
+    return false;
+  }
   const int32_t linger = std::clamp(REXCVAR_GET(ge_body_seconds), 0, 600) * 60;
   if (t == -1) {  // just died
+    REXKRNL_INFO("GEBODIES chr {} died: lies {} s", num, linger / 60);
     if (linger == 0) return false;
     ST32(base, chr + 44u, static_cast<uint32_t>(-2 - linger));
+    g_lying[chr] = g_body_tick;
     return true;
   }
   const int32_t clock = static_cast<int32_t>(LD32(base, 0x82F1E710u));  // frames this tick
   const int32_t next = t + std::max(clock, 1);
   ST32(base, chr + 44u, static_cast<uint32_t>(next >= -1 ? 0 : next));
+  g_lying[chr] = g_body_tick;
   return true;
 }
 
@@ -4298,6 +4425,132 @@ void ge_stan_edge_tick(uint8_t* base) {
     if (LD16(base, e.addr) != want) ST16(base, e.addr, want);
   }
 }
+// Egyptian: the stone door models (cryptdoor1a..4: secret doors, the panels over
+// the four autoguns around the golden gun, the golden gun's pedestal) carry
+// vertex alpha 0 (some 0x3F/0x40) in Rare's files. The N64 ignored that alpha;
+// the 360 shader multiplies the output alpha by it and blends, so they drew
+// nothing while their collision worked (issue #19: "invisible walls", missing
+// textures). Their vertex buffers sit page-aligned in physical memory as copies
+// of the file's vertex block: find each block by its file bytes and make it opaque.
+namespace {
+struct CryptModel {
+  const char* rel;  // under assets
+  uint32_t size;    // stock file size, so other data is left alone
+  uint32_t offset;  // vertex block in the file (24-byte vertices, ARGB colour at +20)
+  uint32_t count;
+};
+constexpr CryptModel kCryptModels[] = {
+    {"files/original/prop/cryptdoor1a/default.bin", 31704, 0x708, 24},
+    {"files/new/prop/cryptdoor1a/default.bin", 31676, 0x6F4, 24},
+    {"files/original/prop/cryptdoor2a/default.bin", 31704, 0x708, 24},
+    {"files/new/prop/cryptdoor2a/default.bin", 31676, 0x6F4, 24},
+    {"files/original/prop/cryptdoor2b/default.bin", 31704, 0x708, 24},
+    {"files/new/prop/cryptdoor2b/default.bin", 31676, 0x6F4, 24},
+    {"files/original/prop/cryptdoor3/default.bin", 41072, 0x84C, 48},
+    {"files/new/prop/cryptdoor3/default.bin", 41044, 0x834, 48},
+    {"files/original/prop/cryptdoor4/default.bin", 22284, 0x5B8, 24},
+    {"files/new/prop/cryptdoor4/default.bin", 22268, 0x5AC, 24},
+};
+constexpr uint32_t kEgyptStage = 0x20u;
+constexpr uint32_t kVertexStride = 24u;
+
+std::filesystem::path ge_assets_root() {
+  std::filesystem::path root = rex::filesystem::GetExecutableFolder();
+  std::string name = root.filename().string();
+  for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (name == "runtime") root = root.parent_path();  // release: resources\runtime -> resources\assets
+  return root / "assets";
+}
+
+// The stock vertex blocks (read once from the player's files; empty if a file differs).
+const std::vector<std::vector<uint8_t>>& crypt_blocks() {
+  static std::vector<std::vector<uint8_t>> blocks;
+  static bool read = false;
+  if (read) return blocks;
+  read = true;
+  const std::filesystem::path root = ge_assets_root();
+  for (const CryptModel& m : kCryptModels) {
+    std::vector<uint8_t> block;
+    std::error_code ec;
+    const std::filesystem::path p = root / m.rel;
+    if (std::filesystem::file_size(p, ec) == m.size && !ec) {
+      if (FILE* f = _wfopen(p.c_str(), L"rb")) {
+        block.resize(m.count * kVertexStride);
+        if (std::fseek(f, static_cast<long>(m.offset), SEEK_SET) != 0 ||
+            std::fread(block.data(), 1, block.size(), f) != block.size())
+          block.clear();
+        std::fclose(f);
+      }
+    }
+    if (block.empty()) REXKRNL_WARN("GECRYPT {} not as expected: left alone", m.rel);
+    blocks.push_back(std::move(block));
+  }
+  return blocks;
+}
+
+// Scans the 0xA0000000 physical view (page starts only) for the stock blocks and
+// sets every vertex alpha to 0xFF. Returns how many blocks it changed.
+int crypt_patch_pass(uint8_t* base) {
+  const auto& blocks = crypt_blocks();
+  int changed = 0;
+  uint8_t* lo = base + 0xA0000000ull;
+  uint8_t* hi = base + 0xC0000000ull;
+  for (uint8_t* p = lo; p < hi;) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+    uint8_t* end = std::min(static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize, hi);
+    const DWORD prot = mbi.Protect & 0xFF;
+    const bool readable = mbi.State == MEM_COMMIT &&
+                          (prot == PAGE_READWRITE || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READWRITE ||
+                           prot == PAGE_EXECUTE_READ || prot == PAGE_WRITECOPY);
+    // Read-only pages here are the GPU caches' write watches: a store into them is
+    // caught and invalidates the cached copy, exactly as for the game's own stores.
+    if (readable) {
+      uint8_t* first = lo + ((static_cast<uint8_t*>(mbi.BaseAddress) - lo + 0xFFF) & ~uintptr_t(0xFFF));
+      for (uint8_t* q = first; q + 64 <= end; q += 0x1000) {
+        for (const auto& b : blocks) {
+          if (b.empty() || q + b.size() > end || std::memcmp(q, b.data(), b.size()) != 0) continue;
+          // Colour bytes are A, B, G, R. The see-through vertices also carry
+          // near-black colours (0x11-0x33): give them a warm stone grey that
+          // suits the temple; vertices that were already opaque keep theirs.
+          for (size_t v = 0; v < b.size(); v += kVertexStride) {
+            if (q[v + 20] >= 0x80) continue;
+            q[v + 20] = 0xFF;
+            q[v + 21] = 0x70;
+            q[v + 22] = 0x7C;
+            q[v + 23] = 0x88;
+          }
+          ++changed;
+          break;
+        }
+      }
+    }
+    p = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+  }
+  return changed;
+}
+}  // namespace
+
+// Each frame (input poll): in Egyptian, look for the stone door blocks soon after
+// the stage loads and every 2 s after (the other graphics mode loads its own copy).
+void ge_crypt_door_alpha_tick(uint8_t* base) {
+  static uint32_t frames = 0;
+  static uint32_t last_setup = 0;
+  if (LD32(base, GE_CURRENT_STAGE) != kEgyptStage) {
+    last_setup = 0;
+    return;
+  }
+  const uint32_t setup = LD32(base, 0x82F30398u);
+  if (setup != last_setup) {
+    last_setup = setup;
+    frames = 0;
+  }
+  ++frames;
+  if (frames != 2 && frames != 30 && frames % 120 != 0) return;
+  const int changed = crypt_patch_pass(base);
+  if (changed) REXKRNL_INFO("GECRYPT {} stone door vertex blocks made opaque", changed);
+}
+
 // Silo: the two missiles (model 93 on bound pads 10032/10033) reach up through
 // the walkway rooms around their shafts, but the level has no portals between
 // those rooms and the shafts, so each missile is only listed in its shaft's
@@ -4413,6 +4666,8 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   }
   ge_stan_edge_tick(base);
   ge_silo_missile_rooms_tick(base);
+  ge_corpse_slots_tick(base);
+  ge_crypt_door_alpha_tick(base);
 
   // Skip the boot screen that jokes about the Nintendo logo (menu 2, drawn by
   // sub_820ED378). The current menu is at 0x8272B35C and a requested change at
