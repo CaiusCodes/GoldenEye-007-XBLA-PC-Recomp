@@ -21,7 +21,8 @@ that it is the supported version and imports the game data from it into this
 folder. After that the package is not needed any more.
 
 Requirements:
-  Windows 10 or 11 (64-bit) and a DirectX 12 capable graphics card.
+  Windows 10 or 11 (64-bit) and a graphics card with DirectX 12 or Vulkan
+  (integrated laptop graphics such as Intel HD 620 or AMD Radeon work too).
   Nothing else needs installing: the Microsoft Visual C++ runtime the game
   uses is included.
 
@@ -45,8 +46,9 @@ FIRST-TIME SETUP
 From then on, opening "GoldenEye 007.exe" starts the game straight away.
 Setup only reads your package; it never changes, moves or deletes it, and
 it is not needed again. Nothing is installed outside this folder and no
-administrator rights are needed. It does not download anything and does
-not contact Xbox LIVE.
+administrator rights are needed. Setup does not download anything and
+nothing contacts Xbox LIVE. The only time the game goes online on its own
+behalf is when you choose Check for Updates (see UPDATING below).
 
 CONTROLS
 --------
@@ -79,12 +81,18 @@ Help & Options on the main menu holds the PC settings:
   Keyboard & Mouse   mouse look, sensitivity, precise aim sensitivity,
                      invert look, key bindings
   Video Settings     windowed or fullscreen, window size (up to 3840x2160),
-                     V-Sync, FPS counter, field of view, anti-aliasing,
-                     texture filtering, graphics API (Auto = Direct3D 12
-                     on NVIDIA, Vulkan on AMD and others), post-processing
+                     screen ratio (4:3, 16:9 or 21:9; the window sizes
+                     offered follow it), V-Sync, render scale (1x =
+                     1280x720 by default; 1.5x (new renderer), 2x and 3x
+                     look sharper, need a stronger graphics card and
+                     restart the game), upscaling (FSR or off), texture
+                     filtering, anti-aliasing (4x by default with the new
+                     renderer), post-processing
+                     (colour filter), field of view, FPS counter
   Online Settings    player name and the online server options
-
-Screen Ratio (Normal, 16:9 or 21:9) is in the game's own options.
+  Other Settings     the game's own options, Camera Bob (turn off the head
+                     bob while walking) and Run Setup Again
+  Check for Updates  asks GitHub for a newer version (see UPDATING)
 
 MULTIPLAYER OVER LAN OR A VIRTUAL LAN
 -------------------------------------
@@ -124,15 +132,30 @@ drive works too). To back up your progress, copy resources\userdata.
 SETUP AGAIN, UPDATING AND OLDER RELEASES
 ----------------------------------------
 
-To change your extras or import your package again, start the game with
---setup (for example from a shortcut whose target ends in
-"GoldenEye 007.exe" --setup). Importing again replaces resources\assets only;
+To change your extras or import your package again, open the setup window:
+hold Shift while opening GoldenEye 007.exe (or its shortcut), or choose
+Help & Options > Other Settings > Run Setup Again in the game. Starting
+GoldenEye 007.exe with --setup works too. Importing again replaces resources\assets only;
 saves and settings in resources\userdata are kept. If a needed file goes
 missing, opening GoldenEye 007.exe shows the setup window again by itself.
 
-To update, extract a new release over this folder (your resources\assets
-and resources\userdata are kept), or into a new folder: setup finds the old
-copy next to it and imports from it.
+UPDATING: Help & Options > Check for Updates asks this
+project's GitHub page (github.com/CaiusCodes/GoldenEye-007-XBLA-PC-Recomp)
+whether a newer release exists. Nothing is checked unless you choose it, and
+nothing is sent but that one request (no personal data). If there is a
+newer version, "Update Now" (from the main menu, not during a mission or a
+network game) closes the game and opens the update window, which downloads
+the release, checks it against the checksum GitHub publishes for it, and
+replaces only the program files: GoldenEye 007.exe, README.txt, licenses\
+and resources\runtime (not its logs). Your imported game data
+(resources\assets), saves, settings and caches (resources\userdata) are
+never touched, and no game data is ever downloaded. If anything goes wrong,
+the old files are put back. Then click Play. Details are in
+resources\runtime\logs\setup.log.
+
+To update by hand, extract a new release over this folder (your
+resources\assets and resources\userdata are kept), or into a new folder:
+setup finds the old copy next to it and imports from it.
 
 Coming from an older release (Setup GoldenEye 007.exe and a Game folder):
 extract this release into the old release folder or next to it. Setup finds
@@ -153,6 +176,33 @@ If setup rejects your package, the reason is shown in the window and in
 resources\runtime\logs\setup.log. When reporting a problem, include the
 newest files from resources\runtime\logs.
 
+Reporting slowdowns, stutter or freezes:
+  1. Close the game. Open resources\userdata\ge.toml in Notepad and add
+     this line:  performance_diagnostics = true
+  2. Start the game and do what shows the problem (for example stand
+     where the stutter happens for a minute or two), then close it.
+  3. Send the newest ge_NNN.log from resources\runtime\logs (sort the
+     folder by date). Its first lines list the settings and the PC's
+     graphics card; it holds no saves, passwords or file names of yours.
+  4. Change the line back to false (or delete it): the detailed log
+     writes more often and is only needed while reporting.
+The 20 newest logs are kept; older ones are deleted automatically.
+
+Reporting a character that gets stuck (an ally or enemy who should walk
+somewhere and doesn't, so the mission can't finish): do the same with
+npc_path_log = true instead, play until it happens, wait a minute, then
+close the game and send the newest log.
+
+The renderer: the game draws with its new native renderer. The first time
+each level loads, it translates the level's shaders on your PC, so that
+first load can take a moment longer; later loads are quick (the results
+are kept in resources\userdata\native_shaders). If the game shows wrong
+or missing graphics, black screens or crashes that the classic renderer
+of earlier versions did not, add this line to resources\userdata\ge.toml
+to go back to it, and please report the problem with the newest log:
+     gpu_native = false
+Delete the line again to return to the new renderer.
+
 LEGAL
 -----
 
@@ -169,3 +219,9 @@ package reader derived from Velocity and is licensed under the GNU GPL
 version 3 (licenses\LICENSE-Extract-STFS.txt); its source is in the project
 repository. The game in resources\runtime is a separate program under the
 Unlicense and MIT licences.
+
+resources\runtime also holds Microsoft's DirectX Shader Compiler, which the
+game uses to translate shaders on your PC: dxcompiler.dll (LLVM and MIT
+licences) and dxil.dll, which is Microsoft software redistributed under the
+Microsoft Software License Terms. By using it you agree to those terms, in
+licenses\LICENSE-MS-DirectXShaderCompiler.txt.

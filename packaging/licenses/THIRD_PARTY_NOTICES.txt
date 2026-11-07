@@ -35,6 +35,13 @@ STFS package reader                  GNU GPL version 3   LICENSE-Extract-STFS.tx
   (https://github.com/hetelek/Velocity). Its complete source is in the
   project repository (packaging/launcher). The game in resources\runtime is
   a separate program and is not covered by the GPL.
+stb_image (zlib inflate)             MIT / public domain   LICENSE-stb.txt
+  Also compiled into the launcher, which unpacks downloaded updates with it
+  (packaging/launcher/stb_image.h, by Sean Barrett).
+Windows HTTP Services (WinHTTP) and Cryptography API: Next Generation
+  Parts of Windows, used by the launcher and the game for Check for Updates
+  (asking GitHub for the latest release, checking the download's SHA-256).
+  Nothing is redistributed.
 
 Libraries compiled into rexruntime.dll / rexgpu-xenos.dll / the game
 --------------------------------------------------------------------
@@ -61,6 +68,9 @@ tiny-AES-c                           The Unlicense (public domain)
 DXBC checksum (AMD, MD5-derived)     free-for-all notice in its source
 FFmpeg (audio decoding)              LGPL 2.1 or later     LICENSE-FFmpeg-LGPL-2.1.txt
 libmspack                            LGPL 2.1              LICENSE-libmspack-LGPL-2.1.txt
+Plume (native renderer, D3D12)       MIT       LICENSE-Plume.txt
+XenosRecomp (native renderer shader translation)
+                                     MIT       LICENSE-XenosRecomp.txt
 
 FFmpeg and libmspack are used under the GNU Lesser General Public License.
 FFmpeg is built without its optional GPL components. Their complete source

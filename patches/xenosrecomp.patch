@@ -1,0 +1,157 @@
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..efa9e04 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -265,6 +265,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     {
+         constName = fmt::format("s{}", instr.constIndex);
+         constNamePtr = constName.c_str();
++        undeclaredSamplers.insert(instr.constIndex);
+     }
+ 
+ #ifdef UNLEASHED_RECOMP
+@@ -1187,6 +1188,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    samplerDefinesPos = out.size();
+     out += "\n#else\n\n";
+ 
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
+@@ -1241,6 +1243,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    samplerMembersPos = out.size();
+     out += "\tDEFINE_SHARED_CONSTANTS();\n";
+     out += "};\n\n";
+ 
+@@ -1611,6 +1614,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             uint32_t count = 0;
+             uint32_t sequence = 0;
+             bool shouldReturn = false;
++            bool condExecOpen = false;
+             bool shouldCloseCurlyBracket = false;
+ 
+             switch (cfInstr.opcode)
+@@ -1630,7 +1634,34 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 address = cfInstr.condExec.address;
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++                // GoldenEye: the block runs only while the bool constant equals the
++                // condition (cexec b129 / cexec !b129). It used to run unconditionally,
++                // so both halves of an if/else pair ran (the menu pixel shader
++                // multiplied its alpha by the texture twice).
++                if (count != 0)
++                {
++                    indent();
++                    const char* test = cfInstr.condExec.condition ? "!" : "=";
++                    auto findResult = boolConstants.find(cfInstr.condExec.boolAddress);
++                    if (findResult != boolConstants.end())
++                    {
++                        println("if ((g_Booleans & {}) {}= 0)", findResult->second, test);
++                    }
++                    else
++                    {
++                        uint32_t boolAddress = cfInstr.condExec.boolAddress;
++                        uint32_t bit = (boolAddress >= 128) ? (boolAddress - 128 + 16) : boolAddress;
++                        if (bit < 32)
++                            println("if ((g_Booleans & {}) {}= 0)", 1u << bit, test);
++                        else
++                            println("if (0 {}= 0)", test);
++                    }
++                    indent();
++                    out += "{\n";
++                    ++indentation;
++                    condExecOpen = true;
++                }
+                 break;
+ 
+             case ControlFlowOpcode::CondExecPred:
+@@ -1698,7 +1729,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         if (findResult != boolConstants.end())
+                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                         else
+-                            println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                        {
++                            // GoldenEye: bool registers missing from the constant table. Vertex
++                            // shaders use b0-b127 and pixel shaders b128-b255; g_Booleans packs
++                            // 16 of each the same way named ones are (pixel ones shifted by 16).
++                            uint32_t boolAddress = cfInstr.condJmp.boolAddress;
++                            uint32_t bit = (boolAddress >= 128) ? (boolAddress - 128 + 16) : boolAddress;
++                            if (bit < 32)
++                                println("if ((g_Booleans & {}) {}= 0)", 1u << bit, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                            else
++                                println("if (0 {}= 0)", cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                        }
+                     }
+ 
+                     if (simpleControlFlow)
+@@ -1792,6 +1833,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 instructionCode += 3;
+             }
+ 
++            if (condExecOpen)
++            {
++                --indentation;
++                indent();
++                out += "}\n";
++            }
++
+             if (shouldReturn)
+             {
+                 if (isPixelShader)
+@@ -1885,4 +1933,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #endif
+ 
+     out += "}";
++
++    // Undeclared samplers, laid out as declared ones with register index N.
++    if (!undeclaredSamplers.empty())
++    {
++        std::string defines, members;
++        for (uint32_t index : undeclaredSamplers)
++        {
++            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++            {
++                defines += fmt::format("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})\n",
++                    index, TEXTURE_DIMENSIONS[j], j * 64 + index * 4);
++                members += fmt::format("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});\n",
++                    index, TEXTURE_DIMENSIONS[j], j * 4 + index / 4, SWIZZLES[index % 4]);
++            }
++            defines += fmt::format("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})\n",
++                index, std::size(TEXTURE_DIMENSIONS) * 64 + index * 4);
++            members += fmt::format("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});\n",
++                index, 4 * std::size(TEXTURE_DIMENSIONS) + index / 4, SWIZZLES[index % 4]);
++        }
++        out.insert(samplerMembersPos, members);  // the later position first
++        out.insert(samplerDefinesPos, defines);
++    }
+ }
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..41af49f 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -3,6 +3,8 @@
+ #include "shader.h"
+ #include "shader_code.h"
+ 
++#include <set>
++
+ struct StringBuffer
+ {
+     std::string out;
+@@ -31,6 +33,11 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
+     std::unordered_map<uint32_t, const char*> boolConstants;
+     std::unordered_map<uint32_t, const char*> samplers;
++    // Samplers the code fetches from that the constant table doesn't list
++    // (GoldenEye has a pixel shader with an empty table): declared as sN at
++    // the end, at these places in the output.
++    std::set<uint32_t> undeclaredSamplers;
++    size_t samplerDefinesPos = 0, samplerMembersPos = 0;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
+ 

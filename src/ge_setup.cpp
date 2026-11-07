@@ -241,11 +241,12 @@ void GeSetupDialog::DrawGraphics(float /*width*/) {
   if (ImGui::Checkbox("Show FPS", &fps)) SetB("ge_show_fps", fps);
 
   Heading("QUALITY");
+  // ge_render_scale (ge_native_menu.cpp) sets the GPU plugin's resolution_scale
+  // once it is loaded; 1.5 would draw at 2x with the classic renderer.
   static const Choice kRes[] = {{"720p (1x, fastest)", "1"},
                                 {"1440p (2x)", "2"},
-                                {"2160p / 4K (3x)", "3"},
-                                {"2880p (4x)", "4"}};
-  CvarCombo("Internal Resolution", "resolution_scale", kRes, IM_ARRAYSIZE(kRes), 1);
+                                {"2160p / 4K (3x)", "3"}};
+  CvarCombo("Internal Resolution", "ge_render_scale", kRes, IM_ARRAYSIZE(kRes), 0);
   Hint("The 3D scene is rendered at this size. Lower it first if the game runs slowly.");
   static const Choice kAA[] = {{"Off", "none"}, {"FXAA", "fxaa"}, {"FXAA (Extreme)", "fxaa_extreme"}};
   CvarCombo("Anti-Aliasing", "swap_post_effect", kAA, IM_ARRAYSIZE(kAA));

@@ -22,6 +22,7 @@
 #include <SDL3/SDL.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <thread>
 
@@ -179,8 +180,9 @@ inline BOOL QueryPerformanceCounter(LARGE_INTEGER* c) {
 // The watchdog's guest stack dumps check the pages with VirtualQuery first;
 // without it they are simply left out.
 constexpr DWORD MEM_COMMIT = 0x1000;
-constexpr DWORD PAGE_READONLY = 0x02, PAGE_READWRITE = 0x04, PAGE_WRITECOPY = 0x08,
-                PAGE_EXECUTE_READ = 0x20, PAGE_EXECUTE_READWRITE = 0x40;
+constexpr DWORD PAGE_NOACCESS = 0x01, PAGE_READONLY = 0x02, PAGE_READWRITE = 0x04,
+                PAGE_WRITECOPY = 0x08, PAGE_EXECUTE_READ = 0x20, PAGE_EXECUTE_READWRITE = 0x40,
+                PAGE_GUARD = 0x100;
 struct MEMORY_BASIC_INFORMATION {
   void* BaseAddress;
   size_t RegionSize;
@@ -190,5 +192,13 @@ struct MEMORY_BASIC_INFORMATION {
 inline size_t VirtualQuery(const void*, MEMORY_BASIC_INFORMATION*, size_t) { return 0; }
 
 inline void Sleep(DWORD ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+// _wfopen(path.c_str(), L"rb") for std::filesystem paths, whose c_str() is a
+// char string outside Windows. Modes are plain ASCII.
+inline FILE* _wfopen(const char* path, const wchar_t* mode) {
+  char narrow[8] = {};
+  for (size_t i = 0; i + 1 < sizeof(narrow) && mode[i]; ++i) narrow[i] = static_cast<char>(mode[i]);
+  return std::fopen(path, narrow);
+}
 
 #endif  // _WIN32

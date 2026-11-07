@@ -14,14 +14,19 @@
 #include <atomic>
 #include <cmath>
 #include <deque>
+#include <unordered_map>
 #include <vector>
+#include <filesystem>
 #include <functional>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+#include "ge_gpu_detect.h"  // DisplayRefreshHz
 #include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
+#include <rex/logging/api.h>  // FlushLogging (crash / closing lines)
+#include <rex/kernel/xam/ge_online_control.h>  // GeNetworkGameActive
 #include <rex/ui/keybinds.h>     // ParseVirtualKey (keyboard rebinding)
 #include <rex/ui/virtual_key.h>
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
@@ -29,19 +34,28 @@
 #include <rex/system/xmemory.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/ui/presenter.h>  // SetFatalGpuLossHook
 #include <rex/system/xthread.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <cstdio>
+#include <csignal>
+#include <cstdlib>
 #include "ge_win32_compat.h"  // <windows.h>, or its SDL3 stand-in elsewhere
 #if defined(_WIN32)
 #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
+#include <winevt.h>    // EvtQuery: Windows' crash records, copied into the log
+#pragma comment(lib, "wevtapi.lib")
 #else
 #include <spawn.h>
 #include <rex/filesystem.h>  // GetExecutablePath (relaunch)
 extern char** environ;
 #endif
 #include <string>
+#include <set>
+#include <rex/filesystem.h>
+#include <unordered_map>
+#include <filesystem>
 
 // Replaces the unsupported `bc 20,lt,0x820F285C` at 0x820F2838. BO=20 makes
 // this an unconditional branch; ge_config.toml supplies the explicit target.
@@ -55,6 +69,8 @@ void ge_fix_mp_menu_branch() {
 // The game window (found when it has focus); defined with the mouse code.
 HWND g_game_hwnd_for_resize();
 namespace ge { void ApplyPlayerName(const std::string& requested); }
+namespace ge { void PersistSettings(); }  // ge_native_menu.cpp: save ge.toml
+namespace ge { bool NativeRendererActive(); }  // ge_native_menu.cpp: fixed for the run
 namespace ge { void TestEnterText(const std::string& text); }  // ge_native_menu.cpp
 namespace ge { void TestToggleReady(); void LobbyPollTick(uint8_t* base, uint32_t menu); }  // ge_native_menu.cpp
 namespace { void ge_rename_tick(PPCContext& ctx, uint8_t* base); }  // below: a new player name
@@ -160,6 +176,12 @@ void RestartSelf() {
   LaunchSelfDetached();
   _exit(0);
 }
+
+// No crash records to collect and no release launcher outside Windows: the
+// Run Setup Again row and Check for Updates stay hidden (empty launcher path).
+void InstallCrashLog() {}
+std::wstring LauncherPath() { return {}; }
+void RunSetupAgain() {}
 #else
 void LaunchSelfDetached() {
   wchar_t exe_path[MAX_PATH];
@@ -205,11 +227,198 @@ void ResizeGameWindow(int w, int h) {
   SetWindowPos(hwnd, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// How the game ended, as the log's last line: a restart or setup (a normal
+// close ends with the SDK's own lines), or (for a crash, which otherwise just cut the log off) the exception
+// and where it happened. The SDK's own vectored handler sees faults first and
+// handles the expected ones; this filter only runs for a real crash.
+void RestartSelf();
+void NativeReportDeviceLost();  // ge_native_gpu.cpp
+bool NativeDeviceLost();
+void NativeEnableDred();
+namespace {
+// The device loss is seen by the presenter's hook and, when drawing faults on
+// the lost device, by the crash filter: the first one restarts the game.
+void restart_after_device_loss(const char* how) {
+  static std::atomic<bool> restarting{false};
+  if (restarting.exchange(true)) {
+    Sleep(INFINITE);  // the other thread is restarting the game
+  }
+  REXLOG_ERROR("Graphics device lost ({}): restarting the game", how);
+  rex::FlushLogging();
+  NativeReportDeviceLost();
+  RestartSelf();
+}
+LONG WINAPI ge_crash_filter(EXCEPTION_POINTERS* ep) {
+  const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+  HMODULE mod = nullptr;
+  wchar_t path[MAX_PATH] = L"?";
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         static_cast<LPCWSTR>(r->ExceptionAddress), &mod))
+    GetModuleFileNameW(mod, path, MAX_PATH);
+  const uintptr_t at = reinterpret_cast<uintptr_t>(r->ExceptionAddress);
+  const std::string module = std::filesystem::path(path).filename().string();
+  if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
+    REXLOG_ERROR("Game crashed: access violation ({} address {:X}) at {}+0x{:X}, thread {}",
+                 r->ExceptionInformation[0] == 1 ? "writing" : r->ExceptionInformation[0] == 8 ? "running" : "reading",
+                 r->ExceptionInformation[1], module, at - reinterpret_cast<uintptr_t>(mod),
+                 GetCurrentThreadId());
+  } else {
+    REXLOG_ERROR("Game crashed: exception {:08X} at {}+0x{:X}, thread {}", r->ExceptionCode, module,
+                 at - reinterpret_cast<uintptr_t>(mod), GetCurrentThreadId());
+  }
+  rex::FlushLogging();
+  if (NativeDeviceLost()) restart_after_device_loss("a fault while drawing on it");
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+void log_closing(const char* why) {
+  REXLOG_INFO("Game {}", why);
+  rex::FlushLogging();
+}
+// Ends the C runtime takes without an exception the filter above sees: abort()
+// (std::terminate, an uncaught exception on a noexcept path), a bad argument to
+// a CRT function, a pure virtual call. Each logs, then ends the game as before.
+void ge_abort_signal(int) {
+  REXLOG_ERROR("Game crashed: abort (std::terminate or a failed check), thread {}", GetCurrentThreadId());
+  rex::FlushLogging();
+}
+void ge_invalid_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {
+  REXLOG_ERROR("Game crashed: invalid argument to a C runtime function, thread {}", GetCurrentThreadId());
+  rex::FlushLogging();
+  __fastfail(FAST_FAIL_INVALID_ARG);
+}
+void ge_purecall() {
+  REXLOG_ERROR("Game crashed: pure virtual call, thread {}", GetCurrentThreadId());
+  rex::FlushLogging();
+  __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+// Windows' own records of earlier ends (the last 7 days), copied into this log so
+// a player only has to send the log: Application Error / Windows Error
+// Reporting entries naming the game (exception code, faulting module), and
+// display driver resets (4101 "display driver stopped responding").
+std::string event_summary(EVT_HANDLE ev) {
+  DWORD used = 0, props = 0;
+  EvtRender(nullptr, ev, EvtRenderEventXml, 0, nullptr, &used, &props);
+  std::wstring xml(used / sizeof(wchar_t) + 1, L'\0');
+  if (!EvtRender(nullptr, ev, EvtRenderEventXml, DWORD(xml.size() * sizeof(wchar_t)), xml.data(), &used, &props))
+    return {};
+  auto narrow = [](std::wstring_view w) {
+    std::string s;
+    for (wchar_t c : w) s += c < 128 ? char(c) : '?';
+    return s;
+  };
+  auto attr = [&](std::wstring_view tag, std::wstring_view name) -> std::string {
+    const size_t t = xml.find(tag);
+    if (t == std::wstring::npos) return {};
+    const size_t a = xml.find(std::wstring(name) + L"='", t);
+    if (a == std::wstring::npos) return {};
+    const size_t b = a + name.size() + 2, e = xml.find(L'\'', b);
+    return narrow(std::wstring_view(xml).substr(b, e - b));
+  };
+  auto element = [&](std::wstring_view tag) -> std::string {
+    const size_t t = xml.find(std::wstring(L"<") + std::wstring(tag) + L">");
+    if (t == std::wstring::npos) return {};
+    const size_t b = t + tag.size() + 2, e = xml.find(L'<', b);
+    return narrow(std::wstring_view(xml).substr(b, e - b));
+  };
+  std::string out = attr(L"<TimeCreated", L"SystemTime") + " " + attr(L"<Provider", L"Name") + " event " +
+                    element(L"EventID") + ":";
+  for (size_t p = xml.find(L"<Data"); p != std::wstring::npos && out.size() < 900; p = xml.find(L"<Data", p + 1)) {
+    const size_t gt = xml.find(L'>', p);
+    if (gt == std::wstring::npos || xml[gt - 1] == L'/') continue;  // empty <Data/>
+    const size_t end = xml.find(L"</Data>", gt);
+    if (end == std::wstring::npos) break;
+    std::string v = narrow(std::wstring_view(xml).substr(gt + 1, end - gt - 1));
+    if (v.empty()) continue;
+    if (v.size() > 160) v = v.substr(0, 160) + "...";
+    out += " | " + v;
+  }
+  return out;
+}
+
+void log_windows_events(const wchar_t* channel, const wchar_t* query, const char* must_contain) {
+  EVT_HANDLE q = EvtQuery(nullptr, channel, query, EvtQueryChannelPath | EvtQueryReverseDirection);
+  if (!q) return;
+  EVT_HANDLE evs[16];
+  DWORD n = 0;
+  int logged = 0;
+  while (logged < 8 && EvtNext(q, 16, evs, 1000, 0, &n)) {
+    for (DWORD i = 0; i < n; ++i) {
+      if (logged < 8) {
+        const std::string s = event_summary(evs[i]);
+        if (!s.empty() && (!must_contain || s.find(must_contain) != std::string::npos)) {
+          REXLOG_INFO("Windows log: {}", s);
+          ++logged;
+        }
+      }
+      EvtClose(evs[i]);
+    }
+  }
+  EvtClose(q);
+  if (!logged) REXLOG_INFO("Windows log: no matching {} entries in the last 7 days", must_contain ? "game crash" : "display driver");
+}
+}  // namespace
+
+void InstallCrashLog() {
+  // The graphics device lost (a GPU hang the driver reset, as on an HD 620 in
+  // Dam): the presenter would abort with nothing in the log. Log why (the
+  // native renderer adds D3D12's breadcrumbs), then start the game again.
+  NativeEnableDred();
+  rex::ui::Presenter::SetFatalGpuLossHook([](bool is_responsible) {
+    restart_after_device_loss(is_responsible ? "reset by a bad command" : "removed");
+  });
+  std::thread([] {
+    // 1000 Application Error, 1001 Windows Error Reporting, 1002 Application Hang.
+    log_windows_events(L"Application",
+                       L"*[System[(EventID=1000 or EventID=1001 or EventID=1002) and "
+                       L"TimeCreated[timediff(@SystemTime) <= 604800000]]]",
+                       "GoldenEye 007.exe");
+    // 4101 display driver stopped responding and recovered; 4116/4117 it failed to.
+    log_windows_events(L"System",
+                       L"*[System[(EventID=4101 or EventID=4116 or EventID=4117) and "
+                       L"TimeCreated[timediff(@SystemTime) <= 604800000]]]",
+                       nullptr);
+    rex::FlushLogging();
+  }).detach();
+  SetUnhandledExceptionFilter(ge_crash_filter);
+  std::signal(SIGABRT, ge_abort_signal);
+  _set_invalid_parameter_handler(ge_invalid_parameter);
+  _set_purecall_handler(ge_purecall);
+}
+
 void RestartSelf() {
   LaunchSelfDetached();
+  log_closing("restarting (settings change)");
   TerminateProcess(GetCurrentProcess(), 0);
   for (;;) {
   }
+}
+
+// The release launcher, <release>\GoldenEye 007.exe, when this game runs from
+// <release>\resources\runtime; empty in a dev build (no launcher).
+std::wstring LauncherPath() {
+  wchar_t exe_path[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return {};
+  const std::filesystem::path runtime = std::filesystem::path(exe_path).parent_path();
+  const std::filesystem::path resources = runtime.parent_path();
+  if (_wcsicmp(runtime.filename().c_str(), L"runtime") != 0 ||
+      _wcsicmp(resources.filename().c_str(), L"resources") != 0)
+    return {};
+  const std::filesystem::path launcher = resources.parent_path() / L"GoldenEye 007.exe";
+  std::error_code ec;
+  return std::filesystem::is_regular_file(launcher, ec) ? launcher.wstring() : std::wstring();
+}
+
+// Help & Options > Video Settings > Run Setup Again: open the launcher's setup
+// window and end the game (settings are saved by the caller).
+void RunSetupAgain() {
+  const std::wstring launcher = LauncherPath();
+  if (launcher.empty()) return;
+  const std::wstring folder = std::filesystem::path(launcher).parent_path().wstring();
+  ShellExecuteW(nullptr, L"open", launcher.c_str(), L"--setup", folder.c_str(), SW_SHOWNORMAL);
+  log_closing("closing to run setup again");
+  TerminateProcess(GetCurrentProcess(), 0);
 }
 #endif  // _WIN32
 }  // namespace ge
@@ -218,6 +427,8 @@ void RestartSelf() {
 // derived class may touch protected base members; we only reinterpret an
 // existing CP* and call a non-virtual accessor -- no construction, no
 // vtable use, layout-compatible single inheritance).
+REXCVAR_DECLARE(bool, gpu_native);  // ge_native_gpu.cpp
+
 namespace {
 struct CPProbe : rex::graphics::CommandProcessor {
   uint32_t rpi() const { return read_ptr_index_; }
@@ -228,13 +439,18 @@ struct CPProbe : rex::graphics::CommandProcessor {
 std::atomic<uint32_t> g_present_cpcnt{0};
 // Guest tick at the last present, for a bounded completion wait.
 std::atomic<uint32_t> g_present_tb{0};
+// vblank_timing_log slow-frame report: GPU waits since the last present.
+std::atomic<uint64_t> g_hitch_gpu_wait_us{0};
+std::atomic<uint64_t> g_hitch_gpu_wait_max_us{0};
+std::atomic<uint32_t> g_hitch_watchdog{0};
 inline rex::graphics::CommandProcessor* ge_cp() {
   auto* ks = rex::system::kernel_state();
   if (!ks) return nullptr;
   auto* rt = ks->emulator();
   if (!rt) return nullptr;
   auto* igs = rt->graphics_system();
-  if (!igs) return nullptr;
+  // Native mode: the presenter-only graphics system has no command processor.
+  if (!igs || ge::NativeRendererActive()) return nullptr;
   return static_cast<rex::graphics::GraphicsSystem*>(igs)->command_processor();
 }
 inline rex::graphics::GraphicsSystem* ge_gs() {
@@ -243,7 +459,7 @@ inline rex::graphics::GraphicsSystem* ge_gs() {
   auto* rt = ks->emulator();
   if (!rt) return nullptr;
   auto* igs = rt->graphics_system();
-  if (!igs) return nullptr;
+  if (!igs || ge::NativeRendererActive()) return nullptr;
   return static_cast<rex::graphics::GraphicsSystem*>(igs);
 }
 }  // namespace
@@ -303,6 +519,299 @@ std::atomic<uint32_t> g_ge_device{0};   // device struct (dev) seen by ge_dbg_no
 std::atomic<uint32_t> g_ge_idblk{0};    // id-block (idblk) seen by ge_dbg_now
 std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
 
+// Game clock vs display. The game's clock is the 60 Hz guest vblank, but many
+// "60 Hz" displays really run at 59.94 Hz or 60.1 Hz. The two then drift
+// apart and every few seconds one frame is shown twice or skipped (a gap of
+// 0.12 Hz is one hitch every 8-9 s). The display's exact refresh rate is
+// logged (once, and when it changes) so a report shows it.
+// ge_match_display_refresh (on by default; held at 60 during LAN / online
+// games so every machine keeps the same clock): when the display
+// runs within 1% of 60 Hz (or of 120, 180 or 240), run the vblank at its exact
+// rate instead (a speed change of at most 1%, normally 0.1%). Other rates
+// (144 Hz, G-Sync / FreeSync screens reporting their maximum) keep 60.
+REXCVAR_DEFINE_BOOL(ge_match_display_refresh, true, "Video",
+                    "Run the game clock at a ~60 Hz display's exact refresh rate (off: always 60 Hz)");
+// performance_diagnostics (vblank_timing_log): log NVIDIA memory clock and
+// performance-state changes, sampled every 250 ms. A driver that keeps
+// switching the memory clock because the game loads the GPU lightly stalls the
+// GPU briefly at each switch, which shows as a regular judder.
+void ge_log_gpu_clock_changes() {
+  static uint32_t poll = 0;
+  static bool on = false;
+  if ((poll++ % 8) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+  if (!on) return;
+  unsigned memory_mhz = 0, graphics_mhz = 0;
+  int pstate = -1;
+  if (!ge::NvidiaGpuClocks(memory_mhz, graphics_mhz, pstate)) return;
+  static unsigned last_memory = 0;
+  static int last_pstate = -1;
+  static uint32_t changes = 0, window_start = 0, suppressed = 0;
+  if (memory_mhz == last_memory && pstate == last_pstate) return;
+  if (poll - window_start >= 240) {  // at most 40 lines a minute
+    if (suppressed) REXKRNL_INFO("ge gpu clock: {} more changes not logged", suppressed);
+    window_start = poll;
+    changes = suppressed = 0;
+  }
+  if (++changes <= 40) {
+    REXKRNL_INFO("ge gpu clock: memory {} MHz, graphics {} MHz, P{}", memory_mhz, graphics_mhz,
+                 pstate);
+  } else {
+    ++suppressed;
+  }
+  last_memory = memory_mhz;
+  last_pstate = pstate;
+}
+
+void ge_match_display_refresh() {
+  static double logged_hz = -1.0, applied = -1.0;
+  HWND hwnd = g_game_hwnd_for_resize();
+  const double hz = hwnd ? ge::DisplayRefreshHz(hwnd) : 0.0;
+  if (hz > 0.0 && std::fabs(hz - logged_hz) > 0.0005) {
+    logged_hz = hz;
+    REXKRNL_INFO("Display refresh: {:.3f} Hz", hz);
+  }
+  // Never during a LAN / online game: every machine in a match must run the
+  // same 60 Hz clock, whatever its display.
+  static bool logged_net = false;
+  const bool net_game = rex::kernel::xam::GeNetworkGameActive();
+  if (net_game != logged_net) {
+    logged_net = net_game;
+    REXKRNL_INFO("Network game {}: game clock {}", net_game ? "started" : "ended",
+                 net_game ? "held at 60 Hz" : "may follow the display again");
+  }
+  double rate = 0.0;
+  if (REXCVAR_GET(ge_match_display_refresh) && !net_game) {
+    const double n = std::round(hz / 60.0);
+    if (hz > 0.0 && n >= 1.0 && n <= 4.0 && std::fabs(hz / n - 60.0) <= 0.6) rate = hz / n;
+  }
+  if (std::fabs(rate - 60.0) < 0.0005) rate = 0.0;  // exactly 60: nothing to do
+  if (rate == applied) return;
+  applied = rate;
+  rex::cvar::SetFlagByName("vblank_rate_hz", fmt::format("{:.6f}", rate));
+  if (rate > 0.0) {
+    REXKRNL_INFO("Game clock follows the display: {:.3f} Hz", rate);
+  } else {
+    REXKRNL_INFO("Game clock: 60 Hz");
+  }
+}
+
+// npc_path_log (ge.toml, off by default): for bug reports about characters
+// that get stuck. Once a second the watchdog thread reads every character
+// (read only) and logs (a) each change of the AI script it runs, and (b) any
+// character that has not moved for 15 seconds while it is running or walking
+// to a position, with its position, action, script and step. XBLA layout: chr prop
+// (type 3) +0x08 = chr, +0x0C position; chr +0x00 number, +0x07 action,
+// +0x18 prop, +0x104 AI list, +0x108 step.
+REXCVAR_DEFINE_BOOL(npc_path_log, false, "Diagnostics",
+                    "Log characters that get stuck and the AI scripts they run (for bug reports)");
+
+namespace {
+uint32_t ge_level_ai_table(uint8_t* base, uint32_t stage) {
+  // Level table records: +0x00 id, +0x04 name, +0x18 single-player setup;
+  // the setup header's +0x14 is the AI list table ({list, id} pairs).
+  for (uint32_t a = 0x82857E00u; a < 0x82858800u; a += 4) {
+    if (LD32(base, a) != stage) continue;
+    const uint32_t name = LD32(base, a + 4), setup = LD32(base, a + 0x18);
+    if (name < 0x82000000u || name >= 0x82010000u) continue;
+    if (setup < 0x82C00000u || setup >= 0x82E80000u) continue;
+    return LD32(base, setup + 0x14);
+  }
+  return 0;
+}
+// AI list id containing `ptr` (the nearest list start at or below it).
+uint32_t ge_ai_list_id(uint8_t* base, uint32_t table, uint32_t ptr, uint32_t* start) {
+  uint32_t best = 0, best_id = 0xFFFFFFFFu;
+  for (int i = 0; table && i < 512; ++i) {
+    const uint32_t lp = LD32(base, table + i * 8), id = LD32(base, table + i * 8 + 4);
+    if (!lp) break;
+    if (lp <= ptr && lp > best) { best = lp; best_id = id; }
+  }
+  if (start) *start = best;
+  return best_id;
+}
+}  // namespace
+
+void ge_log_npc_paths(uint8_t* base) {
+  static uint32_t poll = 0;
+  static bool on = false;
+  if ((poll++ % 16) == 0) on = REXCVAR_GET(npc_path_log);
+  if (!on || (poll % 4) != 0) return;  // once a second
+  struct Npc {
+    float x = 0, y = 0, z = 0;
+    uint32_t still = 0;     // seconds without moving
+    uint32_t list = 0;      // AI list pointer last seen
+    int reported = 0;       // stuck lines logged for this stop (at 15 s and 60 s)
+  };
+  static std::unordered_map<uint32_t, Npc> npcs;
+  static uint32_t stage_seen = 0, table = 0;
+  static uint32_t lines = 0, minute = 0;
+  const uint32_t stage = LD32(base, 0x82423E00u);
+  if (stage != stage_seen) {
+    stage_seen = stage;
+    npcs.clear();
+    table = stage == 90u ? 0 : ge_level_ai_table(base, stage);
+    if (table) REXKRNL_INFO("ge npc: stage {}, AI list table {:08X}", stage, table);
+  }
+  if (!table) return;
+  if (++minute >= 60) { minute = 0; lines = 0; }
+  const uint32_t pl = LD32(base, 0x82F1FA98u);
+  uint32_t prop = pl ? LD32(base, pl + 0x1ACu) : 0;
+  // Props live in the game image's heap and characters in its 0x4xxxxxxx
+  // heap; anything else (a list being changed under us) ends the walk.
+  auto prop_ok = [](uint32_t p) { return p >= 0x82000000u && p < 0x83200000u; };
+  if (!prop_ok(prop)) return;
+  for (int i = 0; i < 2000 && prop_ok(LD32(base, prop + 0x2Cu)); ++i) prop = LD32(base, prop + 0x2Cu);
+  for (int i = 0; i < 2000 && prop_ok(prop); ++i, prop = LD32(base, prop + 0x28u)) {
+    if (base[prop] != 3) continue;
+    const uint32_t chr = LD32(base, prop + 0x08u);
+    if (chr < 0x40000000u || chr >= 0x50000000u || LD32(base, chr + 0x18u) != prop) continue;
+    const int num = static_cast<int16_t>(LD16(base, chr));
+    const uint32_t action = base[chr + 7];
+    const uint32_t list = LD32(base, chr + 0x104u);
+    const uint32_t step = LD16(base, chr + 0x108u);
+    const float x = LDF32(base, prop + 0x0Cu), y = LDF32(base, prop + 0x10u),
+                z = LDF32(base, prop + 0x14u);
+    Npc& n = npcs[chr];
+    uint32_t list_start = 0;
+    if (list != n.list) {
+      if (n.list && lines < 60) {
+        ++lines;
+        REXKRNL_INFO("ge npc: chr {} now on AI list {:04X} (action {}, at {:.0f},{:.0f},{:.0f})",
+                     num, ge_ai_list_id(base, table, list, nullptr), action, x, y, z);
+      }
+      n.list = list;
+    }
+    const float moved = std::fabs(x - n.x) + std::fabs(y - n.y) + std::fabs(z - n.z);
+    n.x = x; n.y = y; n.z = z;
+    // Running or walking to a position (N64 action numbers 13 and 15, which
+    // XBLA keeps). Patrols (14) are left out: a patrol out of view jumps from
+    // point to point and sits still in between, which looked stuck.
+    const bool moving_action = action == 13 || action == 15;
+    if (moved > 2.f || !moving_action) {
+      n.still = 0;
+      n.reported = 0;
+      continue;
+    }
+    // Out of view, the game moves characters from point to point with pauses,
+    // so a 15 s stop can be normal; one still stopped at 60 s is stuck.
+    ++n.still;
+    if (((n.still >= 15 && n.reported == 0) || (n.still >= 60 && n.reported == 1)) && lines < 60) {
+      ++n.reported;
+      ++lines;
+      const uint32_t id = ge_ai_list_id(base, table, list, &list_start);
+        const uint32_t cmd = list >= 0x82000000u && list < 0x83200000u ? base[list + step] : 0;
+      REXKRNL_INFO("ge npc stuck: chr {} has not moved for {} s at {:.0f},{:.0f},{:.0f}; action {}, "
+                   "AI list {:04X} step {} (command {:02X})",
+                   num, n.still, x, y, z, action, id, step, cmd);
+    }
+  }
+}
+
+// Dam, classic graphics: five triangles of the mountain model (original\
+// background\dam\default.bin's first mesh, a triangle soup of 24-byte vertices)
+// stand out of the ridges: triangle 22 (vertices at file offset 0x763C) as a
+// long spike across the sky from the base below the tower, 19-21 as a thin fin
+// above that peak, and the one at vertex 1395 as a flat blue band across the
+// far mountains (its third point lies ~1800 units east of its neighbours).
+// They are collapsed here once the level data is in memory: each one's second
+// and third points are moved onto its first, so it covers no pixels. Found by
+// hiding the frame's triangles one by one (gpu_native_hide) at each spot.
+namespace {
+constexpr uint8_t kDamSpike[4 * 72] = {
+    0x45, 0x82, 0x3C, 0x00, 0x44, 0xAF, 0x00, 0x02, 0xC4, 0x1B, 0xF0, 0x01, 0x05, 0x42, 0x5A, 0x1F, 0x00, 0x71,
+    0xFF, 0xFD, 0xFF, 0xB0, 0xC0, 0xCD, 0x45, 0x81, 0x60, 0x00, 0x44, 0xED, 0x80, 0x02, 0xC4, 0xCF, 0xF8, 0x01,
+    0x05, 0x42, 0x5A, 0x1F, 0xFF, 0xFF, 0xFF, 0xCD, 0xFF, 0xFF, 0xFF, 0xFF, 0x45, 0x76, 0xB8, 0x00, 0x44, 0x3B,
+    0x80, 0x02, 0xC4, 0x34, 0x50, 0x01, 0x05, 0x42, 0x5A, 0x1F, 0x00, 0x70, 0x00, 0x32, 0xFF, 0x6C, 0x75, 0x7D,
+    0x45, 0x82, 0x3C, 0x00, 0x44, 0xAF, 0x00, 0x02, 0xC4, 0x1B, 0xF0, 0x01, 0x2B, 0x82, 0xA2, 0x9F, 0x00, 0x71,
+    0xFF, 0xFD, 0xFF, 0xB0, 0xC0, 0xCD, 0x45, 0x76, 0xB8, 0x00, 0x44, 0x3B, 0x80, 0x02, 0xC4, 0x34, 0x50, 0x01,
+    0x2B, 0x82, 0xA2, 0x9F, 0x00, 0x70, 0x00, 0x32, 0xFF, 0x6C, 0x75, 0x7D, 0x45, 0x67, 0x40, 0x00, 0x44, 0x8F,
+    0xC0, 0x01, 0xC3, 0x7A, 0x00, 0x00, 0x2B, 0x82, 0xA2, 0x9F, 0x00, 0x9A, 0x00, 0x17, 0xFF, 0x33, 0x33, 0x33,
+    0x45, 0x70, 0xA0, 0x00, 0x44, 0x61, 0x00, 0x00, 0x42, 0xFA, 0x00, 0x00, 0x11, 0xB6, 0xA4, 0x00, 0x00, 0x24,
+    0x01, 0x6E, 0xFF, 0xEC, 0xEC, 0xEC, 0x45, 0x82, 0x3C, 0x00, 0x44, 0xAF, 0x00, 0x02, 0xC4, 0x1B, 0xF0, 0x01,
+    0x11, 0xB6, 0xA4, 0x00, 0x00, 0xEF, 0x01, 0xFF, 0xFF, 0xB0, 0xC0, 0xCD, 0x45, 0x67, 0x40, 0x00, 0x44, 0x8F,
+    0xC0, 0x01, 0xC3, 0x7A, 0x00, 0x00, 0x11, 0xB6, 0xA4, 0x00, 0x00, 0xA4, 0x01, 0x6E, 0xFF, 0x33, 0x33, 0x33,
+    0x45, 0x70, 0xA0, 0x00, 0x44, 0x61, 0x00, 0x00, 0x42, 0xFA, 0x00, 0x00, 0x13, 0x95, 0x8F, 0x41, 0x00, 0x24,
+    0x01, 0x6E, 0xFF, 0xEC, 0xEC, 0xEC, 0x45, 0x67, 0x40, 0x00, 0x44, 0x8F, 0xC0, 0x01, 0xC3, 0x7A, 0x00, 0x00,
+    0x13, 0x95, 0x8F, 0x41, 0x00, 0xA4, 0x01, 0x6E, 0xFF, 0x33, 0x33, 0x33, 0x45, 0x43, 0x50, 0x00, 0x43, 0xC8,
+    0x00, 0x00, 0x43, 0x7A, 0x00, 0x00, 0x13, 0x95, 0x8F, 0x41, 0x00, 0x00, 0x00, 0x81, 0xFF, 0x75, 0x80, 0x89};
+constexpr uint8_t kDamBand[72] = {
+    0x45, 0x87, 0x64, 0x00, 0x44, 0xEF, 0x60, 0x02, 0xC5, 0x41, 0x5C, 0x01, 0x11, 0x76, 0xAC, 0x13, 0x00, 0x2C,
+    0x00, 0x1E, 0xFF, 0xFF, 0xFF, 0xFF, 0x45, 0x8F, 0x20, 0x00, 0x44, 0xA8, 0xC0, 0x02, 0xC5, 0x0C, 0x8C, 0x00,
+    0x11, 0x76, 0xAC, 0x13, 0x00, 0x08, 0x00, 0x2F, 0xFF, 0x11, 0x11, 0x11, 0x45, 0xC6, 0x42, 0x42, 0x44, 0xB2,
+    0x92, 0x59, 0xC5, 0x1B, 0xA2, 0x21, 0x11, 0x76, 0xAC, 0x13, 0x00, 0x0D, 0x00, 0x17, 0xFF, 0x11, 0x11, 0x11};
+struct DamFix {
+  const uint8_t* bytes;
+  size_t size;  // a whole number of triangles (72 bytes each)
+};
+constexpr DamFix kDamFixes[] = {{kDamSpike, sizeof(kDamSpike)}, {kDamBand, sizeof(kDamBand)}};
+
+// Patches every copy of every run in the committed parts of [lo, lo + size) of
+// guest memory; returns the number of runs patched.
+int ge_patch_dam_spike_in(uint8_t* base, uint32_t lo, uint32_t size) {
+  int patched = 0;
+  uint8_t* p = base + lo;
+  uint8_t* const end = p + size;
+  while (p < end) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+    uint8_t* const region_end = std::min(end, static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize);
+    const bool readable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                          (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE));
+    if (readable) {
+      // Vertex data is 4-byte aligned; each run's first word is rare.
+      for (uint8_t* q = p; q + 72 <= region_end; q += 4) {
+        for (const DamFix& fix : kDamFixes) {
+          if (std::memcmp(q, fix.bytes, 4) != 0 || q + fix.size > region_end) continue;
+          if (std::memcmp(q, fix.bytes, fix.size) != 0) continue;
+          for (size_t t = 0; t < fix.size; t += 72) {
+            std::memcpy(q + t + 24, q + t, 12);
+            std::memcpy(q + t + 48, q + t, 12);
+          }
+          ++patched;
+        }
+      }
+    }
+    p = region_end;
+  }
+  return patched;
+}
+
+// Each time Dam (stage 33) is entered, the copy the GPU draws from (physical
+// memory, seen at 0xA0000000+; the level loads both backgrounds) is searched
+// every two seconds on a thread of its own until it is found and patched
+// (a search takes ~0.2 s).
+void ge_fix_dam_spike(uint8_t* base) {
+  static uint32_t last_stage = 0;
+  static int found = 0;  // runs patched since Dam was entered
+  const uint32_t stage = LD32(base, 0x82423E00u);
+  if (stage != last_stage) {
+    last_stage = stage;
+    found = 0;
+  }
+  if (stage != 33u || found >= int(std::size(kDamFixes))) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  const int n = ge_patch_dam_spike_in(base, 0xA0000000u, 0x20000000u);
+  if (n) {
+    found += n;
+    REXKRNL_INFO("GEDAMSPIKE collapsed {} of the mountain's stray triangle runs (search {:.0f} ms)", n,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  }
+}
+}  // namespace
+
+// Started from the per-frame input hook, alongside the mouse thread.
+void ge_start_dam_spike_fix_once(uint8_t* base) {
+  static std::atomic<bool> started{false};
+  bool expected = false;
+  if (!started.compare_exchange_strong(expected, true)) return;
+  std::thread([base] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      ge_fix_dam_spike(base);
+    }
+  }).detach();
+}
+
 void ge_watchdog_thread() {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
@@ -310,8 +819,12 @@ void ge_watchdog_thread() {
   uint32_t stall = 0;
   bool logged = false;
   bool recover_fired = false;
+  uint32_t display_check = 0;
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    if ((display_check++ % 8) == 0) ge_match_display_refresh();  // every 2 s
+    ge_log_gpu_clock_changes();
+    ge_log_npc_paths(base);
     auto* cp = ge_cp();
     if (!cp) continue;
     uint32_t wpi = static_cast<CPProbe*>(cp)->wpi();
@@ -559,11 +1072,120 @@ void ge_watchdog_thread() {
   }
 }
 
+// vblank_timing_log: late-frame sampler. When the game has not shown a frame
+// for 28 ms (a missed 60 Hz tick), sample the main game thread (start
+// 0x8235E4A8) without stopping it: its last guest return address (lr) and the
+// guest return addresses on its stack, i.e. the call chain it is stuck in.
+// Up to three samples per late frame (at about +28, +53, +78 ms).
+void ge_stall_sampler_thread() {
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  PPCContext* main_ctx = nullptr;
+  uint32_t sampled_for = 0;
+  int samples = 0;
+  uint32_t flag_poll = 0;
+  bool on = false;
+  LARGE_INTEGER freq;
+  QueryPerformanceFrequency(&freq);
+  for (;;) {
+    Sleep(1);
+    if ((flag_poll++ % 500) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+    if (!on) {
+      // Diagnostics off: check again in half a second instead of waking up a
+      // thousand times a second for nothing.
+      Sleep(500);
+      flag_poll = 0;
+      continue;
+    }
+    if (!main_ctx) {
+      auto* ks = rex::system::kernel_state();
+      if (!ks) continue;
+      for (auto& th : ks->object_table()->GetObjectsByType<rex::system::XThread>()) {
+        if (th && th->creation_params()->start_address == 0x8235E4A8u && th->thread_state()) {
+          main_ctx = th->thread_state()->context();
+          break;
+        }
+      }
+      if (!main_ctx) continue;
+    }
+    // Where the main thread spends its time: every 10 s, the most common
+    // guest return addresses (lr) sampled once a millisecond.
+    {
+      static std::vector<std::pair<uint32_t, uint32_t>> hist;
+      static LARGE_INTEGER hist_start{};
+      LARGE_INTEGER t;
+      QueryPerformanceCounter(&t);
+      if (!hist_start.QuadPart) hist_start = t;
+      const uint32_t lr_now = static_cast<uint32_t>(main_ctx->lr);
+      bool found = false;
+      for (auto& e : hist)
+        if (e.first == lr_now) { ++e.second; found = true; break; }
+      if (!found && hist.size() < 256) hist.push_back({lr_now, 1});
+      if (t.QuadPart - hist_start.QuadPart >= 10 * freq.QuadPart) {
+        std::sort(hist.begin(), hist.end(),
+                  [](const auto& x, const auto& y) { return x.second > y.second; });
+        uint32_t total = 0;
+        for (auto& e : hist) total += e.second;
+        char hb[400];
+        int ho = 0;
+        hb[0] = 0;
+        for (size_t i = 0; i < hist.size() && i < 8 && ho < 360; ++i) {
+          int k = std::snprintf(hb + ho, sizeof(hb) - ho, "%x:%u%% ", hist[i].first,
+                                total ? hist[i].second * 100 / total : 0);
+          if (k > 0) ho += k;
+        }
+        REXKRNL_INFO("ge main thread lr: {}", hb);
+        hist.clear();
+        hist_start = t;
+      }
+    }
+    const uint32_t n = g_guest_presents.load(std::memory_order_acquire);
+    if (n < 2) continue;
+    if (n != sampled_for) {
+      sampled_for = n;
+      samples = 0;
+    }
+    if (samples >= 3) continue;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const int64_t last = g_present_qpc[(n - 1) % kPresentRing].load(std::memory_order_relaxed);
+    const double age_ms = double(now.QuadPart - last) * 1000.0 / double(freq.QuadPart);
+    if (age_ms < 28.0 + 25.0 * samples || age_ms > 2000.0) continue;
+    ++samples;
+    const uint32_t lr = static_cast<uint32_t>(main_ctx->lr);
+    const uint32_t sp = main_ctx->r1.u32;
+    char buf[400];
+    int off = 0;
+    buf[0] = 0;
+    if (sp >= 0x10000u && sp < 0xC0000000u) {
+      MEMORY_BASIC_INFORMATION mbi;
+      uint8_t* hsp = base + sp;
+      if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT) {
+        uint8_t* end = std::min(hsp + 0x1800u,
+                                static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize);
+        int found = 0;
+        for (uint8_t* pp = hsp; pp + 4 <= end && found < 14 && off < 360; pp += 4) {
+          uint32_t v;
+          std::memcpy(&v, pp, 4);
+          v = __builtin_bswap32(v);
+          if (v >= 0x82000000u && v < 0x84000000u) {
+            int k = std::snprintf(buf + off, sizeof(buf) - off, "%x ", v);
+            if (k > 0) off += k;
+            ++found;
+          }
+        }
+      }
+    }
+    REXKRNL_INFO("ge stall sample: no frame for {:.0f} ms; game thread lr={:#x} stack: {}", age_ms,
+                 lr, buf);
+  }
+}
+
 inline void ge_start_watchdog_once() {
   static std::atomic<bool> started{false};
   bool expected = false;
   if (started.compare_exchange_strong(expected, true)) {
     std::thread(ge_watchdog_thread).detach();
+    std::thread(ge_stall_sampler_thread).detach();
   }
 }
 }  // namespace
@@ -619,41 +1241,59 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   bool drawn = (cpc != g_present_cpcnt.load(std::memory_order_relaxed)) ||
                (wpi != 0u && rpi == wpi);
 
-  //  (c) WATCHDOG. If neither (a) nor (b) has happened for a long stretch
-  //      (~80ms of real wall time), the CP is genuinely stuck on this frame
-  //      (e.g. blocked in a D3D12 op the backend can't complete for this
-  //      title's scene). Force-complete so the guest's GPU-completion spin
-  //      clears instead of deadlocking forever -- and, critically, releases the
-  //      device spinlock other guest threads (sub_821A3A40) are blocked on.
-  //      This turns a permanent freeze into a recoverable hitch. 80ms is far
-  //      above any real frame time, so normal frames still clear via (a)/(b).
-  // sub_82198C28 checks the skip bit *(device+10941)&2 at its very top and
-  // returns 0 (proceed) before any fence/timeout logic -- the only GUARANTEED
-  // way out of the spin. Writing the completion fence does not always release
-  // it (it resets the routine's own timeout anchor, and only helps when
-  // submit>=target). So: when the wait has stalled for a real wall-clock
-  // stretch (~80ms, far above any frame), SET the skip bit so the guest stops
-  // blocking on a GPU completion the CP cannot deliver -- and, crucially,
-  // releases the device spinlock the rest of the guest threads are stuck on.
-  // When the CP is keeping up (drawn via (a)/(b)) CLEAR it again so waits are
-  // honored and frames stay visible. Net: visible when the GPU keeps up, a
-  // brief skipped (black) frame during a stall instead of a permanent freeze.
-  // Do NOT touch the skip bit on the normal/keeping-up path -- the game manages
-  // *(device+10941)&2 itself (sets it when it intends NOT to block, clears it
-  // when it wants to wait), and clearing it during early init hangs the boot.
-  // Only SET it when the wait has genuinely stalled (~80ms, far above any real
-  // frame): that forces sub_82198C28 to return 0 next iteration so the guest
-  // stops blocking on a GPU completion the CP cannot deliver -- breaking the
-  // spinlock cascade / freeze. The game re-clears it on its own next frame, so
-  // this stays a one-shot "proceed past this stall", not a permanent skip.
+  //  (c) WATCHDOG. If the game has been stuck in this wait for a long stretch
+  //      (~80 ms, far above any real frame), the GPU fence it waits for is not
+  //      coming (the CP is stuck on this frame, or idle with the fence never
+  //      written). Do what the game's own GPU-hang handler (sub_821A2D50) does
+  //      to the fence, without its "GPU dead" mode: mark every fence issued so
+  //      far as reached, *(dev+10896)[0] := target - 2 (dev+10908 = the next
+  //      fence; sub_8219CEA0 keeps target = last fence + 2). The caller
+  //      (sub_8219D060 and friends) then sees its fence passed and moves on;
+  //      the GPU keeps processing the ring and later fences work normally.
+  //      This turns a permanent freeze into a recoverable hitch.
+  //      Do NOT set the skip bit *(dev+10941)&2 for this: that bit is the
+  //      game's "GPU is hung" mode (sub_821A2D50 sets it, sub_821A4D50 then
+  //      stops sending anything to the GPU, sub_8219CEA0 fakes fences on the
+  //      CPU) and nothing ever clears it, so the picture froze for good while
+  //      the sound played on (the 0.9.5e black-screen report; old builds too).
+  //      The stretch is measured from the last sign of progress: the GPU fence
+  //      or the game's present count changing, or this thread not polling
+  //      for over ~2 ms (a new wait). It counts whether or not (a)/(b) say
+  //      "drawn", because with the ring drained (b) holds while the fence
+  //      still never arrives.
+  const uint32_t fence_ptr = dev ? LD32(base, dev + 10896) : 0;
+  const bool fence_ok = fence_ptr >= 0x1000u && fence_ptr < 0xFFFFFFF0u;
+  const uint32_t fence = fence_ok ? LD32(base, fence_ptr) : 0;
+  const uint32_t presents = g_guest_presents.load(std::memory_order_relaxed);
+  static thread_local uint32_t s_ep_start = 0, s_ep_last = 0, s_ep_fence = 0, s_ep_presents = 0;
+  static thread_local bool s_ep = false;
+  if (!s_ep || (uint32_t)(t - s_ep_last) > 100000u ||  // ~2 ms @49.875MHz
+      fence != s_ep_fence || presents != s_ep_presents) {
+    s_ep = true;
+    s_ep_start = t;
+    s_ep_fence = fence;
+    s_ep_presents = presents;
+  }
+  s_ep_last = t;
+  if ((uint32_t)(t - s_ep_start) > 4000000u && fence_ok) {  // ~80 ms @49.875MHz
+    s_ep_start = t;
+    const uint32_t reached = LD32(base, dev + 10908) - 2u;
+    if (static_cast<int32_t>(reached - fence) > 0) {
+      ST32(base, fence_ptr, reached);
+      s_ep_fence = reached;
+    }
+    drawn = true;
+    g_hitch_watchdog.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+      REXKRNL_INFO("GE GPU wait timed out (over 80 ms); marked issued fences reached");
+    }
+  }
   static thread_local uint32_t s_wait_start = 0;
   static thread_local bool s_waiting = false;
+  static thread_local LARGE_INTEGER s_wait_qpc{};
   if (!drawn) {
-    if (!s_waiting) { s_waiting = true; s_wait_start = t; }
-    else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
-      drawn = true;
-      if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
-    }
+    if (!s_waiting) { s_waiting = true; s_wait_start = t; QueryPerformanceCounter(&s_wait_qpc); }
     // The six GPU-completion waits poll this routine in a TIGHT busy spin. With
     // dozens of guest threads that oversubscribes the cores and starves the
     // rexglue CP worker thread -- which is the very thread that must advance the
@@ -661,9 +1301,42 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // never advances, the spin never exits = freeze (visual stops, audio thread
     // keeps running on its own core). Yield here while still waiting so the CP
     // worker reliably gets CPU and can finish the frame.
-    if (!drawn) std::this_thread::yield();
-  } else {
+    // The game waits here for most of each frame (87% of its main thread,
+    // measured in Dam). Yield for the first ~0.5 ms, then sleep in 0.5 ms
+    // high-resolution steps: a whole CPU core no longer spins at 100%, which
+    // on power-limited handhelds leaves more power for the GPU. Sleeping also
+    // gives the CP worker the CPU it needs.
+    if (!drawn) {
+      if ((uint32_t)(t - s_wait_start) < 25000u) {  // ~0.5 ms @49.875MHz
+        std::this_thread::yield();
+      } else {
+#if defined(_WIN32)
+        static thread_local HANDLE s_wait_timer =
+            CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */,
+                                   TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -5000;  // 0.5 ms in 100 ns units
+        if (s_wait_timer && SetWaitableTimer(s_wait_timer, &due, 0, nullptr, nullptr, FALSE)) {
+          WaitForSingleObject(s_wait_timer, INFINITE);
+        } else {
+          std::this_thread::yield();
+        }
+#else
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+#endif
+      }
+    }
+  }
+  if (drawn && s_waiting) {
+    // vblank_timing_log: how long the game waited for the GPU this frame.
     s_waiting = false;
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    const uint64_t us = uint64_t((now.QuadPart - s_wait_qpc.QuadPart) * 1000000 / freq.QuadPart);
+    g_hitch_gpu_wait_us.fetch_add(us, std::memory_order_relaxed);
+    uint64_t prev = g_hitch_gpu_wait_max_us.load(std::memory_order_relaxed);
+    while (us > prev && !g_hitch_gpu_wait_max_us.compare_exchange_weak(prev, us)) {}
   }
 
   if (dev && idblk && idblk < 0xFFFFFFFEu && drawn) {
@@ -707,6 +1380,43 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     static int64_t log_start = 0;
     if ((poll++ & 0x3F) == 0)
       log_on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+    // Frames where the game's frame counter (0x8308851C) moved by more than one
+    // step without a slow frame: the game's own clock ran ahead of the vblank
+    // and the picture jumped. Counted for the 10-second line.
+    static uint32_t last_counter = 0, double_steps = 0;
+    {
+      const uint32_t counter = LD32(base, 0x8308851Cu);
+      const uint32_t n = g_guest_presents.load(std::memory_order_relaxed);
+      if (log_on && last_counter && counter - last_counter >= 2 && counter - last_counter < 4 &&
+          n >= 2) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        const int64_t prev = g_present_qpc[(n - 2) % kPresentRing].load(std::memory_order_relaxed);
+        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(f.QuadPart);
+        if (prev && ms < 20.0) ++double_steps;
+      }
+      last_counter = counter;
+    }
+    // Each slow frame (over 25 ms, i.e. a missed 60 Hz tick) on its own line,
+    // with what the game thread waited on; file reads and new pipelines are
+    // logged by the SDK at the same time stamps.
+    {
+      const uint64_t wait_us = g_hitch_gpu_wait_us.exchange(0, std::memory_order_relaxed);
+      const uint64_t wait_max_us = g_hitch_gpu_wait_max_us.exchange(0, std::memory_order_relaxed);
+      const uint32_t watchdog = g_hitch_watchdog.exchange(0, std::memory_order_relaxed);
+      const uint32_t n = g_guest_presents.load(std::memory_order_relaxed);
+      if (log_on && n >= 2) {
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        const int64_t prev = g_present_qpc[(n - 2) % kPresentRing].load(std::memory_order_relaxed);
+        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(freq.QuadPart);
+        if (prev && ms > 25.0 && ms < 1000.0) {
+          REXKRNL_INFO("ge slow frame: {:.1f} ms; GPU wait {:.1f} ms (longest {:.1f}){}; stage {}",
+                       ms, wait_us / 1000.0, wait_max_us / 1000.0,
+                       watchdog ? ", GPU wait timed out" : "", LD32(base, 0x82423E00u));  // stage number
+        }
+      }
+    }
     if (log_on) {
       LARGE_INTEGER freq;
       QueryPerformanceFrequency(&freq);
@@ -724,19 +1434,49 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
           for (double v : ms)
             if (v > mean * 1.5) ++hitches;
           REXKRNL_INFO("ge frames: {} frames, {:.2f} fps, frame time mean {:.3f} ms sd {:.3f} "
-                       "min {:.3f} max {:.3f}, {} hitches (>1.5x mean)",
+                       "min {:.3f} max {:.3f}, {} hitches (>1.5x mean), {} double steps",
                        ms.size(), 1000.0 / mean, mean,
-                       std::sqrt(std::max(0.0, sq / ms.size() - mean * mean)), mn, mx, hitches);
+                       std::sqrt(std::max(0.0, sq / ms.size() - mean * mean)), mn, mx, hitches,
+                       double_steps);
+          double_steps = 0;
         }
         log_start = qpc.QuadPart;
       }
     } else {
       log_start = 0;
     }
+    // Always on, for bug reports: one line a minute with the frame rate, the
+    // frames that missed a 60 Hz tick and the worst one. A few counters per
+    // frame, no allocation; the stage number says where the player was.
+    {
+      static LARGE_INTEGER freq{};
+      static int64_t minute_start = 0, prev = 0;
+      static uint32_t frames = 0, slow = 0, very_slow = 0;
+      static double worst = 0.0;
+      if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+      if (prev) {
+        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(freq.QuadPart);
+        ++frames;
+        if (ms > 25.0) ++slow;
+        if (ms > 100.0) ++very_slow;
+        if (ms < 5000.0) worst = std::max(worst, ms);
+      }
+      prev = qpc.QuadPart;
+      if (!minute_start) minute_start = qpc.QuadPart;
+      const double elapsed = double(qpc.QuadPart - minute_start) / double(freq.QuadPart);
+      if (elapsed >= 60.0) {
+        REXKRNL_INFO("ge minute: {:.1f} fps; {} frames over 25 ms ({} over 100 ms); worst {:.0f} ms; "
+                     "stage {}",
+                     frames / elapsed, slow, very_slow, worst, LD32(base, 0x82423E00u));
+        minute_start = qpc.QuadPart;
+        frames = slow = very_slow = 0;
+        worst = 0.0;
+      }
+    }
   }
 
-  static uint32_t n = 0;                       // throttled fps heartbeat
-  if ((n++ & 0x3F) == 0)
+  static uint32_t n = 0;  // throttled present heartbeat (vblank_timing_log only)
+  if ((n++ & 0x3F) == 0 && rex::cvar::GetFlagByName("vblank_timing_log") == "true")
     REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
 }
 
@@ -926,8 +1666,11 @@ void ge_hook_830E0750(PPCRegister& r7, PPCRegister& r8, PPCRegister& r11,
 // user-facing sensitivity multiplier is ge_mouse_sens (defined below).
 REXCVAR_DEFINE_BOOL(ge_invert_x, false, "Input", "Invert mouse X (horizontal) look");
 REXCVAR_DEFINE_BOOL(ge_invert_y, false, "Input", "Invert mouse Y (vertical) look");
-REXCVAR_DEFINE_BOOL(ge_disable_autoaim, true, "Input",
-                    "Disable auto-aim and look-ahead while mouse-look is on");
+// Off by default: the game's own Auto-Aim option (front-end Controls, watch)
+// decides. On, mouse-look keeps auto-aim off whatever that option says.
+REXCVAR_DEFINE_BOOL(ge_disable_autoaim, false, "Input",
+                    "Keep auto-aim off while mouse-look is on, whatever the game's Auto-Aim "
+                    "option says");
 REXCVAR_DEFINE_DOUBLE(ge_menu_sensitivity, 1.0, "Input",
                       "Mouse sensitivity in menus").range(0.05, 20.0);
 REXCVAR_DEFINE_DOUBLE(ge_aim_turn_distance, 0.4, "Input",
@@ -1361,6 +2104,34 @@ bool ge_skip_joke_screen(PPCRegister& /*r3*/) { return true; }
 // New saves start with Look Up/Down = Upright (option 3 set) instead of
 // following the Xbox profile's Y inversion.
 void ge_look_default(PPCRegister& r5) { r5.u64 = 1; }
+
+// Camera Bob (Other Settings; the setting is ge_view_bob). The head update
+// sub_820AEB80 (the N64's bheadUpdate) builds the eye's offset (r1+96), look
+// (r1+112) and up (r1+80) vectors from
+// Bond's walk animation and idle breathing, then hands them on at 0x820AF08C.
+// The game's "Camera Roll While Walking" option only straightens the up
+// vector, so the eye still bobs and sways. Off, the eye stays at the resting
+// height (player+1656, the value it has standing still) looking straight ahead
+// with no roll; the offset's x and z stay, as they are what moves Bond.
+REXCVAR_DEFINE_BOOL(ge_view_bob, true, "Video",
+                    "Camera bob while walking (off = the camera stays level and steady)");
+
+void ge_view_bob_hold(PPCRegister& r1) {
+  if (REXCVAR_GET(ge_view_bob)) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  const uint32_t player = LD32(base, 0x82F1FAACu);
+  if (!player) return;
+  const uint32_t sp = r1.u32;
+  // Only the height: the walk code (sub_820BC030, sub_820BDAC8) moves Bond by
+  // the offset's x and z, so zeroing those stopped him walking.
+  STF32(base, sp + 100, LDF32(base, player + 1656));
+  STF32(base, sp + 112, 0.0f);
+  STF32(base, sp + 116, 0.0f);
+  STF32(base, sp + 120, 1.0f);
+  STF32(base, sp + 80, 0.0f);
+  STF32(base, sp + 84, 1.0f);
+  STF32(base, sp + 88, 0.0f);
+}
 
 // The save routine's "Saving content. Please don't turn off your console."
 // notice is console TCR text; skip showing it. Other notices still show.
@@ -1939,6 +2710,41 @@ static bool ge_menu_cursor_limits(float& min_x, float& max_x, float& min_y, floa
   return true;
 }
 
+// The mouse-driven menu crosshair (ge_menu_cursor_from_pointer, once a frame).
+struct MenuPointer {
+  POINT last{-1, -1};                     // pointer as we last left it (-1: not driving)
+  float last_x = -1e9f, last_y = -1e9f;   // crosshair as we last left it
+  float game_x = -1e9f, game_y = -1e9f;   // where the game last moved it against us
+  uint32_t calls = 0, restored_at = 0;    // frames, and the frame of that restore
+};
+static MenuPointer g_menu_ptr;
+
+// The game jumps the crosshair when a menu opens: put it back where the mouse
+// left it, as a Windows pointer would stay. If the game puts it straight back
+// to the same spot within a few frames, the mouse is outside the area the game
+// allows (for example after the window shrank): that jump is accepted and the
+// pointer moves there, so the two never lock up. Only straight away:
+// re-entering a menu later jumps to the same spot as last time, and taking that
+// as "insisting" moved the crosshair (Help & Options > back > Help & Options).
+// Called from the game's own per-frame crosshair clamp too (before the menu is
+// drawn), so the jumped crosshair never shows for a frame.
+static bool ge_menu_cursor_restore_jump(uint8_t* base) {
+  MenuPointer& m = g_menu_ptr;
+  if (m.last.x < 0) return false;
+  const float cx = LDF32(base, GE_MENU_XY);
+  const float cy = LDF32(base, GE_MENU_XY + 4);
+  const float jump = std::max(std::fabs(cx - m.last_x), std::fabs(cy - m.last_y));
+  const bool game_insists = std::fabs(cx - m.game_x) <= 0.5f && std::fabs(cy - m.game_y) <= 0.5f &&
+                            m.calls - m.restored_at <= 3;
+  if (jump <= 12.f || game_insists) return false;
+  m.game_x = cx;
+  m.game_y = cy;
+  m.restored_at = m.calls;
+  STF32(base, GE_MENU_XY, m.last_x);
+  STF32(base, GE_MENU_XY + 4, m.last_y);
+  return true;
+}
+
 void ge_menu_cursor_clamp_x() {
   PPCContext* ctx; uint8_t* base; getcb(ctx, base);
   float lo, hi, y0, y1;
@@ -1955,6 +2761,7 @@ void ge_menu_cursor_clamp_y() {
   float y = LDF32(base, GE_MENU_XY + 4);
   y = std::clamp(y, lo, hi);
   STF32(base, GE_MENU_XY + 4, y);
+  if (LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE) ge_menu_cursor_restore_jump(base);
 }
 
 
@@ -1967,8 +2774,9 @@ void ge_menu_cursor_clamp_y() {
 // mission is running.
 bool ge_menu_cursor_from_pointer(uint8_t* base) {
   g_frontend_menus.store(LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE, std::memory_order_relaxed);
-  static POINT last{-1, -1};
-  static float last_x = -1e9f, last_y = -1e9f;  // crosshair as we last left it
+  POINT& last = g_menu_ptr.last;
+  float& last_x = g_menu_ptr.last_x;
+  float& last_y = g_menu_ptr.last_y;
   // Follow the pointer whenever the game has focus in the front-end menus,
   // whatever state the in-mission mouse capture was left in (after Abort
   // Mission it could stay released, so the crosshair stopped moving).
@@ -2015,21 +2823,8 @@ bool ge_menu_cursor_from_pointer(uint8_t* base) {
       return true;
   }
   const float jump = std::max(std::fabs(cx - last_x), std::fabs(cy - last_y));
-  // Where the game last moved the crosshair against us (see below).
-  static float game_x = -1e9f, game_y = -1e9f;
-  if (last.x >= 0 && jump > 12.f &&
-      (std::fabs(cx - game_x) > 0.5f || std::fabs(cy - game_y) > 0.5f)) {
-    // The game jumped the crosshair (a new menu opened): keep it where the
-    // mouse is instead, as a Windows pointer would stay. If the game puts it
-    // straight back to the same spot, the mouse is outside the area the game
-    // allows (for example after the window shrank): the next frame accepts
-    // the game's spot and moves the pointer there, so the two never lock up.
-    game_x = cx;
-    game_y = cy;
-    STF32(base, GE_MENU_XY, last_x);
-    STF32(base, GE_MENU_XY + 4, last_y);
-    return true;
-  }
+  ++g_menu_ptr.calls;
+  if (ge_menu_cursor_restore_jump(base)) return true;
   if (last.x < 0 || jump > 0.5f) {
     // Put the pointer on the crosshair.
     const PictureRect pic = ge_menu_rect(rc);
@@ -2120,9 +2915,12 @@ void ge_mouse_camera(uint8_t* base) {
   if (game_control_disabled == 0)
     game_control_disabled = LD32(base, player + GE_OFF_WATCH);
 
-  // Disable auto-aim & look-ahead, only when the pause/control state changes --
-  // xenia's exact behaviour. (Doing it every frame oscillated against the game's
-  // per-frame auto-aim in multiplayer and caused the camera jitter.)
+  // Disable look-ahead (and auto-aim only with ge_disable_autoaim), only when
+  // the pause/control state changes -- xenia's exact behaviour. (Doing it
+  // every frame oscillated against the game's per-frame auto-aim in
+  // multiplayer and caused the camera jitter.) Auto-aim used to be cleared here
+  // by default, so turning Auto-Aim on in the options or the watch was undone
+  // at the next pause and did nothing.
   if (game_pause_flag != prev_pause || game_control_disabled != prev_disabled) {
     const uint32_t sp = LD32(base, GE_SETTINGS_PTR);
     if (sp) {
@@ -2135,6 +2933,32 @@ void ge_mouse_camera(uint8_t* base) {
     }
     prev_pause = game_pause_flag;
     prev_disabled = game_control_disabled;
+  }
+
+  // A new stage: no mouse look until the player first has control. Mouse motion
+  // queued while the level loads (the game thread is stuck, the raw-mouse
+  // thread keeps adding) otherwise turns Bond in the frame between his spawn
+  // facing being set and the intro locking the controls; the intro's pan is
+  // built around that facing, so it swung through Dam's cliffs. Control means
+  // the intro has ended (disabled -> enabled) or, with no intro (multiplayer),
+  // 60 frames of play (frames, not time: the load itself can take seconds).
+  static uint32_t look_stage = 0;
+  static bool look_held = false, look_saw_intro = false;
+  static int look_free_frames = 0;
+  const uint32_t stage_now = LD32(base, GE_CURRENT_STAGE);
+  if (stage_now != look_stage) {
+    look_stage = stage_now;
+    look_held = true;
+    look_saw_intro = false;
+    look_free_frames = 0;
+  }
+  if (look_held) {
+    if (game_control_disabled) {
+      look_saw_intro = true;
+    } else if (look_saw_intro || ++look_free_frames > 60) {
+      look_held = false;
+    }
+    if (look_held) return;
   }
 
   if (game_control_disabled) return;
@@ -2223,6 +3047,24 @@ void ge_mouse_camera(uint8_t* base) {
     start_centering = false;   // nothing to centre -> no spring-back
     disable_sway = false;
   } else {
+    // #10: with the game's Auto-Aim on, the game itself moves the gun and the
+    // crosshair onto the target, and shots go where the crosshair is. Our sway
+    // and recentring below pulled them back every frame, so the gun swung
+    // toward a guard but the crosshair stayed short of him and the shot missed.
+    // With Auto-Aim on, the mouse only turns the camera here.
+    const uint32_t settings_ptr = LD32(base, GE_SETTINGS_PTR);
+    if (settings_ptr && (LD32(base, settings_ptr + GE_SETTINGS_BITS) & GE_SET_AutoAim)) {
+      if (look_mdx != 0.f || mdy != 0.f) {
+        float camX = LDF32(base, player + GE_OFF_CAM_X);
+        float camY = LDF32(base, player + GE_OFF_CAM_Y);
+        camX += (invert_x ? -1.f : 1.f) * (look_mdx / 10.f) * sensitivity;
+        camY -= (invert_y ? -1.f : 1.f) * (mdy / 10.f) * sensitivity;
+        STF32(base, player + GE_OFF_CAM_X, camX);
+        STF32(base, player + GE_OFF_CAM_Y, camY);
+      }
+      start_centering = false;
+      return;
+    }
     float gX = LDF32(base, player + GE_OFF_GUN_X);
     float gY = LDF32(base, player + GE_OFF_GUN_Y);
 
@@ -2359,12 +3201,199 @@ static void ge_watch_help_rows(uint8_t* base) {
     if (LD32(base, kTable + i * 4u) != want[i]) ST32(base, kTable + i * 4u, want[i]);
 }
 
-// Screen Ratio is set from the window's shape (the Other Settings row is
-// hidden): profile option 12 = 16:9, 13 = 21:9, neither = 4:3. A window close
-// to 4:3 gets 4:3, one about as wide as 21:9 (fullscreen on an ultrawide
-// screen, or a window stretched that far) gets 21:9, anything else 16:9. The
-// game shapes its 16:9 frame for the chosen TV, so the frame is presented at
-// that shape too (4:3 and 21:9; 16:9 is the frame's own).
+// Auto-Aim is kept in ge.toml (ge_autoaim, off by default): applied to the
+// first profile's option bit (+0x298 & 0x10) when the profile is loaded, and
+// a change the player makes in the Controls options or the watch is saved
+// back, so the choice lasts whether or not the game saves its profile.
+REXCVAR_DEFINE_BOOL(ge_autoaim, false, "Input", "Auto-aim (the game's Auto-Aim option)");
+void ge_autoaim_tick(uint8_t* base) {
+  static uint32_t last_profile = 0, settle_word = 0;
+  static int settle = 0;  // frames the profile's options have been unchanged
+  static bool applied = false, last_on = false;
+  const uint32_t profile = LD32(base, GE_SETTINGS_PTR);
+  if (!profile || base[profile + 1358u] == 0) {
+    last_profile = 0;
+    return;
+  }
+  const uint32_t sva = profile + GE_SETTINGS_BITS;
+  const uint32_t word = LD32(base, sva);
+  const bool on = (word & GE_SET_AutoAim) != 0;
+  if (profile != last_profile) {
+    last_profile = profile;
+    applied = false;
+    settle = 0;
+    settle_word = word;
+    return;
+  }
+  // The game fills in the saved options a frame or so after the profile
+  // appears: wait until they have stayed put for a second, then apply ours.
+  if (!applied) {
+    if (word != settle_word) {
+      settle_word = word;
+      settle = 0;
+      return;
+    }
+    if (++settle < 60) return;
+    const bool want = REXCVAR_GET(ge_autoaim);
+    if (on != want) ST32(base, sva, want ? (word | GE_SET_AutoAim) : (word & ~(uint32_t)GE_SET_AutoAim));
+    applied = true;
+    last_on = want;
+    return;
+  }
+  if (on != last_on) {
+    last_on = on;
+    rex::cvar::SetFlagByName("ge_autoaim", on ? "true" : "false");
+    ge::PersistSettings();
+    REXKRNL_INFO("GEAUTOAIM {}", on ? "on" : "off");
+  }
+}
+
+// Jungle's broad-leaf plants: Rare's unfinished build has no texture for them,
+// so the game hands D3D its missing-texture picture, a 16x16 DXT1 checker of
+// magenta and dark magenta, and they show up purple. In
+// Jungle, SetTexture is given one of the level's own leaf textures instead.
+// Both renderers read the texture object they are handed, so both get it. The
+// leaf is the nearest texture object of the level's table (objects 0x80 apart)
+// with the size ge_jungle_plant_texture names.
+REXCVAR_DEFINE_BOOL(ge_fix_jungle_plants, true, "Video",
+                    "Jungle: draw the plants the game left untextured with a leaf texture");
+REXCVAR_DEFINE_STRING(ge_jungle_plant_texture, "128x512", "Debug",
+                      "Jungle: size (WxH) of the level texture used on the untextured plants");
+constexpr uint32_t GE_STAGE_JUNGLE = 0x25u;
+
+namespace {
+struct GeTexInfo {
+  uint32_t fmt = 0, width = 0, height = 0, data = 0;
+};
+// The texture object's fetch constant (+28): format, size and where the base
+// level is. Textures loaded with the level sit at 0xE0000000+, read 4 KB on.
+GeTexInfo ge_tex_info(uint8_t* base, uint32_t tex) {
+  GeTexInfo t;
+  const uint32_t f1 = LD32(base, tex + 32), f2 = LD32(base, tex + 36);
+  t.fmt = f1 & 0x3F;
+  t.width = (f2 & 0x1FFF) + 1;
+  t.height = ((f2 >> 13) & 0x1FFF) + 1;
+  const uint32_t phys = f1 & 0xFFFFF000u;
+  t.data = phys >= 0xE0000000u ? phys + 0x1000 : 0;
+  return t;
+}
+bool ge_is_missing_texture(uint8_t* base, uint32_t tex) {
+  const GeTexInfo t = ge_tex_info(base, tex);
+  if (t.fmt != 18 || t.width != 16 || t.height != 16 || !t.data) return false;  // k_DXT1
+  // A small base level sits at an offset in its tile (packed mips), which can
+  // be shared with other textures: count checker blocks over the 8 KB tile.
+  auto magenta = [](uint16_t c) {  // RGB565 with no green and red = blue
+    const int r = c >> 11, g = (c >> 5) & 0x3F, b = c & 0x1F;
+    return r > 0 && g <= 2 && std::abs(r - b) <= 2;
+  };
+  int checker = 0;
+  for (uint32_t off = 0; off < 0x2000; off += 8) {
+    const uint16_t c0 = LD16(base, t.data + off), c1 = LD16(base, t.data + off + 2);
+    if (magenta(c0) && magenta(c1)) ++checker;
+  }
+  return checker >= 16;  // the 16x16 base level alone is 16 blocks; the tile can hold other data
+}
+}  // namespace
+
+// Egyptian stone pieces (cryptdoor models, see ge_see_through_doors_tick) have
+// only their N64 textures, in both graphics modes. With remastered graphics,
+// SetTexture is given remastered temple textures of the same level instead:
+// the 32x32 sandstone pair becomes the big sandstone blocks, the 64x64 carved
+// panel becomes the carved relief panel. Textures are told apart by a hash of
+// their first 256 bytes of picture data (the same in every load); the temple
+// textures are picked up as the level sets them.
+namespace {
+uint32_t ge_tex_hash(uint8_t* base, const GeTexInfo& t) {
+  uint32_t h = 0x811C9DC5u;
+  for (uint32_t i = 0; i < 256; ++i) h = (h ^ base[t.data + i]) * 0x01000193u;
+  return h;
+}
+}  // namespace
+REXCVAR_DEFINE_BOOL(ge_egypt_stone_textures, true, "Video",
+                    "Egyptian: remastered textures on the stone doors and panels with remastered graphics");
+bool ge_egypt_set_texture(uint8_t* base, PPCRegister& r5) {
+  constexpr uint32_t kSandSmallA = 0x190BEAD6u, kSandSmallB = 0xA3CF8E73u, kPanel = 0x6717A4A1u;
+  constexpr uint32_t kBlocks = 0x854BE3D1u, kRelief = 0x7081B850u;  // remastered temple textures
+  static std::unordered_map<uint32_t, uint32_t> hashes;               // object -> hash (0 = not a candidate)
+  static uint32_t stage_seen = 0, blocks = 0, relief = 0;
+  const uint32_t tex = r5.u32;
+  const uint32_t stage = LD32(base, GE_CURRENT_STAGE);
+  if (stage != stage_seen) {  // a new level: its textures are new objects
+    stage_seen = stage;
+    hashes.clear();
+    blocks = relief = 0;
+  }
+  if (stage != 0x20u || !REXCVAR_GET(ge_egypt_stone_textures)) return false;
+  auto it = hashes.find(tex);
+  if (it == hashes.end()) {
+    const GeTexInfo t = ge_tex_info(base, tex);
+    uint32_t h = 0;
+    const bool is_small = t.width == t.height && (t.width == 32 || t.width == 64);
+    const bool is_big = (t.width == 256 && t.height == 256) || (t.width == 1024 && t.height == 1024);
+    if (t.fmt == 18 && t.data && (is_small || is_big)) h = ge_tex_hash(base, t);
+    it = hashes.emplace(tex, h).first;
+    if (h == kBlocks && !blocks) blocks = tex;
+    if (h == kRelief && !relief) relief = tex;
+  }
+  if (base[0x82F0DF11u] != 0) return false;  // classic graphics: the N64 look
+  const uint32_t h = it->second;
+  const uint32_t to = (h == kSandSmallA || h == kSandSmallB) ? blocks : h == kPanel ? relief : 0;
+  if (!to) return false;
+  r5.u64 = to;
+  return true;
+}
+
+void ge_jungle_set_texture(PPCRegister& r5) {
+  if (r5.u32 && ge_egypt_set_texture(rex::system::kernel_state()->memory()->virtual_membase(), r5)) return;
+  // The level's checker objects (it has two) and the leaf each one becomes.
+  struct Swap { uint32_t missing, leaf; };
+  static Swap swaps[4];
+  static uint32_t count = 0, stage_seen = 0, last_other = 0;
+  const uint32_t tex = r5.u32;
+  if (!tex || !REXCVAR_GET(ge_fix_jungle_plants)) return;
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  const uint32_t stage = LD32(base, GE_CURRENT_STAGE);
+  if (stage != stage_seen) {  // a new level: its textures are new objects
+    stage_seen = stage;
+    count = last_other = 0;
+  }
+  if (stage != GE_STAGE_JUNGLE || tex == last_other) return;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (swaps[i].missing == tex) {
+      if (swaps[i].leaf) r5.u64 = swaps[i].leaf;
+      return;
+    }
+  }
+  if (count == 4 || !ge_is_missing_texture(base, tex)) {
+    last_other = tex;  // the cheap test above skips it next time in a row
+    return;
+  }
+  uint32_t want_w = 0, want_h = 0, leaf = 0;
+  std::sscanf(REXCVAR_GET(ge_jungle_plant_texture).c_str(), "%ux%u", &want_w, &want_h);
+  for (uint32_t k = 1; k <= 64 && !leaf; ++k) {
+    for (const uint32_t other : {tex - k * 0x80u, tex + k * 0x80u}) {
+      const GeTexInfo t = ge_tex_info(base, other);
+      if ((t.fmt == 18 || t.fmt == 19 || t.fmt == 20) && t.width == want_w && t.height == want_h && t.data) {
+        leaf = other;
+        break;
+      }
+    }
+  }
+  swaps[count++] = {tex, leaf};
+  REXKRNL_INFO("GEJUNGLE missing-texture object {:08X} -> leaf {:08X} ({})", tex, leaf,
+               REXCVAR_GET(ge_jungle_plant_texture));
+  if (leaf) r5.u64 = leaf;
+}
+
+// Screen Ratio (the game's Other Settings row is hidden): profile option 12 =
+// 16:9, 13 = 21:9, neither = 4:3. ge_screen_ratio (PC Settings > Video) picks
+// it; on Auto it follows the window's shape: a window close to 4:3 gets 4:3,
+// one about as wide as 21:9 (fullscreen on an ultrawide screen, or a window
+// stretched that far) gets 21:9, anything else 16:9. The game shapes its 16:9
+// frame for the chosen TV, so the frame is presented at that shape too (4:3
+// and 21:9; 16:9 is the frame's own), with bars where the window differs.
+REXCVAR_DEFINE_STRING(ge_screen_ratio, "auto", "Video",
+                      "Screen ratio: auto (follow the window's shape), 4:3, 16:9 or 21:9");
 void ge_screen_ratio_tick(uint8_t* base) {
   static int countdown = 0;
   static int shown = -1;
@@ -2378,6 +3407,11 @@ void ge_screen_ratio_tick(uint8_t* base) {
     rex::cvar::SetFlagByName("ge_boot_cover", "false");
     REXKRNL_INFO("GEBOOTCOVER lifted at poll {} (ratio set at {})", polls, applied_at);
   }
+  static std::string last_chosen;
+  if (REXCVAR_GET(ge_screen_ratio) != last_chosen) {  // a new choice applies at once
+    last_chosen = REXCVAR_GET(ge_screen_ratio);
+    countdown = 0;
+  }
   if (--countdown > 0) return;
   countdown = 30;
   const uint32_t profile = LD32(base, 0x83088228u);
@@ -2387,6 +3421,10 @@ void ge_screen_ratio_tick(uint8_t* base) {
   if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return;
   const float aspect = static_cast<float>(rc.right) / static_cast<float>(rc.bottom);
   int ratio = aspect < 1.55f ? 0 : aspect >= 2.2f ? 2 : 1;  // 0 4:3, 1 16:9, 2 21:9
+  const std::string chosen = REXCVAR_GET(ge_screen_ratio);
+  if (chosen == "4:3") ratio = 0;
+  else if (chosen == "16:9") ratio = 1;
+  else if (chosen == "21:9") ratio = 2;
   // The game's own 21:9 front-end squeezes the menus into part of the frame
   // and leaves the rest black, so the menus stay 16:9 (with side bars on an
   // ultrawide window); missions use 21:9.
@@ -2534,6 +3572,17 @@ struct GeScriptPress {
   int16_t lx = 0, ly = 0;
 };
 std::deque<GeScriptPress> g_script_queue;
+// Test pads 2-4 (ge_debug_pads): words prefixed "P2:" .. "P4:" go to their
+// own queue; XamInputGetState answers for those users from it (below).
+REXCVAR_DEFINE_INT32(ge_debug_pads, 1, "Debug",
+                     "Test-only: pads the input pipe drives (2-4 adds pads for users 2-4, words P2: .. P4:)")
+    .range(1, 4);
+struct GeExtraPad {
+  std::deque<GeScriptPress> queue;
+  GeScriptPress current;
+  int phase = 0;
+};
+GeExtraPad g_extra_pads[3];
 // Test-only watch click from the pipe: "CLICK=x,y" in 1280x720 units.
 bool g_test_click = false;
 bool g_test_menu_click = false;  // the same click, for front-end menus
@@ -2570,6 +3619,15 @@ void ge_script_read_new_lines() {
         start = end + 1;
         while (!word.empty() && (word.back() == '\r' || word.back() == ' ')) word.pop_back();
         GeScriptPress press;
+        int pad = 0;  // "P2:A" = pad 2's A
+        if (word.size() > 3 && word[0] == 'P' && word[1] >= '2' && word[1] <= '4' && word[2] == ':') {
+          pad = word[1] - '1';
+          word = word.substr(3);
+        }
+        if (word == "TRACE") {  // test: the native renderer logs the next frame's draws
+          rex::cvar::SetFlagByName("gpu_native_trace_frame", "-1");
+          continue;
+        }
         if (word == "READY") {  // test: toggle ready in the LAN lobby
           ge::TestToggleReady();
           continue;
@@ -2600,6 +3658,11 @@ void ge_script_read_new_lines() {
           (word == "WHEELUP" ? g_wheel_up_queue : g_wheel_down_queue).fetch_add(1);
           continue;
         }
+        if (word.rfind("CVAR=", 0) == 0) {  // test: CVAR=name=value sets a setting mid-run
+          const size_t eq = word.find('=', 5);
+          if (eq != std::string::npos) rex::cvar::SetFlagByName(word.substr(5, eq - 5), word.substr(eq + 1));
+          continue;
+        }
         if (word.rfind("CLICK=", 0) == 0) {
           if (std::sscanf(word.c_str() + 6, "%f,%f", &g_test_click_x, &g_test_click_y) == 2)
             g_test_click = true;
@@ -2625,7 +3688,8 @@ void ge_script_read_new_lines() {
         else if (word == "SLEFT") press.lx = -32767;
         else if (word == "SRIGHT") press.lx = 32767;
         else if (word != "WAIT") continue;
-        g_script_queue.push_back(press);
+        if (pad) g_extra_pads[pad - 1].queue.push_back(press);
+        else g_script_queue.push_back(press);
       }
     }
   }
@@ -2634,6 +3698,17 @@ void ge_script_read_new_lines() {
 
 void ge_script_apply(uint8_t* base) {
   ge_script_read_new_lines();
+  for (GeExtraPad& pad : g_extra_pads) {  // the same hold / gap rhythm as pad 1
+    if (pad.phase > 0) {
+      if (--pad.phase == 0) pad.phase = -8;
+    } else if (pad.phase < 0) {
+      ++pad.phase;
+    } else if (!pad.queue.empty()) {
+      pad.current = pad.queue.front();
+      pad.queue.pop_front();
+      pad.phase = 6;
+    }
+  }
   if (g_script_phase > 0) {
     if (--g_script_phase == 0) g_script_phase = -8;
   } else if (g_script_phase < 0) {
@@ -2653,6 +3728,31 @@ void ge_script_apply(uint8_t* base) {
     if (g_script_current.lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(g_script_current.lx));
     if (g_script_current.ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(g_script_current.ly));
   }
+}
+
+// The game's XamInputGetState call (user index, XINPUT_STATE*). Test pads 2-4
+// are "connected" while ge_debug_pads covers them and the pipe is set, and
+// report the press being played back.
+extern "C" REX_FUNC(sub_824082E8) {
+  const uint32_t user = ctx.r3.u32;
+  if (user >= 1 && user <= 3 && static_cast<int>(user) < REXCVAR_GET(ge_debug_pads) &&
+      !REXCVAR_GET(ge_debug_input_file).empty() && ctx.r4.u32) {
+    const GeExtraPad& pad = g_extra_pads[user - 1];
+    const uint32_t state = ctx.r4.u32;
+    static uint32_t packet = 0;
+    ST32(base, state + 0, ++packet);
+    const GeScriptPress none;
+    const GeScriptPress& p = pad.phase > 0 ? pad.current : none;
+    ST16(base, state + 4, p.buttons);
+    base[state + 6] = p.lt;
+    base[state + 7] = p.rt;
+    ST16(base, state + 8, static_cast<uint16_t>(p.lx));
+    ST16(base, state + 10, static_cast<uint16_t>(p.ly));
+    ST32(base, state + 12, 0);  // right stick
+    ctx.r3.u64 = 0;             // ERROR_SUCCESS
+    return;
+  }
+  __imp__sub_824082E8(ctx, base);
 }
 
 // A wheel notch becomes a press held for a few polls, then a gap, so the game
@@ -3153,21 +4253,155 @@ void ge_watch_mouse(uint8_t* base) {
 // the game starts the fade at once (fade timer +44 goes from -1 to 0, then up to
 // 90 = gone), so bodies vanished after about a second and a half. They now lie
 // for ge_body_seconds first: the timer counts up from below -1 while they lie.
-REXCVAR_DEFINE_INT32(ge_body_seconds, 60, "Game", "Seconds a dead guard stays before fading");
+// Two things wait for a body to be gone, so lying bodies must not hold them back:
+// - Mission scripts: if_chr_does_not_exist (AI command 0x31) is true only once a
+//   character has died AND faded. Objectives, Baron Samedi's three lives in
+//   Egyptian, Trevelyan in Cradle and some respawns wait on it (issues #13, #19).
+//   Every character a stage's scripts test that way fades at once, as stock.
+// - Reinforcements: a guard spawns only while 3 guard slots are free, and a body
+//   holds its slot. When free slots run short, the oldest body starts fading.
+REXCVAR_DEFINE_INT32(ge_body_seconds, 10, "Game", "Seconds a dead guard stays before fading");
+// The game spawns a guard only with >= 3 free slots; keep 2 spare for bursts.
+REXCVAR_DEFINE_INT32(ge_body_free_slots, 5, "Debug", "Free guard slots kept by fading the oldest body");
+namespace {
+constexpr uint32_t kSetupPtr = 0x82F30398u;  // current stage setup; +0x14 = AI list table {list, id}
+constexpr uint32_t kChrSlots = 0x830612F4u;  // guard slots (0x2A4 bytes each), count at +4
+constexpr uint32_t kChrSize = 0x2A4u;
+// AI command lengths (n64decomp bondaicommands.h); 0xAD is a zero-terminated text.
+constexpr uint8_t kAiLen[256] = {
+    2, 2, 2, 1, 1, 4, 3, 1, 1, 1, 9, 2, 1, 1, 2, 2,
+    2, 2, 2, 2, 6, 6, 6, 6, 4, 4, 2, 5, 3, 1, 3, 3,
+    2, 1, 1, 2, 4, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 2,
+    3, 3, 2, 1, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 2, 2, 2, 4, 2, 2, 3, 3, 3, 3, 4, 4, 7, 7, 5,
+    5, 4, 6, 6, 5, 4, 3, 3, 4, 3, 3, 3, 3, 3, 2, 2,
+    2, 2, 2, 2, 3, 4, 2, 2, 4, 3, 3, 3, 4, 3, 3, 3,
+    3, 3, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 4, 4, 3, 3,
+    3, 2, 2, 2, 3, 2, 2, 2, 2, 3, 2, 3, 2, 2, 2, 3,
+    3, 2, 2, 2, 2, 2, 3, 3, 3, 4, 5, 5, 6, 5, 5, 6,
+    6, 6, 7, 6, 6, 7, 6, 6, 7, 2, 3, 3, 4, 50, 1, 1,
+    1, 1, 2, 5, 5, 1, 1, 3, 1, 1, 2, 4, 4, 12, 11, 9,
+    8, 5, 3, 3, 4, 5, 6, 6, 6, 2, 5, 2, 5, 5, 2, 2,
+    4, 2, 1, 1, 3, 6, 4, 2, 1, 5, 1, 1, 2, 1, 1, 2,
+    3, 3, 4, 2, 2, 3, 5, 2, 2, 1, 1, 2, 1, 1, 13, 1,
+    2, 2, 3, 2, 4, 2, 1, 3, 3, 1, 1, 1, 2, 0, 0, 0};
+std::array<bool, 256> g_scripted_chrs{};
+uint32_t g_scripted_table = 0;  // the AI list table g_scripted_chrs was read from
+std::vector<std::pair<uint32_t, int>> g_fading_for_slot;  // bodies we started fading, frames left
+// Bodies lying on our timer: chr -> g_body_tick when ge_corpse_linger last kept it.
+// +44 is not a timer while a guard lives, so only bodies seen here count.
+std::unordered_map<uint32_t, uint32_t> g_lying;
+uint32_t g_body_tick = 0;
+
+bool in_ram(uint32_t a) { return a >= 0x40000000u && a < 0x9F000000u; }
+
+// Reads every AI list of the current stage and notes the characters tested
+// with if_chr_does_not_exist. Redone when the stage's setup changes.
+void scan_scripted_chrs(uint8_t* base) {
+  const uint32_t setup = LD32(base, kSetupPtr);
+  const uint32_t table = in_ram(setup) ? LD32(base, setup + 0x14u) : 0u;
+  if (table == g_scripted_table) return;
+  g_scripted_table = table;
+  g_scripted_chrs.fill(false);
+  if (!in_ram(table)) return;
+  int lists = 0, found = 0;
+  for (uint32_t e = table; lists < 512; e += 8u, ++lists) {
+    uint32_t o = LD32(base, e);
+    if (!in_ram(o)) break;
+    for (int n = 0; n < 100000; ++n) {
+      const uint8_t c = base[o];
+      if (c == 0x04u) break;  // end of list
+      if (c == 0xADu) {       // debug text
+        int k = 1;
+        while (k < 256 && base[o + k] != 0) ++k;
+        o += k + 1;
+        continue;
+      }
+      if (kAiLen[c] == 0) {
+        REXKRNL_WARN("GEBODIES unknown AI command {:02X} at {:08X}", c, o);
+        break;
+      }
+      if (c == 0x31u && base[o + 1] < 0xF0u && !g_scripted_chrs[base[o + 1]]) {
+        g_scripted_chrs[base[o + 1]] = true;
+        ++found;
+      }
+      o += kAiLen[c];
+    }
+  }
+  REXKRNL_INFO("GEBODIES stage {}: {} AI lists, {} characters fade at once", LD32(base, GE_CURRENT_STAGE),
+               lists, found);
+}
+}  // namespace
+
+// Called each frame (input poll): when fewer than ge_body_free_slots guard slots
+// are free, the oldest lying body starts its fade so reinforcements can come.
+void ge_corpse_slots_tick(uint8_t* base) {
+  scan_scripted_chrs(base);
+  const uint32_t slots = LD32(base, kChrSlots);
+  const uint32_t count = LD32(base, kChrSlots + 4u);
+  if (!in_ram(slots) || count == 0 || count > 200) {
+    g_fading_for_slot.clear();
+    return;
+  }
+  ++g_body_tick;
+  int free_slots = 0;
+  for (uint32_t i = 0; i < count; ++i)
+    if (LD32(base, slots + i * kChrSize + 0x1Cu) == 0) ++free_slots;  // no model: free
+  uint32_t oldest = 0;
+  int32_t oldest_t = INT32_MIN;
+  for (auto it = g_lying.begin(); it != g_lying.end();) {
+    const uint32_t chr = it->first;
+    const int32_t t = static_cast<int32_t>(LD32(base, chr + 44u));
+    if (g_body_tick - it->second > 3u || LD32(base, chr + 0x1Cu) == 0 || t > -2) {
+      it = g_lying.erase(it);
+      continue;
+    }
+    if (t > oldest_t) {  // our timer counts up towards -1: the highest lay longest
+      oldest_t = t;
+      oldest = chr;
+    }
+    ++it;
+  }
+  int pending = 0;  // bodies already fading for a slot: their slots come free soon
+  for (auto it = g_fading_for_slot.begin(); it != g_fading_for_slot.end();) {
+    if (LD32(base, it->first + 0x1Cu) == 0 || --it->second <= 0) {
+      it = g_fading_for_slot.erase(it);
+    } else {
+      ++pending;
+      ++it;
+    }
+  }
+  if (oldest && free_slots + pending < REXCVAR_GET(ge_body_free_slots)) {
+    REXKRNL_INFO("GEBODIES {} guard slots free: chr {} fades now", free_slots + pending,
+                 static_cast<int16_t>(LD16(base, oldest)));
+    ST32(base, oldest + 44u, 0u);  // start the stock fade (90 frames)
+    g_fading_for_slot.emplace_back(oldest, 180);
+    g_lying.erase(oldest);
+  }
+}
+
 bool ge_corpse_linger(PPCRegister& r3) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const uint32_t chr = r3.u32;
   const int32_t t = static_cast<int32_t>(LD32(base, chr + 44u));
   if (t >= 0) return false;  // fading: the game's own code
+  const int16_t num = static_cast<int16_t>(LD16(base, chr));
+  if (num >= 0 && num < 256 && g_scripted_chrs[num]) {  // a script waits for it
+    if (t == -1) REXKRNL_INFO("GEBODIES chr {} died: a script waits for it, fades at once", num);
+    return false;
+  }
   const int32_t linger = std::clamp(REXCVAR_GET(ge_body_seconds), 0, 600) * 60;
   if (t == -1) {  // just died
+    REXKRNL_INFO("GEBODIES chr {} died: lies {} s", num, linger / 60);
     if (linger == 0) return false;
     ST32(base, chr + 44u, static_cast<uint32_t>(-2 - linger));
+    g_lying[chr] = g_body_tick;
     return true;
   }
   const int32_t clock = static_cast<int32_t>(LD32(base, 0x82F1E710u));  // frames this tick
   const int32_t next = t + std::max(clock, 1);
   ST32(base, chr + 44u, static_cast<uint32_t>(next >= -1 ? 0 : next));
+  g_lying[chr] = g_body_tick;
   return true;
 }
 
@@ -3511,6 +4745,258 @@ void ge_stan_edge_tick(uint8_t* base) {
     if (LD16(base, e.addr) != want) ST16(base, e.addr, want);
   }
 }
+// See-through door models (issue #19). Some of Rare's converted N64 door models
+// store vertex alpha 0 (some 0x3F/0x40) and near-black colours. The N64 ignored
+// that alpha; the 360 prop shader multiplies the output alpha by it and blends,
+// so those parts drew nothing while their collision worked:
+// - Egyptian's stone models cryptdoor1a/2a/2b/3/4: the secret doors, the panels
+//   over the four autoguns around the golden gun, the golden gun's pedestal
+//   ("invisible walls", missing textures).
+// - doordest2 (model 0x99, multiplayer Frigate): the door's back drew nothing,
+//   so it looked one-sided.
+// Their vertex buffers are copies of the file's vertex block in physical memory:
+// find each block by the bytes in the player's own file and make the broken
+// vertices opaque. Both graphics modes draw these blocks, so their colour follows
+// the mode and is redone when it changes. Vertices that were opaque keep theirs.
+namespace {
+struct SeeThroughModel {
+  const char* rel;  // under assets
+  uint32_t size;    // stock file size, so other data is left alone
+  uint32_t offset;  // vertex block in the file (24-byte vertices, colour A, B, G, R at +20)
+  uint32_t count;
+  bool stone;       // Egyptian stone (colour per graphics mode) or the Frigate door
+};
+constexpr SeeThroughModel kSeeThroughModels[] = {
+    {"files/original/prop/cryptdoor1a/default.bin", 31704, 0x708, 24, true},
+    {"files/new/prop/cryptdoor1a/default.bin", 31676, 0x6F4, 24, true},
+    {"files/original/prop/cryptdoor2a/default.bin", 31704, 0x708, 24, true},
+    {"files/new/prop/cryptdoor2a/default.bin", 31676, 0x6F4, 24, true},
+    {"files/original/prop/cryptdoor2b/default.bin", 31704, 0x708, 24, true},
+    {"files/new/prop/cryptdoor2b/default.bin", 31676, 0x6F4, 24, true},
+    {"files/original/prop/cryptdoor3/default.bin", 41072, 0x84C, 48, true},
+    {"files/new/prop/cryptdoor3/default.bin", 41044, 0x834, 48, true},
+    {"files/original/prop/cryptdoor4/default.bin", 22284, 0x5B8, 24, true},
+    {"files/new/prop/cryptdoor4/default.bin", 22268, 0x5AC, 24, true},
+    {"files/original/prop/doordest2/default.bin", 72320, 0xE7C, 52, false},
+    {"files/new/prop/doordest2/default.bin", 72280, 0xE58, 52, false},
+};
+constexpr uint32_t kVertexStride = 24u;
+
+std::filesystem::path ge_assets_root() {
+  std::filesystem::path root = rex::filesystem::GetExecutableFolder();
+  std::string name = root.filename().string();
+  for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (name == "runtime") root = root.parent_path();  // release: resources\runtime -> resources\assets
+  return root / "assets";
+}
+
+// The stock vertex blocks (read once from the player's files; empty if a file differs).
+const std::vector<std::vector<uint8_t>>& see_through_blocks() {
+  static std::vector<std::vector<uint8_t>> blocks;
+  static bool read = false;
+  if (read) return blocks;
+  read = true;
+  const std::filesystem::path root = ge_assets_root();
+  for (const SeeThroughModel& m : kSeeThroughModels) {
+    std::vector<uint8_t> block;
+    std::error_code ec;
+    const std::filesystem::path p = root / m.rel;
+    if (std::filesystem::file_size(p, ec) == m.size && !ec) {
+      if (FILE* f = _wfopen(p.c_str(), L"rb")) {
+        block.resize(m.count * kVertexStride);
+        if (std::fseek(f, static_cast<long>(m.offset), SEEK_SET) != 0 ||
+            std::fread(block.data(), 1, block.size(), f) != block.size())
+          block.clear();
+        std::fclose(f);
+      }
+    }
+    if (block.empty()) REXKRNL_WARN("GEDOORS {} not as expected: left alone", m.rel);
+    blocks.push_back(std::move(block));
+  }
+  return blocks;
+}
+
+// Blocks patched since the stage loaded: guest address, model index.
+std::vector<std::pair<uint32_t, size_t>> g_see_through_found;
+
+// Makes the broken vertices of a found block opaque in the colour for the mode.
+// Egyptian stone, classic graphics: from Rare's per-face value (0x00-0x33), as
+// 0xE0 - 2x with a slightly cool tint, which matches N64 footage: the carved
+// panels darker blue-grey, the plain sides lighter.
+// Remastered (with the temple textures swapped in): a flat warm stone grey.
+// The Frigate door: the grey of its other side. Which vertices were broken
+// comes from the stock block.
+void see_through_colour(uint8_t* base, const std::pair<uint32_t, size_t>& f, bool classic) {
+  const auto& stock = see_through_blocks()[f.second];
+  const SeeThroughModel& m = kSeeThroughModels[f.second];
+  uint8_t* q = base + f.first;
+  for (size_t v = 0; v < stock.size(); v += kVertexStride) {
+    if (stock[v + 20] >= 0x80) continue;
+    // Still our block (the game may have reused the memory): position unchanged.
+    if (std::memcmp(q + v, stock.data() + v, 12) != 0) return;
+    uint8_t bgr[3] = {0xA0, 0xA0, 0xA0};
+    if (m.stone && classic) {
+      constexpr int tint[3] = {255, 240, 224};  // B, G, R: slightly cool, like the N64's
+      for (int c = 0; c < 3; ++c)
+        bgr[c] = static_cast<uint8_t>(std::clamp(0xE0 - stock[v + 21 + c] * 2, 0, 255) * tint[c] / 255);
+    } else if (m.stone) {
+      const uint8_t grey[3] = {0x70, 0x7C, 0x88};
+      std::memcpy(bgr, grey, 3);
+    }
+    q[v + 20] = 0xFF;
+    std::memcpy(q + v + 21, bgr, 3);
+  }
+}
+
+// Scans the 0xA0000000 physical view (16-byte steps) for the stock blocks and
+// patches them. Returns how many blocks it changed.
+int see_through_patch_pass(uint8_t* base, bool classic) {
+  const auto& blocks = see_through_blocks();
+  uint32_t firsts[std::size(kSeeThroughModels)] = {};
+  bool any = false;
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    if (blocks[i].empty()) continue;
+    std::memcpy(&firsts[i], blocks[i].data(), 4);
+    any = true;
+  }
+  if (!any) return 0;
+  int changed = 0;
+  uint8_t* lo = base + 0xA0000000ull;
+  uint8_t* hi = base + 0xC0000000ull;
+  for (uint8_t* p = lo; p < hi;) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+    uint8_t* end = std::min(static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize, hi);
+    const DWORD prot = mbi.Protect & 0xFF;
+    // Read-only pages here are the GPU caches' write watches: a store into them is
+    // caught and invalidates the cached copy, exactly as for the game's own stores.
+    const bool readable = mbi.State == MEM_COMMIT &&
+                          (prot == PAGE_READWRITE || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READWRITE ||
+                           prot == PAGE_EXECUTE_READ || prot == PAGE_WRITECOPY);
+    if (readable) {
+      uint8_t* first = lo + ((static_cast<uint8_t*>(mbi.BaseAddress) - lo + 15) & ~uintptr_t(15));
+      for (uint8_t* q = first; q + 4 <= end; q += 16) {
+        uint32_t w;
+        std::memcpy(&w, q, 4);
+        for (size_t i = 0; i < blocks.size(); ++i) {
+          const auto& b = blocks[i];
+          if (b.empty() || w != firsts[i] || q + b.size() > end || std::memcmp(q, b.data(), b.size()) != 0)
+            continue;
+          g_see_through_found.emplace_back(static_cast<uint32_t>(q - base), i);
+          see_through_colour(base, g_see_through_found.back(), classic);
+          ++changed;
+          break;
+        }
+      }
+    }
+    p = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+  }
+  return changed;
+}
+}  // namespace
+
+// Each frame (input poll): look for the blocks soon after a stage loads (and once
+// more after a graphics mode switch), and recolour them when the mode changes.
+void ge_see_through_doors_tick(uint8_t* base) {
+  static uint32_t frames = 0, last_setup = 0;
+  static int toggle_wait = -1;
+  static uint8_t last_classic = 0xFF;
+  if (LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE) {
+    last_setup = 0;
+    g_see_through_found.clear();
+    return;
+  }
+  const uint32_t setup = LD32(base, 0x82F30398u);
+  if (setup != last_setup) {
+    last_setup = setup;
+    frames = 0;
+    g_see_through_found.clear();
+  }
+  const uint8_t classic = base[0x82F0DF11u];  // old graphics flag (1 = classic)
+  if (classic != last_classic) {
+    if (last_classic != 0xFF) {
+      for (const auto& f : g_see_through_found) see_through_colour(base, f, classic != 0);
+      toggle_wait = 10;
+    }
+    last_classic = classic;
+  }
+  ++frames;
+  bool scan = frames == 2 || frames == 30 || frames == 120;
+  if (toggle_wait >= 0 && toggle_wait-- == 0) scan = true;
+  if (!scan) return;
+  const int changed = see_through_patch_pass(base, classic != 0);
+  if (changed) REXKRNL_INFO("GEDOORS {} see-through door blocks made solid", changed);
+}
+
+// Silo: the two missiles (model 93 on bound pads 10032/10033) reach up through
+// the walkway rooms around their shafts, but the level has no portals between
+// those rooms and the shafts, so each missile is only listed in its shaft's
+// rooms and is culled while seen from the walkways (issue #18; the BeanTools
+// Silo data adds those portals instead). List the walkway rooms on the missiles
+// too: prop +0x30 holds up to 7 room ids ended by 0xFF.
+// Egyptian: the golden gun's glass case is four sliding glass doors (model
+// 0x146, doorwin) that drop into the stone pedestal. The 360 draws props with
+// blending, so the pedestal doesn't hide the glass inside it: lowered, the
+// panels stood just above the top and showed through the pedestal's sides.
+// While all four are down (at least 90% of their travel), their draws are
+// skipped (ge_model_draw_fixes), as the N64's pedestal hid them.
+bool g_egypt_glass_down = false;
+void ge_egypt_glass_tick(uint8_t* base) {
+  static int countdown = 0;
+  if (LD32(base, GE_CURRENT_STAGE) != 0x20u) {
+    g_egypt_glass_down = false;
+    return;
+  }
+  if (--countdown > 0) return;
+  countdown = 4;
+  const uint32_t player = LD32(base, GE_PLAYER_PTR);
+  const uint32_t start = player ? LD32(base, player + 0x1ACu) : 0u;
+  if (!start) return;
+  uint32_t prop = start;
+  for (int n = 0; n < 4096 && LD32(base, prop + 0x28u); ++n) prop = LD32(base, prop + 0x28u);
+  int glass = 0, down = 0;
+  for (int n = 0; prop && n < 4096; ++n, prop = LD32(base, prop + 0x2Cu)) {
+    if (base[prop] != 2u) continue;  // doors only
+    const uint32_t obj = LD32(base, prop + 8u);
+    if (!obj || LD16(base, obj + 4u) != 0x146u) continue;
+    ++glass;
+    float max_frac, frac;
+    const uint32_t mf = LD32(base, obj + 0x84u), f = LD32(base, obj + 0xB4u);
+    std::memcpy(&max_frac, &mf, 4);
+    std::memcpy(&frac, &f, 4);
+    if (max_frac > 0.f && frac >= 0.9f * max_frac) ++down;
+  }
+  g_egypt_glass_down = glass > 0 && down == glass;
+}
+
+void ge_silo_missile_rooms_tick(uint8_t* base) {
+  if (LD32(base, GE_CURRENT_STAGE) != 0x14u) return;
+  const uint32_t player = LD32(base, GE_PLAYER_PTR);
+  const uint32_t start = player ? LD32(base, player + 0x1ACu) : 0u;
+  if (!start) return;
+  // Active props are a list (prev +0x28, next +0x2C) that holds Bond.
+  uint32_t prop = start;
+  for (int n = 0; n < 4096 && LD32(base, prop + 0x28u); ++n) prop = LD32(base, prop + 0x28u);
+  for (int n = 0; prop && n < 4096; ++n, prop = LD32(base, prop + 0x2Cu)) {
+    if (base[prop] != 1u) continue;  // objects only
+    const uint32_t obj = LD32(base, prop + 8u);
+    if (!obj || LD16(base, obj + 4u) != 93u) continue;
+    const uint16_t pad = LD16(base, obj + 6u);
+    std::string_view add;  // walkway room ids
+    if (pad == 10032u) add = std::string_view("\x1A\x1B\x1E", 3);  // shaft room 25 (by the start): 26, 27, 30
+    else if (pad == 10033u) add = std::string_view("\x11\x12", 2);  // shaft room 15: 17, 18
+    else continue;
+    uint8_t* rooms = base + prop + 0x30u;
+    int count = 0;
+    while (count < 7 && rooms[count] != 0xFFu) ++count;
+    for (const char c : add) {
+      const uint8_t room = static_cast<uint8_t>(c);
+      if (count >= 7 || std::memchr(rooms, room, count)) continue;
+      rooms[count++] = room;
+      rooms[count] = 0xFFu;
+    }
+  }
+}
 // Frigate multiplayer: five doors, at (+-206, -569), (-206, -2075) and the
 // balconies (+-597, -158), were locked (key 0x80), most of them missing the
 // open-away-from-player flag every other door has, and used door model 0x99,
@@ -3591,6 +5077,10 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     REXKRNL_INFO("GECE community data bug-fixes applied");
   }
   ge_stan_edge_tick(base);
+  ge_silo_missile_rooms_tick(base);
+  ge_corpse_slots_tick(base);
+  ge_see_through_doors_tick(base);
+  ge_egypt_glass_tick(base);
 
   // Skip the boot screen that jokes about the Nintendo logo (menu 2, drawn by
   // sub_820ED378). The current menu is at 0x8272B35C and a requested change at
@@ -3641,6 +5131,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // raw-mouse thread only accumulates deltas while the game is focused and the
   // cursor is captured, so this is a no-op in menus / when unfocused.
   ge_start_mouse_once();
+  ge_start_dam_spike_fix_once(base);
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
 
   ge_script_apply(base);
@@ -3657,6 +5148,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
                      menu != 12u && menu != 24u && menu != 25u);
   }
   ge_screen_ratio_tick(base);
+  ge_autoaim_tick(base);
   ge_charsel_tick(base);
 
   if (g_test_aim > 0) {
@@ -4089,34 +5581,393 @@ void ApplyPlayerName(const std::string& requested) {
 // built-in one is kept off: before each draw of that model (sub_8209D250(res),
 // at 0x8209D270 with r31 = res; res + 16 holds its file path) the bit is cleared.
 //
-// Old graphics: some original bodies have a head built in although the body
-// table says they have none (byte +25 clear): Bond's four (boilerbond,
-// suitbond, timberbond, snowbond) and the Russian infantry guard (greatguard2).
-// The game attaches a separate head to them too, and two faces cut through
-// each other. In the new graphics those bodies are headless and need it, so
-// only the original-graphics draw of the separate head is skipped: a character
-// draws its body, then its head, so a head drawn right after one of these
-// bodies is left out (true jumps to the draw's return, 0x8209D3A4).
+// Old graphics: an original body model made to wear a separate head has the
+// attachment point CP_HEADCHILD; one without it has its head built in. The
+// game adds a separate head when the body table (0x82729020, 36-byte entries,
+// +25 the body has its own head) says it has none. That table follows the new
+// graphics, and some original bodies it says that of have a head built in, so
+// two faces cut through each other: Bond's four, greatguard2, blueman,
+// bluewoman and greyman. A character draws its body, then its head, so an
+// original head drawn right after an original body with its own head is left
+// out (true jumps to the draw's return, 0x8209D3A4). (The new models attach
+// their heads differently: CP_HEADCHILD says nothing there.)
 namespace {
-bool g_body_has_head = false;  // the last original body drawn has its own head
+bool g_body_has_head = false;  // the last body drawn has its own head
+
+// Whether the model file a draw names ("game:\\files\\...") has a head built
+// in: no CP_HEADCHILD in it. Read once per file from the game data folder.
+bool model_has_own_head(const char* guest_path) {
+  static std::unordered_map<std::string, bool> cache;
+  const auto it = cache.find(guest_path);
+  if (it != cache.end()) return it->second;
+  bool own_head = false;
+  const char* rel = std::strchr(guest_path, ':');
+  if (rel) {
+    std::filesystem::path root = rex::filesystem::GetExecutableFolder();
+    std::string name = root.filename().string();
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (name == "runtime") root = root.parent_path();  // release: resources\\runtime -> resources\\assets
+    std::string tail = rel + 1;
+    while (!tail.empty() && (tail[0] == '\\' || tail[0] == '/')) tail.erase(0, 1);
+    if (FILE* f = _wfopen((root / "assets" / tail).c_str(), L"rb")) {
+      std::string data;
+      char buf[65536];
+      for (size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;) data.append(buf, n);
+      std::fclose(f);
+      own_head = !data.empty() && data.find("CP_HEADCHILD") == std::string::npos;
+    }
+  }
+  cache.emplace(guest_path, own_head);
+  return own_head;
 }
+
+// The pause watch arm (char\suitlfhand) holds every sleeve Bond can wear. The
+// N64 showed one, picked by the player's outfit (bondviewSelectCuff and its
+// switches SW_BOILER..SW_SNOW); both Xbox arm models lost those switches, so
+// every sleeve was drawn at once and the bulky ones poked through. The outfit
+// is still set from the stage setup (player +0x544, the N64 CUFF_* values:
+// 0 blue suit, 1 Brosnan tuxedo, 2 jungle, 3 boiler suit, 4 snow, 5 Connery,
+// 6 Dalton, 7 Moore, 8 folder). The arm's command list, loaded at res+8 ->
+// +0xEC -> {start, end}, draws each texture's pieces in a block opened by an
+// op 0x16 (3 render passes); a sleeve block of another outfit has its first
+// 8 bytes turned into op 0x19 (goto) to the next block, restored on change.
+struct CuffArm {
+  uint32_t stream = 0;              // command list start, to notice a reload
+  std::vector<uint32_t> blocks;     // every op 0x16 in order
+  std::vector<std::pair<int, std::array<uint8_t, 8>>> saved;  // patched block -> original bytes
+  int outfit = -2;
+};
+constexpr uint32_t kCurrentPlayer = 0x82F1FAACu;
+constexpr uint32_t kPlayerCuff = 0x544u;
+
+// Sleeve blocks (index into the op 0x16 list) and which of them each outfit wears.
+// Classic: blocks 2.. are the arm's 22 textures in order; 10 is the shirt cuff
+// shared by the three suits (checked against each sleeve's length in game). Remastered: blocks 6..10 are its five sleeves.
+std::vector<int> cuff_blocks(bool remastered) {
+  if (remastered) return {6, 7, 8, 9, 10};
+  return {8, 9, 10, 11, 12, 13, 14, 15};
+}
+std::vector<int> cuff_worn(bool remastered, int outfit) {
+  if (remastered) {
+    switch (outfit) {
+      case 0: return {10};      // blue suit, light blue shirt cuff
+      case 2: return {7};       // jungle
+      case 3: return {9};       // boiler suit, knitted cuff
+      case 4: return {8};       // snow parka
+      default: return {6};      // the tuxedos (no white jacket in this model)
+    }
+  }
+  switch (outfit) {
+    case 0: return {13, 10};    // blue suit + shirt cuff
+    case 2: return {14};        // jungle (rolled sleeve)
+    case 3: return {8, 9};      // boiler suit: knitted cuff + short sleeve
+    case 4: return {15};        // snow parka
+    case 5: return {12, 10};    // Connery's white jacket + shirt cuff
+    default: return {11, 10};   // black tuxedo + shirt cuff
+  }
+}
+
+// Classic watch winder knobs: the arm's last block (texture 21, two quads, one
+// each side of the watch). Rare's conversion of the N64 picture lost its
+// transparency (every DXT1 block is opaque, the background solid black) and
+// the classic shader writes alpha 1, so neither a cut-out nor alpha blending
+// can hide the black squares around the knobs on the pause watch. The knob's
+// own colour is the mask instead:
+//   - the picture is touched up once: the knob's darkest texels are lifted to
+//     at least kKnobFloor, the background stays exactly black (knob_texture);
+//   - the knob is drawn kKnobMaskPasses times blended ZERO / INVSRCCOLOR, each
+//     pass scaling what is behind it by (1 - knob colour): behind the knob it
+//     goes to black (at most (1 - floor)^passes, about 2%), around it nothing
+//     changes;
+//   - then once blended ONE / ONE: the knob lands on that black at full
+//     strength and its black squares add nothing.
+// Depth writes are off throughout. The block's bone/primitive ops are copied to
+// a guest buffer between render-state ops (op 0x0C {offset, value}, Xbox 360
+// D3DRS byte offsets) and the original bone op becomes a goto there. The states
+// end on the values the game's own command lists use (blend off, SRCALPHA /
+// INVSRCALPHA, depth writes on).
+constexpr int kKnobFloor = 24;       // of 255, per channel
+constexpr int kKnobMaskPasses = 40;  // (1 - 24/255)^40 = 2%
+
+// DXT1, 8-in-16 byte order (as the CAFF textures are stored): lifts every
+// non-black texel to kKnobFloor per channel and keeps black texels black,
+// using the 3-colour mode (index 3 = black) where a block holds both.
+void knob_texture(uint8_t* p, uint32_t bytes) {
+  using Rgb = std::array<int, 3>;
+  auto rgb = [](uint16_t c) {
+    return Rgb{((c >> 11) & 31) * 255 / 31, ((c >> 5) & 63) * 255 / 63, (c & 31) * 255 / 31};
+  };
+  auto pack = [](const Rgb& c) {
+    return static_cast<uint16_t>(((c[0] * 31 + 127) / 255) << 11 | ((c[1] * 63 + 127) / 255) << 5 |
+                                 ((c[2] * 31 + 127) / 255));
+  };
+  auto black = [](const Rgb& c) { return c[0] == 0 && c[1] == 0 && c[2] == 0; };
+  for (uint32_t i = 0; i + 8 <= bytes; i += 8) {
+    uint8_t* b = p + i;
+    const uint16_t c0 = static_cast<uint16_t>(b[1] | b[0] << 8), c1 = static_cast<uint16_t>(b[3] | b[2] << 8);
+    const uint32_t idx = static_cast<uint32_t>(b[5] | b[4] << 8 | b[7] << 16 | b[6] << 24);
+    if (c0 == 0 && c1 == 0) continue;  // all black: background
+    std::array<Rgb, 4> pal{rgb(c0), rgb(c1), Rgb{}, Rgb{}};
+    const bool four = c0 > c1;
+    for (int k = 0; k < 3; ++k) {
+      pal[2][k] = four ? (2 * pal[0][k] + pal[1][k]) / 3 : (pal[0][k] + pal[1][k]) / 2;
+      pal[3][k] = four ? (pal[0][k] + 2 * pal[1][k]) / 3 : 0;
+    }
+    std::array<Rgb, 16> px;
+    bool any_black = false;
+    for (int j = 0; j < 16; ++j) {
+      px[j] = pal[(idx >> (2 * j)) & 3];
+      any_black |= black(px[j]);
+    }
+    Rgb lo{255, 255, 255}, hi{0, 0, 0};
+    bool any_knob = false;
+    for (Rgb& c : px) {
+      if (black(c)) continue;
+      any_knob = true;
+      for (int k = 0; k < 3; ++k) {
+        c[k] = std::max(c[k], kKnobFloor);
+        lo[k] = std::min(lo[k], c[k]);
+        hi[k] = std::max(hi[k], c[k]);
+      }
+    }
+    if (!any_knob) continue;
+    uint16_t e0 = pack(hi), e1 = pack(lo);
+    std::array<Rgb, 4> out;
+    int colours;
+    if (any_black) {  // 3-colour mode: c0 <= c1, index 3 = black
+      if (e0 > e1) std::swap(e0, e1);
+      out = {rgb(e0), rgb(e1), Rgb{}, Rgb{}};
+      for (int k = 0; k < 3; ++k) out[2][k] = (out[0][k] + out[1][k]) / 2;
+      colours = 3;
+    } else {  // 4-colour mode: c0 > c1
+      if (e0 == e1) {
+        if (e0 < 0xFFFF) ++e0; else --e1;
+      }
+      if (e0 < e1) std::swap(e0, e1);
+      out = {rgb(e0), rgb(e1), Rgb{}, Rgb{}};
+      for (int k = 0; k < 3; ++k) {
+        out[2][k] = (2 * out[0][k] + out[1][k]) / 3;
+        out[3][k] = (out[0][k] + 2 * out[1][k]) / 3;
+      }
+      colours = 4;
+    }
+    uint32_t ni = 0;
+    for (int j = 0; j < 16; ++j) {
+      int q = 3;
+      if (!black(px[j])) {
+        int best = INT32_MAX;
+        for (int t = 0; t < colours; ++t) {
+          int d = 0;
+          for (int k = 0; k < 3; ++k) d += (px[j][k] - out[t][k]) * (px[j][k] - out[t][k]);
+          if (d < best) { best = d; q = t; }
+        }
+      }
+      ni |= static_cast<uint32_t>(q) << (2 * j);
+    }
+    b[0] = static_cast<uint8_t>(e0 >> 8); b[1] = static_cast<uint8_t>(e0);
+    b[2] = static_cast<uint8_t>(e1 >> 8); b[3] = static_cast<uint8_t>(e1);
+    b[4] = static_cast<uint8_t>(ni >> 8); b[5] = static_cast<uint8_t>(ni);
+    b[6] = static_cast<uint8_t>(ni >> 24); b[7] = static_cast<uint8_t>(ni >> 16);
+  }
+}
+
+void ge_watch_knob_blend(uint8_t* base, uint32_t rg, uint32_t block, uint32_t end) {
+  uint32_t bones = 0, prim = 0, stop = 0;
+  bool material = false;
+  for (uint32_t p = block; p + 4 <= end;) {
+    const uint32_t size = LD32(base, p) >> 16;
+    const uint8_t op = base[p + 2];
+    if (size < 4) return;
+    if (op == 0x2D && !material) {  // the first pass's texture: the knob's is 21
+      if (LD32(base, p + 12) != 21) return;
+      material = true;
+    }
+    if (op == 0x13) bones = p;
+    else if (op == 0x01 && bones && !prim) prim = p;
+    else if (op == 0x1D) { stop = p; break; }
+    else if (prim) return;  // more than one primitive: not the block we know
+    p += size;
+  }
+  if (!bones || !prim || !stop || prim != bones + 16 || stop != prim + 16) {
+    REXKRNL_WARN("GEKNOB classic watch knob block not as expected; left as it is");
+    return;
+  }
+  // The knob picture: texture 21 of the arm (table at rendergraph +0x7C, each
+  // entry a "texture" resource with its D3D texture object at +0x34; the
+  // fetch constant at object +28). 64x64 DXT1, tiled, 8-in-16, CAFF-loaded
+  // (0xE0000000 range, data 4 KB on).
+  if (LD32(base, rg + 0x1C) != 22) return;
+  const uint32_t tex_res = LD32(base, LD32(base, rg + 0x7C) + 21 * 4);
+  const uint32_t tex_obj = tex_res ? LD32(base, tex_res + 0x34) : 0;
+  if (!tex_obj) return;
+  const uint32_t f0 = LD32(base, tex_obj + 28), f1 = LD32(base, tex_obj + 32), f2 = LD32(base, tex_obj + 36);
+  const uint32_t phys = f1 & 0xFFFFF000u;
+  if ((f1 & 0x3F) != 18 || ((f1 >> 6) & 3) != 1 || !(f0 >> 31) || phys < 0xE0000000u || (f2 & 0x1FFF) != 63 ||
+      ((f2 >> 13) & 0x1FFF) != 63) {
+    REXKRNL_WARN("GEKNOB classic watch knob picture not as expected; left as it is");
+    return;
+  }
+  knob_texture(base + phys + 0x1000, 32 * 32 * 8);  // 16x16 blocks, tiled in a 32x32-block area
+  static uint32_t cave = 0;
+  constexpr uint32_t kCaveBytes = 4 * 12 + kKnobMaskPasses * 32 + 2 * 12 + 32 + 4 * 12 + 8;
+  if (!cave) cave = rex::system::kernel_state()->memory()->SystemHeapAlloc(kCaveBytes);
+  if (!cave) return;
+  uint32_t w = cave;
+  auto state = [&](uint32_t offset, uint32_t value) {
+    ST32(base, w, 0x000C0C00u); ST32(base, w + 4, offset); ST32(base, w + 8, value); w += 12;
+  };
+  auto draw = [&]() {
+    std::memcpy(base + w, base + bones, 32);  // the bone op and the primitive op
+    const uint32_t bone_list = LD32(base, w + 4);  // points into the bone op itself
+    if (bone_list >= bones && bone_list < bones + 16) ST32(base, w + 4, w + (bone_list - bones));
+    w += 32;
+  };
+  state(0x3C, 1);  // D3DRS_ALPHABLENDENABLE
+  state(0x30, 0);  // D3DRS_ZWRITEENABLE
+  state(0x48, 0);  // D3DRS_SRCBLEND = ZERO
+  state(0x4C, 5);  // D3DRS_DESTBLEND = INVSRCCOLOR
+  for (int i = 0; i < kKnobMaskPasses; ++i) draw();
+  state(0x48, 1);  // ONE
+  state(0x4C, 1);  // ONE
+  draw();
+  state(0x3C, 0);
+  state(0x48, 6);  // SRCALPHA
+  state(0x4C, 7);  // INVSRCALPHA
+  state(0x30, 1);
+  ST32(base, w, 0x00081900u); ST32(base, w + 4, stop);  // goto the list's end
+  // The bone op becomes a goto to the copy; its other 8 bytes another (never
+  // reached) goto, so the list still walks op by op.
+  for (uint32_t p = bones; p < prim; p += 8) { ST32(base, p, 0x00081900u); ST32(base, p + 4, cave); }
+  REXKRNL_INFO("GEKNOB classic watch knobs drawn without their black squares");
+}
+
+void ge_select_cuff(uint8_t* base, uint32_t res, bool remastered) {
+  static std::unordered_map<uint32_t, CuffArm> arms;
+  const uint32_t player = LD32(base, kCurrentPlayer);
+  if (!player) return;
+  const int outfit = static_cast<int>(LD32(base, player + kPlayerCuff));
+  if (outfit < 0 || outfit > 8) return;
+  const uint32_t rg = LD32(base, res + 8);
+  const uint32_t hdr = rg ? LD32(base, rg + 0xEC) : 0;
+  const uint32_t start = hdr ? LD32(base, hdr) : 0;
+  const uint32_t end = hdr ? LD32(base, hdr + 4) : 0;
+  if (!start || end <= start || end - start > 0x10000) return;
+  CuffArm& arm = arms[res];
+  if (arm.stream != start) {  // first draw, or the model was loaded again
+    arm = CuffArm{};
+    arm.stream = start;
+    for (uint32_t p = start; p + 4 <= end;) {
+      const uint32_t size = LD32(base, p) >> 16;
+      const uint8_t op = base[p + 2];
+      if (size < 4 || base[p + 3] != 0) { arm.blocks.clear(); break; }
+      if (op == 0x16) arm.blocks.push_back(p);
+      if (op == 0x1D) break;
+      p += size;
+    }
+    const size_t expected = remastered ? 17 : 24;
+    if (arm.blocks.size() != expected) {
+      REXKRNL_WARN("GECUFF {} arm: {} blocks, expected {}; sleeves left as they are",
+                   remastered ? "remastered" : "classic", arm.blocks.size(), expected);
+      arm.blocks.clear();
+    } else if (!remastered) {
+      ge_watch_knob_blend(base, rg, arm.blocks.back(), end);
+    }
+  }
+  if (arm.blocks.empty() || arm.outfit == outfit) return;
+  for (const auto& [b, bytes] : arm.saved) std::memcpy(base + arm.blocks[b], bytes.data(), 8);
+  arm.saved.clear();
+  const std::vector<int> worn = cuff_worn(remastered, outfit);
+  for (int b : cuff_blocks(remastered)) {
+    if (std::find(worn.begin(), worn.end(), b) != worn.end()) continue;
+    std::array<uint8_t, 8> bytes;
+    std::memcpy(bytes.data(), base + arm.blocks[b], 8);
+    arm.saved.emplace_back(b, bytes);
+    ST32(base, arm.blocks[b], 0x00081900u);  // op 0x19, size 8: goto
+    ST32(base, arm.blocks[b] + 4, arm.blocks[b + 1]);
+  }
+  arm.outfit = outfit;
+  REXKRNL_INFO("GECUFF {} arm wears outfit {}", remastered ? "remastered" : "classic", outfit);
+}
+}  // namespace
+
+// Old graphics: Rare's original\head\headdave (the Dr. Doak face, also in the
+// random guard faces) was exported with rigid shaders (c_modelviewprojection)
+// on a skinned head, so the face never reaches the neck: the guard is drawn
+// headless with his hat floating. The new\head\headdave is fine. A model's
+// files are named when it is set up (sub_8211DB38(model, name, kind): the
+// original file first, at 0x8211DB78, sprintf "game:\files\original\%s\%s\..."
+// with r6 = kind, r7 = name), so the original file of headdave is taken from
+// headgrant, the closest classic face; the remastered file stays Dave's.
+void ge_classic_head_swap(PPCRegister& r6, PPCRegister& r7) {
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  if (r6.u32 < 0x80000000u || r7.u32 < 0x80000000u) return;
+  if (std::strcmp(reinterpret_cast<const char*>(base + r6.u32), "head") != 0) return;
+  if (std::strcmp(reinterpret_cast<const char*>(base + r7.u32), "headdave") != 0) return;
+  // The body/head table (0x82729020, 36-byte entries, name pointer at +4) names headgrant at entry 52.
+  const uint32_t name = LD32(base, 0x82729020u + 36u * 52u + 4u);
+  if (name < 0x80000000u || std::strcmp(reinterpret_cast<const char*>(base + name), "headgrant") != 0) return;
+  r7.u64 = name;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXKRNL_INFO("GEHEADS classic headdave is drawn with headgrant (its own file has rigid shaders)");
+  }
+}
+
+// A guard's missed shot is traced along its aim line to where it leaves the
+// floor (a stan edge = a wall), and the N64 code (chraction.c) puts the bullet
+// spark and impact 26 units back from that point along the shot. When Bond
+// stands near a wall, a miss that passes him lands on that wall and its spark
+// is pulled back to beside or into his head, so it looks like the shot burst
+// in mid air on him. At 0x8212DDD8 (the guard fire code; this block only runs
+// for a miss; r1 + 112 = spark position, r30 + 21268 = the prop the trace
+// stopped at, 0 = a wall) true skips the spark and the wall impact (to
+// 0x8212E128) when a wall miss lands within kNearBond units of Bond. Misses
+// that hit other guards or objects, and all hits, are left alone.
+bool ge_guard_miss_spark(PPCRegister& r1, PPCRegister& r30) {
+  constexpr float kNearBond = 60.0f;
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  if (LD32(base, r30.u32 + 21268u) != 0) return false;
+  const uint32_t pl = LD32(base, 0x82F1FA98u);  // current player
+  const uint32_t bp = pl ? LD32(base, pl + 0x1ACu) : 0;  // Bond's prop, position at +0xC
+  if (!bp) return false;
+  auto f = [&](uint32_t a) { const uint32_t v = LD32(base, a); float r; std::memcpy(&r, &v, 4); return r; };
+  const float dx = f(r1.u32 + 112) - f(bp + 0xC);
+  const float dy = f(r1.u32 + 116) - f(bp + 0x10);
+  const float dz = f(r1.u32 + 120) - f(bp + 0x14);
+  // Bond's prop sits at eye height; his body reaches about 170 below it.
+  if (dx * dx + dz * dz > kNearBond * kNearBond || dy > kNearBond || dy < -200.0f) return false;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXKRNL_INFO("GESHOTS a guard's miss landed beside Bond: its spark is left out");
+  }
+  return true;
+}
+
 bool ge_model_draw_fixes(PPCRegister& r31) {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const char* path = reinterpret_cast<const char*>(base + r31.u32 + 16);
+  if (g_egypt_glass_down && std::strstr(path, "\\prop\\doorwin\\")) return true;  // see ge_egypt_glass_tick
+  if (std::strstr(path, "\\char\\suitlfhand\\")) {  // the watch arm: one sleeve, not a body
+    g_body_has_head = false;
+    ge_select_cuff(base, r31.u32, std::strstr(path, "\\new\\") != nullptr);
+    return false;
+  }
+  static std::string last_body;
   if (std::strstr(path, "\\original\\head\\")) {
     const bool skip = g_body_has_head;
     g_body_has_head = false;
+    static std::set<std::string> logged;
+    if (skip && logged.insert(last_body).second)
+      REXKRNL_INFO("GEHEADS {} has its own head: the separate head is left out", last_body);
     return skip;
   }
-  static const char* const kHeadedBodies[] = {
-      "\\original\\char\\boilerbond\\", "\\original\\char\\suitbond\\", "\\original\\char\\timberbond\\",
-      "\\original\\char\\snowbond\\", "\\original\\char\\greatguard2\\"};
   g_body_has_head = false;
-  for (const char* body : kHeadedBodies) {
-    if (std::strstr(path, body)) {
-      g_body_has_head = true;
-      return false;
-    }
+  if (std::strstr(path, "\\original\\char\\")) {
+    g_body_has_head = model_has_own_head(path);
+    last_body = path;
+    return false;
   }
   if (!std::strstr(path, "\\new\\prop\\chrautoshot\\")) return false;
   const uint32_t params = LD32(base, r31.u32 + 12);

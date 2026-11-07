@@ -13,26 +13,56 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/presenter_graphics_system.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <string>
 
 #include "ge_menu.h"
 #include "ge_postfx.h"
+#include "ge_native_shaders.h"
 #include "ge_setup.h"
 
 // Relaunch the current executable as a fresh process (implemented in
 // ge_hooks.cpp, which owns the Win32 includes). Used by the ONLINE menu's
 // "Save & Restart" so username/server/enable changes take effect on a clean
 // boot -- they are read at startup (UserProfile ctor, online client start).
+// Native renderer (src/ge_native_gpu.cpp): when on, no GPU plugin is loaded
+// and the game is drawn by the native Plume backend instead of Xenos.
+REXCVAR_DECLARE(bool, gpu_native);
+REXCVAR_DECLARE(bool, gpu_native_presenter);
+REXCVAR_DECLARE(std::string, gpu_native_api);
+
 namespace ge {
 void LaunchSelfDetached();
 // Start a fresh copy of the game and end this one at once (settings saved first).
 [[noreturn]] void RestartSelf();
+// A crash's exception and place as the log's last line (a filter installed at
+// start; ge_hooks.cpp). A normal close already ends with the SDK's "Window
+// closing" / "Title terminated" lines.
+void InstallCrashLog();
+// The native renderer's Texture Filtering (anisotropic_override; ge_native_gpu.cpp).
+void SetNativeAnisotropy(int value);
+int NativeAnisotropy();
+// The release launcher's path (empty in a dev build), and "Run Setup Again":
+// open its setup window and end the game.
+std::wstring LauncherPath();
+void RunSetupAgain();
+// The renderer this run uses (Video page: changing it restarts; ge_native_menu.cpp).
+void SetActiveRenderer(bool native);
+bool NativeRendererActive();
+// Render Scale: sets resolution_scale from ge_render_scale (ge_native_menu.cpp).
+void ApplyRenderScale();
+void ApplyRenderScaleToGpu();
+void LogSessionHeader();
+void ApplyUpscaling();
+void SetUpscalingChangedHandler(std::function<void()> handler);
+void ApplyDiagnostics();
 // Windowed mode: resize the game window's client area (call on the UI thread).
 void ResizeGameWindow(int w, int h);
 // Native Video Settings page: resize the window for a chosen resolution.
@@ -149,6 +179,10 @@ class GeApp : public rex::ReXApp {
       app_context().CallInUIThreadDeferred([this, defaults, resume] {
         if (window()) window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
         ge::SetMouselookSuppressed(false);
+        // The Render Scale was applied before this window (OnCreateDialogs);
+        // the emulated GPU starts with resume, so a scale chosen here counts now.
+        ge::ApplyRenderScale();
+        ge::ApplyRenderScaleToGpu();
         resume(defaults);
       });
     };
@@ -157,9 +191,105 @@ class GeApp : public rex::ReXApp {
     return std::nullopt;
   }
 
+  // Render Scale (ge_render_scale): picks the scale once the config is loaded;
+  // OnCreateDialogs hands it to the GPU plugin before the emulated GPU starts.
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    ge::InstallCrashLog();
+    // gpu_native (the default): run detached ("bring your own renderer") - no GPU
+    // plugin, the native backend (src/ge_native_gpu.cpp) draws the guest; false
+    // loads the classic Xenos plugin.
+    // With gpu_native_presenter the SDK's presenter-only graphics system shows
+    // its frames, so the ImGui overlays, PC menu and FSR work as with Xenos.
+    // Without Microsoft's shader compiler (dxcompiler.dll beside the exe) the
+    // native renderer could not translate the game's shaders: classic this run.
+    if (REXCVAR_GET(gpu_native)) {
+#if defined(_WIN32)
+      if (HMODULE dxc = LoadLibraryW(L"dxcompiler.dll")) {
+        FreeLibrary(dxc);
+      } else {
+        REXLOG_WARN("dxcompiler.dll not found: using the classic renderer this run");
+        rex::cvar::SetFlagByName("gpu_native", "false");
+      }
+#else
+      // No bundled shader compiler for the native renderer outside Windows yet:
+      // the classic Xenos renderer (Vulkan on MoltenVK on macOS).
+      rex::cvar::SetFlagByName("gpu_native", "false");
+#endif
+    }
+    ge::SetActiveRenderer(REXCVAR_GET(gpu_native));
+    if (REXCVAR_GET(gpu_native)) {
+      config.gpu_plugin.clear();
+      // Settings the Xenos plugin owns but the presenter and this game read by
+      // name; this run doesn't load the plugin, so register them here (ge.toml
+      // and command-line values waiting for them apply now). Without vsync the
+      // presenter tore every frame and the Video page's V-Sync row could not
+      // change; without vblank_timing_log performance_diagnostics logged
+      // nothing about presents.
+      static bool native_vsync = true, native_timing_log = false;
+      auto register_bool = [](const char* name, const char* category, const char* description,
+                              bool* value) {
+        rex::cvar::FlagEntry flag;
+        flag.name = name;
+        flag.type = rex::cvar::FlagType::Boolean;
+        flag.category = category;
+        flag.description = description;
+        flag.default_value = *value ? "true" : "false";
+        flag.setter = [value](std::string_view v) {
+          if (v == "true" || v == "1") *value = true;
+          else if (v == "false" || v == "0") *value = false;
+          else return false;
+          return true;
+        };
+        flag.getter = [value] { return std::string(*value ? "true" : "false"); };
+        rex::cvar::RegisterFlag(std::move(flag));
+      };
+      register_bool("vsync", "GPU", "Enable vertical sync", &native_vsync);
+      register_bool("vblank_timing_log", "Transient", "Log frame and present timing",
+                    &native_timing_log);
+      // Texture Filtering (anisotropic_override, -1 = the game's own, 0 off,
+      // n = 2^(n-1)x): the renderer reads it live (ge_native_gpu.cpp).
+      {
+        rex::cvar::FlagEntry flag;
+        flag.name = "anisotropic_override";
+        flag.type = rex::cvar::FlagType::Int32;
+        flag.category = "GPU";
+        flag.description = "Texture filtering: -1 the game's own, 0 off, 3 4x, 4 8x, 5 16x";
+        flag.default_value = "3";
+        flag.setter = [](std::string_view v) {
+          const std::string s(v);
+          char* end = nullptr;
+          const long n = std::strtol(s.c_str(), &end, 10);
+          if (s.empty() || *end != '\0' || n < -1 || n > 5) return false;
+          ge::SetNativeAnisotropy(static_cast<int>(n));
+          return true;
+        };
+        flag.getter = [] { return std::to_string(ge::NativeAnisotropy()); };
+        rex::cvar::RegisterFlag(std::move(flag));
+      }
+      // Vulkan: SPIR-V shaders and the SDK's Vulkan presenter (ge_native_vk_out.cpp).
+      const bool vulkan = REXCVAR_GET(gpu_native_api) == "vulkan";
+      ge::native_shaders::SetSpirv(vulkan);
+      using PresenterApi = rex::ui::PresenterGraphicsSystem::Api;
+      const PresenterApi api = vulkan ? PresenterApi::kVulkan : PresenterApi::kD3D12;
+      if (REXCVAR_GET(gpu_native_presenter) && rex::ui::PresenterGraphicsSystem::IsAvailable(api))
+        config.graphics = std::make_unique<rex::ui::PresenterGraphicsSystem>(api);
+    }
+    // The game counts its simulation steps in timebase ticks at the Xbox 360's
+    // 49.875 MHz. At the SDK's 50 MHz it stepped 0.25% faster than the 60 Hz
+    // vblank, so every ~6.8 s one frame advanced two steps: a visible jump.
+    rex::cvar::SetFlagByName("guest_timebase_hz", "49875000");
+    ge::ApplyRenderScale();
+    ge::ApplyUpscaling();  // present_effect, read when the presenter starts
+  }
+
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    // The GPU plugin (and its resolution_scale cvar) is loaded by now and the
+    // emulated GPU is not created yet: apply the Render Scale chosen above.
+    ge::ApplyRenderScaleToGpu();
+    ge::ApplyDiagnostics();
+    ge::LogSessionHeader();
     // Window/taskbar title shown while running. Overrides the SDK default
     // ("ge <build stamp>"); the internal app name stays "ge" so ge.toml and the
     // user data dir are unchanged.
@@ -172,6 +302,14 @@ class GeApp : public rex::ReXApp {
     ge::SetPcSettingsOpener([this] {
       app_context().CallInUIThreadDeferred([this] {
         if (!menu_) TogglePauseMenu();
+      });
+    });
+    // Upscaling changed on the Video page: the presenter re-reads its effect.
+    ge::SetUpscalingChangedHandler([this] {
+      app_context().CallInUIThreadDeferred([this] {
+        auto* gs = runtime() ? runtime()->graphics_system() : nullptr;
+        if (auto* presenter = gs ? gs->presenter() : nullptr)
+          presenter->ReloadGuestOutputPaintConfigFromCVarsFromUIThread();
       });
     });
     ge::SetWindowSizeHandler([this](int w, int h) {

@@ -53,6 +53,10 @@ bool IsInstalled(const Paths& p, std::wstring* missing);
 // Puts back resources\assets from .assets-previous if an import was cut off
 // in the middle of swapping the folders. Safe to call any time.
 void RecoverInterruptedSwap(const Paths& p);
+// Puts back program files from an update cut off half-way (*.update-old with
+// no file in its place), and clears what an update left behind (*.update-new,
+// the old launcher exe, resources\.update). update.cpp; safe to call any time.
+void RecoverInterruptedUpdate(const Paths& p);
 // True while the game from this folder is running (its exe cannot be opened
 // for writing then).
 bool GameRunning(const Paths& p);
@@ -136,6 +140,10 @@ struct SetupOptions {
   std::wstring reason;       // why setup opened (a missing file), for the log
 };
 int RunSetupWindow(HINSTANCE instance, const Paths& p, const SetupOptions& options);
+// --update (the game's Check for Updates > Update Now): downloads, verifies and
+// installs the latest release's program files (update.cpp). 0 when updated or
+// already up to date.
+int RunUpdateWindow(HINSTANCE instance, const Paths& p);
 
 // ---------------------------------------------------------------- utils --
 std::wstring FormatMB(uint64_t bytes);

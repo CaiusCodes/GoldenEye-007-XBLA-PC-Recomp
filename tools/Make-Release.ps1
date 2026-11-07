@@ -6,7 +6,8 @@
 #     licenses\
 #     resources\
 #       runtime\                  the game (GoldenEye 007.exe, rexruntime.dll,
-#                                 rexgpu-xenos.dll, VC++ runtime DLLs) and the
+#                                 rexgpu-xenos.dll, dxcompiler.dll, dxil.dll,
+#                                 VC++ runtime DLLs) and the
 #                                 port's own pictures and version.txt
 #
 # The first time the launcher runs it imports the game data from the player's
@@ -20,7 +21,10 @@ param(
     # Defaults to the VERSION file at the project root, the single source of truth.
     [string]$Version,
     # Folder holding the Visual C++ runtime DLLs to ship; found automatically.
-    [string]$VcRedistDir
+    [string]$VcRedistDir,
+    # Accepted for older command lines: every build now ships the native renderer's
+    # shader compiler (see $runtimeFiles below).
+    [switch]$Native
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,7 +48,20 @@ $stageRoot = Join-Path $releaseRoot "staging\$releaseName"
 $zipPath = Join-Path $releaseRoot "GoldenEye-007-XBLA-PC-Recomp-v$Version.zip"
 $exeName = "GoldenEye 007.exe"
 
-$runtimeFiles = @($exeName, "rexruntime.dll", "rexgpu-xenos.dll")
+# The native renderer (the default) translates the game's shaders on the player's PC
+# with Microsoft's shader compiler (dxcompiler.dll, dxil.dll); rexgpu-xenos.dll is the
+# classic renderer, kept as the gpu_native = false fallback.
+$runtimeFiles = @($exeName, "rexruntime.dll", "rexgpu-xenos.dll", "dxcompiler.dll", "dxil.dll")
+$nativeLicenses = Join-Path $PSScriptRoot "..\packaging\licenses-native"
+& {
+    # dxcompiler.dll: LLVM/NCSA + MIT + third-party notices; dxil.dll: Microsoft's own terms (LICENSE-MS).
+    foreach ($required in @("LICENSE-DirectXShaderCompiler.txt", "ThirdPartyNotices-DirectXShaderCompiler.txt",
+                            "LICENSE-MIT-DirectXShaderCompiler.txt", "LICENSE-MS-DirectXShaderCompiler.txt")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $nativeLicenses $required) -PathType Leaf)) {
+            throw "Releases ship Microsoft's DirectX Shader Compiler: packaging\licenses-native\$required is missing."
+        }
+    }
+}
 $vcRuntimeFiles = @("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll")
 
 # --- 1. Inputs ---------------------------------------------------------------
@@ -170,6 +187,8 @@ $readme = [System.IO.File]::ReadAllText((Join-Path $packagingRoot "README.txt"))
 $readme = $readme -replace "`r?`n", "`r`n"  # Notepad-friendly line endings
 [System.IO.File]::WriteAllText((Join-Path $stageRoot "README.txt"), $readme, (New-Object System.Text.UTF8Encoding($false)))
 Get-ChildItem -LiteralPath (Join-Path $packagingRoot "licenses") -File |
+    ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $licensesStage }
+Get-ChildItem -LiteralPath $nativeLicenses -File |
     ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $licensesStage }
 
 # resources\runtime: the game, its DLLs, and the port's own pictures (the desk

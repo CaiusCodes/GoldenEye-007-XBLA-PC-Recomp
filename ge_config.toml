@@ -113,6 +113,13 @@ address = 0x8210D408
 name = "ge_fov_set"
 registers = ["f2"]
 after_instruction = false
+# View Bob off: level, steady head vectors before the head update hands them
+# on (ge_hooks.cpp ge_view_bob_hold).
+[[midasm_hook]]
+address = 0x820AF08C
+name = "ge_view_bob_hold"
+registers = ["r1"]
+after_instruction = false
 # LAN lobby: View Layout defaults to "single"
 [[midasm_hook]]
 address = 0x82103400
@@ -622,7 +629,7 @@ name = "ge_charsel_cursor"
 registers = []
 after_instruction = false
 
-# Single player: dead guards stay about a minute before they fade (sub_82123C20,
+# Single player: dead guards stay ten seconds before they fade (sub_82123C20,
 # the dead-body tick; +44 is the fade timer, -1 when the guard has just died).
 [[midasm_hook]]
 address = 0x82123C20
@@ -765,6 +772,24 @@ registers = ["r31"]
 after_instruction = false
 jump_address_on_true = 0x8209D3A4
 
+# Old graphics: the original headdave file is broken (rigid shaders on a skinned
+# head, so guards wearing it look headless); its classic file comes from
+# headgrant instead (see ge_classic_head_swap).
+[[midasm_hook]]
+address = 0x8211DB78
+name = "ge_classic_head_swap"
+registers = ["r6", "r7"]
+after_instruction = false
+
+# A guard's missed shot that hits a wall right beside Bond makes no spark in his
+# face (see ge_guard_miss_spark).
+[[midasm_hook]]
+address = 0x8212DDD8
+name = "ge_guard_miss_spark"
+registers = ["r1", "r30"]
+after_instruction = false
+jump_address_on_true = 0x8212E128
+
 # LAN match music: every machine plays the track the host picked.
 [[midasm_hook]]
 address = 0x82145438
@@ -780,3 +805,11 @@ address = 0x820EF9E0
 name = "ge_intro_no_weapon"
 registers = ["r25"]
 after_instruction = true
+
+# Jungle's untextured plants (ge_hooks.cpp, ge_jungle_set_texture): at the top of
+# D3DDevice_SetTexture(pDevice, Sampler, pTexture), swap the texture object.
+[[midasm_hook]]
+address = 0x8218BE00
+name = "ge_jungle_set_texture"
+registers = ["r5"]
+after_instruction = false

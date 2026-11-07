@@ -1,9 +1,9 @@
 // ge - native PC settings pages inside the game's own Help & Options menu.
 //
 // Help & Options (menu 33) normally lists five rows from a table of text ids at
-// 0x8272C344. We give it eight:
+// 0x8272C344. We give it nine:
 //   How to Play | Gamepad Settings | Keyboard & Mouse | Video Settings |
-//   Online Settings | Other Settings | Credits | Done
+//   Online Settings | Other Settings | Credits | Check for Updates | Done
 // The three PC rows open the game's Other Settings page (menu 35) with a page
 // flag set; while the flag is set, the Other Settings draw and update
 // functions are skipped and our own rows are drawn with the game's own text,
@@ -15,14 +15,19 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "ge_gpu_detect.h"
 #include "ge_init.h"  // PPCRegister/PPCContext + generated function decls
 
 #include <rex/cvar.h>
@@ -40,12 +45,28 @@
 
 #include <rex/filesystem.h>  // GetExecutableFolder
 
+#if !defined(_WIN32)
+#include <sys/sysctl.h>  // the log header's system details
+#endif
+
 #include "ge_win32_compat.h"  // <windows.h>, or its SDL3 stand-in elsewhere
+
+#include <atomic>
+#include <mutex>
+
+#if defined(_WIN32)
+#include "ge_update.h"      // Check for Updates (WinHTTP; no launcher elsewhere)
+#endif
+#include "ge_version_rc.h"  // GE_VERSION_STR, from VERSION
 
 namespace ge {
 void SetRebindCapturing(bool v);  // ge_hooks.cpp: swallow pad input while capturing
 std::string TakeWheelNotch();      // ge_hooks.cpp: "WheelUp"/"WheelDown" since last call
 void ApplyPlayerName(const std::string& name);  // ge_hooks.cpp
+void ApplyUpscaling();                          // below
+std::wstring LauncherPath();                    // ge_hooks.cpp
+void RunSetupAgain();                           // ge_hooks.cpp
+void PersistSettings();                         // below
 }
 
 namespace {
@@ -103,7 +124,7 @@ bool EnsureGuestBlocks(uint8_t* base) {
   if (g_string_block) return true;
   auto* mem = rex::system::kernel_state()->memory();
   g_string_block = mem->SystemHeapAlloc(kCustomCount * kCustomChars * 2);
-  g_help_table = mem->SystemHeapAlloc(8 * 4);
+  g_help_table = mem->SystemHeapAlloc(16 * 4);  // Help & Options rows (nine used)
   if (!g_string_block || !g_help_table) return false;
   std::memset(base + g_string_block, 0, kCustomCount * kCustomChars * 2);
   return true;
@@ -131,6 +152,7 @@ enum : uint32_t {
   kTxtOnline,
   kTxtRefresh,
   kTxtVersion,
+  kTxtUpdates,
   kTxtFirstDynamic = kCustomBase + 16,  // page labels and values, rewritten per frame
 };
 
@@ -141,7 +163,7 @@ std::function<void()> g_restart;
 std::function<void(int, int)> g_window_size;
 
 // ---------------------------------------------------------------- pages ---
-enum class Page { None, Keyboard, Video, PostFx, Online, Bindings1, Bindings2 };
+enum class Page { None, Keyboard, Video, PostFx, Online, Bindings1, Bindings2, Update };
 Page g_page = Page::None;
 bool g_leave_page = false;  // a Done row asked to go back to Help & Options
 
@@ -167,8 +189,12 @@ std::string GetS(const char* cvar) { return rex::cvar::GetFlagByName(cvar); }
 bool GetB(const char* cvar) { return GetS(cvar) == "true"; }
 // Online settings apply without a restart: the name goes straight to the
 // profile, and the online client reconnects with the new server on next use.
+std::function<void()> g_upscaling_changed;  // reloads the presenter's effect (UI thread)
 void ApplyLive(const char* cvar, const std::string& v) {
-  if (std::strcmp(cvar, "ge_username") == 0) {
+  if (std::strcmp(cvar, "ge_upscaling") == 0) {
+    ge::ApplyUpscaling();
+    if (g_upscaling_changed) g_upscaling_changed();
+  } else if (std::strcmp(cvar, "ge_username") == 0) {
     ge::ApplyPlayerName(v);
   } else if (std::strncmp(cvar, "ge_online_", 10) == 0) {
     rex::kernel::xam::GeOnlineReconnect();
@@ -180,6 +206,85 @@ void SetS(const char* cvar, const std::string& v) {
   if (g_persist) g_persist();
 }
 float GetF(const char* cvar) { return static_cast<float>(std::atof(GetS(cvar).c_str())); }
+
+// Render Scale (see ge::ApplyRenderScale below).
+float g_render_scale_active = 0;  // the scale this run uses (0 = not set yet)
+ge::GpuForScale g_scale_gpu;      // read once at start
+// 1x unless the player chose 1.5x, 2x or 3x ("auto" from an older ge.toml is 1x).
+float DesiredRenderScale() {
+  const std::string v = GetS("ge_render_scale");
+  return v == "1.5" ? 1.5f : v == "2" ? 2.0f : v == "3" ? 3.0f : 1.0f;
+}
+// "1", "1.5", "2", "3": the ge_render_scale value and the row's text.
+std::string RenderScaleText(float scale) {
+  return scale == 1.5f ? "1.5" : std::to_string(static_cast<int>(scale));
+}
+
+// Window sizes for the Resolution row, each with its Screen Ratio shape. The
+// row offers only the sizes of the chosen Screen Ratio, so the window and the
+// picture keep the same shape.
+struct WindowSize {
+  int w, h;
+  const char* ratio;
+};
+constexpr WindowSize kWindowSizes[] = {
+    {1024, 768, "4:3"},   {1440, 1080, "4:3"},  {1280, 720, "16:9"},
+    {1600, 900, "16:9"},  {1920, 1080, "16:9"}, {2560, 1440, "16:9"},
+    {3840, 2160, "16:9"}, {2560, 1080, "21:9"}, {3440, 1440, "21:9"}};
+// The Screen Ratio in use: the chosen one, or for "auto" (the default, and
+// older ge.toml files) the shape of the window, or of the screen in
+// fullscreen, by the same rule as ge_screen_ratio_tick. The Video page offers
+// only 4:3, 16:9 and 21:9, starting from this one.
+std::string EffectiveScreenRatio() {
+  const std::string chosen = GetS("ge_screen_ratio");
+  if (chosen != "auto") return chosen;
+  int w = std::atoi(GetS("ge_window_width").c_str());
+  int h = std::atoi(GetS("ge_window_height").c_str());
+  if (GetB("fullscreen")) {
+#if defined(_WIN32)
+    MONITORINFO mi{sizeof(mi)};
+    HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+      w = mi.rcMonitor.right - mi.rcMonitor.left;
+      h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    }
+#else
+    SDL_Rect r{};
+    HWND win = GetForegroundWindow();
+    const SDL_DisplayID display = win ? SDL_GetDisplayForWindow(win) : SDL_GetPrimaryDisplay();
+    if (display && SDL_GetDisplayBounds(display, &r)) {
+      w = r.w;
+      h = r.h;
+    }
+#endif
+  }
+  if (w <= 0 || h <= 0) return "16:9";
+  const float aspect = static_cast<float>(w) / static_cast<float>(h);
+  return aspect < 1.55f ? "4:3" : aspect >= 2.2f ? "21:9" : "16:9";
+}
+
+// Every size of the shape, whether or not it fits on this screen: a size bigger
+// than the screen is the player's choice (Windows then trims the window to it).
+std::vector<WindowSize> OfferedWindowSizes(const std::string& ratio) {
+  std::vector<WindowSize> shape;
+  for (const WindowSize& s : kWindowSizes)
+    if (ratio == "auto" || ratio == s.ratio) shape.push_back(s);
+  return shape;
+}void SetWindowSize(const WindowSize& s) {
+  rex::cvar::SetFlagByName("ge_window_width", std::to_string(s.w));
+  rex::cvar::SetFlagByName("ge_window_height", std::to_string(s.h));
+  if (g_persist) g_persist();
+  if (g_window_size) g_window_size(s.w, s.h);
+}
+// The renderer this run started with: -1 not known yet, 0 classic, 1 native.
+int g_renderer_active = -1;
+// Leaving the Video page with a different Render Scale: save and restart now
+// (the emulated GPU reads the scale only when it starts).
+void RestartIfRenderScaleChanged() {
+  if (g_render_scale_active && DesiredRenderScale() != g_render_scale_active && g_restart) {
+    g_restart();
+  }
+}
 
 std::vector<Row> BuildPage(Page page);
 void CycleName(int dir);  // the player card's name list (below)
@@ -200,7 +305,8 @@ constexpr float kLabelX = 70.0f;
 constexpr float kValueX = 245.0f;
 constexpr float kRowY0 = 88.0f;
 constexpr float kRowSpacing = 24.0f;
-constexpr float kSliderW = 100.0f;
+constexpr int kRowsAtFullSpacing = 10;  // more rows are drawn closer, so the last stays on screen
+constexpr float kSliderW = 60.0f;  // short enough for the value to fit the 4:3 page
 constexpr float kSliderH = 12.0f;
 
 // Online Settings' Player Name row: "<" and ">" either side of the name step
@@ -235,6 +341,8 @@ std::string KeyText(const char* cvar) {
     if (one == "LMB") one = "Left Click";
     else if (one == "RMB") one = "Right Click";
     else if (one == "MMB") one = "Middle Click";
+    else if (one == "Mouse4") one = "Mouse 4";
+    else if (one == "Mouse5") one = "Mouse 5";
     else if (one == "Control") one = "Ctrl";
     else if (one == "WheelUp") one = "Wheel Up";
     else if (one == "WheelDown") one = "Wheel Down";
@@ -276,6 +384,164 @@ void AddAction(std::vector<Row>& rows, const char* label, std::function<void()> 
   rows.push_back(r);
 }
 
+// ---------------------------------------------------- Check for Updates ---
+// Online Settings > Check for Updates opens Page::Update, and only then is
+// GitHub asked (on a worker thread, src/ge_update.h) whether a newer release
+// exists; nothing is checked at start or in the background. "Update Now"
+// (front end only, never in a LAN / online game) starts the launcher with
+// --update and ends the game; the launcher downloads, verifies and installs
+// the release and offers Play.
+enum class UpdateState { Idle, Checking, UpToDate, Failed, NoLauncher, Available, Blocked };
+struct UpdateStatus {
+  UpdateState state = UpdateState::Idle;
+  std::string latest, error;  // the latest release's version; why a check failed
+  uint64_t size = 0;          // its ZIP's size in bytes (0 unknown)
+};
+std::mutex g_update_mutex;
+UpdateStatus g_update;
+uint32_t g_update_check = 0;  // which check the worker's answer belongs to
+
+UpdateStatus CurrentUpdate() {
+  std::lock_guard<std::mutex> lock(g_update_mutex);
+  return g_update;
+}
+
+void StartUpdateCheck() {
+  uint32_t check;
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update = UpdateStatus{};
+    g_update.state = ge::LauncherPath().empty() ? UpdateState::NoLauncher : UpdateState::Checking;
+    if (g_update.state != UpdateState::Checking) return;
+    check = ++g_update_check;
+  }
+#if defined(_WIN32)
+  REXLOG_INFO("[update] asking {} for the latest release", ge::update::Narrow(ge::update::ApiUrl()));
+  std::thread([check] {
+    ge::update::Release release;
+    std::string error;
+    const int newer = ge::update::CheckForNewer(release, ge::update::Agent(GE_VERSION_STR), GE_VERSION_STR, error);
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    if (check != g_update_check || g_update.state != UpdateState::Checking) return;  // left meanwhile
+    g_update.latest = release.version;
+    g_update.size = release.zip_size;
+    g_update.error = error;
+    g_update.state = newer > 0 ? UpdateState::Available : newer == 0 ? UpdateState::UpToDate : UpdateState::Failed;
+    REXLOG_INFO("[update] latest release {} (this copy {}): {}", release.version.empty() ? "?" : release.version,
+                GE_VERSION_STR, newer > 0 ? "newer" : newer == 0 ? "not newer" : error);
+  }).detach();
+#else
+  (void)check;
+#endif
+}
+
+// Back to Help & Options, where Check for Updates is.
+void LeaveUpdatePage() {
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update.state = UpdateState::Idle;
+  }
+  g_leave_page = true;
+}
+
+// Restarting is safe on the front end only, and never in a LAN / online game.
+bool UpdateIsSafeNow() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks || !ks->memory()) return false;
+  uint8_t* base = ks->memory()->virtual_membase();
+  return LD32(base, 0x82423E00u) == 90u && !rex::kernel::xam::GeNetworkGameActive();
+}
+
+// Opens the launcher's update window and ends the game (settings saved first).
+void StartUpdater() {
+  if (!UpdateIsSafeNow()) {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update.state = UpdateState::Blocked;
+    return;
+  }
+  const std::wstring launcher = ge::LauncherPath();
+  if (launcher.empty()) return;
+#if defined(_WIN32)
+  ge::PersistSettings();
+  const std::wstring folder = std::filesystem::path(launcher).parent_path().wstring();
+  std::wstring command = L"\"" + launcher + L"\" --update";
+  STARTUPINFOW startup = {sizeof(startup)};
+  PROCESS_INFORMATION process = {};
+  if (!CreateProcessW(launcher.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, folder.c_str(),
+                      &startup, &process)) {
+    REXLOG_ERROR("[update] could not start the launcher (error {})", GetLastError());
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update.state = UpdateState::Failed;
+    g_update.error = "the launcher (GoldenEye 007.exe) could not be started";
+    return;
+  }
+  AllowSetForegroundWindow(process.dwProcessId);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  REXLOG_INFO("Game closing for the launcher to install an update");
+  rex::FlushLogging();
+  TerminateProcess(GetCurrentProcess(), 0);
+#endif
+}
+
+// The page's text, in lines short enough for the page (the game's own font
+// and size; the text slots hold 63 characters).
+constexpr size_t kUpdateLineChars = 38;
+void AddTextLines(std::vector<Row>& rows, const std::string& text) {
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = std::min(text.size(), start + kUpdateLineChars);
+    if (end < text.size()) {
+      const size_t space = text.rfind(' ', end);
+      if (space != std::string::npos && space > start) end = space;
+    }
+    rows.push_back(Row{RowKind::Label, text.substr(start, end - start)});
+    start = end;
+    while (start < text.size() && text[start] == ' ') ++start;
+  }
+}
+
+void BuildUpdatePage(std::vector<Row>& rows) {
+  const UpdateStatus s = CurrentUpdate();
+  const std::string current = GE_VERSION_STR;
+  rows.push_back(Row{RowKind::Label, "CHECK FOR UPDATES"});
+  switch (s.state) {
+    case UpdateState::Idle:
+    case UpdateState::Checking:
+      AddTextLines(rows, "Asking GitHub for the latest release...");
+      AddAction(rows, "Cancel", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::UpToDate:
+      AddTextLines(rows, "GoldenEye 007 is up to date (v" + current + ").");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::Failed:
+      AddTextLines(rows, "Could not check for updates: " + s.error + ".");
+      AddTextLines(rows, "Please try again later.");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::NoLauncher:
+      AddTextLines(rows, "Updates work in the release folder, with GoldenEye 007.exe beside the resources folder.");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+    case UpdateState::Available: {
+      AddTextLines(rows, "v" + s.latest + " is available. You have v" + current + ".");
+      char size[32] = "";
+      if (s.size) std::snprintf(size, sizeof(size), " (%.0f MB)", s.size / 1048576.0);
+      AddTextLines(rows, std::string("The game closes, the update downloads") + size +
+                             " and installs, then you can play. Saves and settings are kept.");
+      AddAction(rows, "Update Now", [] { StartUpdater(); });
+      AddAction(rows, "Not Now", [] { LeaveUpdatePage(); });
+      break;
+    }
+    case UpdateState::Blocked:
+      AddTextLines(rows, "Updating closes the game. Quit to the main menu (and leave any network game) first, "
+                         "then try again.");
+      AddAction(rows, "Done", [] { LeaveUpdatePage(); });
+      break;
+  }
+}
+
 std::vector<Row> BuildPage(Page page) {
   std::vector<Row> rows;
   switch (page) {
@@ -315,6 +581,7 @@ std::vector<Row> BuildPage(Page page) {
       AddAction(rows, "Done", [] { g_page = Page::Keyboard; });
       break;
     case Page::Video: {
+      // Order: display and window first, then picture quality, then the rest.
       AddAction(
           rows, "Display Mode:",
           [] {
@@ -324,35 +591,19 @@ std::vector<Row> BuildPage(Page page) {
             if (g_persist) g_persist();
           },
           [] { return std::string(GetB("fullscreen") ? "Fullscreen" : "Windowed"); });
-      rows.push_back(Row{RowKind::Toggle, "V-Sync:", "vsync"});
-      // No Frame Limit row: the game always runs at its own 60 FPS (its clock
-      // is the 60 Hz vblank; a lower cap slowed the game itself down).
-      rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
-      AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
-      AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
-                {{"Off", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
-      AddChoice(rows, "Texture Filtering:", "anisotropic_override",
-                {{"Bilinear", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}});
       // Window size in windowed mode (fullscreen always uses the display). The
       // game keeps rendering the same way; the picture is scaled to the window.
       AddAction(
           rows, "Resolution:",
           [] {
             if (GetB("fullscreen")) return;  // fullscreen always uses the screen's size
-            // 4:3, 16:9 and 21:9 sizes; Screen Ratio follows the window shape.
-            static const int kSizes[][2] = {{1024, 768},  {1280, 720},  {1920, 1080},
-                                            {2560, 1080}, {2560, 1440}, {3440, 1440},
-                                            {3840, 2160}};
-            constexpr int kCount = 7;
+            const std::vector<WindowSize> sizes = OfferedWindowSizes(EffectiveScreenRatio());
             const int w = std::atoi(GetS("ge_window_width").c_str());
             const int h = std::atoi(GetS("ge_window_height").c_str());
-            int next = 1;  // 1280x720 unless the current size is in the list
-            for (int i = 0; i < kCount; ++i)
-              if (kSizes[i][0] == w && kSizes[i][1] == h) next = (i + 1) % kCount;
-            rex::cvar::SetFlagByName("ge_window_width", std::to_string(kSizes[next][0]));
-            rex::cvar::SetFlagByName("ge_window_height", std::to_string(kSizes[next][1]));
-            if (g_persist) g_persist();
-            if (g_window_size) g_window_size(kSizes[next][0], kSizes[next][1]);
+            size_t next = 0;  // the first size unless the current one is offered
+            for (size_t i = 0; i < sizes.size(); ++i)
+              if (sizes[i].w == w && sizes[i].h == h) next = (i + 1) % sizes.size();
+            SetWindowSize(sizes[next]);
           },
           [] {
             if (GetB("fullscreen")) {  // the size of the screen the game is on
@@ -361,24 +612,97 @@ std::vector<Row> BuildPage(Page page) {
               HWND win = GetForegroundWindow();
               const SDL_DisplayID display = win ? SDL_GetDisplayForWindow(win) : SDL_GetPrimaryDisplay();
               if (display && SDL_GetDisplayBounds(display, &r))
-                return std::to_string(r.w) + "x" + std::to_string(r.h) + " (screen)";
+                return std::to_string(r.w) + "x" + std::to_string(r.h);
 #else
               MONITORINFO mi{sizeof(mi)};
               HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
               if (mon && GetMonitorInfoW(mon, &mi))
                 return std::to_string(mi.rcMonitor.right - mi.rcMonitor.left) + "x" +
-                       std::to_string(mi.rcMonitor.bottom - mi.rcMonitor.top) + " (screen)";
+                       std::to_string(mi.rcMonitor.bottom - mi.rcMonitor.top);
 #endif
               return std::string("Screen size");
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
           });
-      // Render backend, used from the next start (Auto: NVIDIA -> Direct3D 12,
-      // other GPUs -> Vulkan; D3D12 crashes on AMD for this game).
-      AddChoice(rows, "Graphics API:", "gpu",
-                {{"Auto", "auto"}, {"Direct3D 12", "d3d12"}, {"Vulkan", "vulkan"}});
+      // The game's TV shape (ge_hooks.cpp): 4:3, 16:9 or 21:9 (an "auto"
+      // setting shows as the shape it follows). Choosing a shape in a window
+      // also moves the window to the nearest size of that shape, so the picture
+      // fills it (fullscreen keeps the screen's shape, with bars where the two
+      // differ).
+      AddAction(
+          rows, "Screen Ratio:",
+          [] {
+            static const char* const kOrder[] = {"4:3", "16:9", "21:9"};
+            const std::string cur = EffectiveScreenRatio();
+            int i = 0;
+            for (int k = 0; k < 3; ++k)
+              if (cur == kOrder[k]) i = k;
+            const std::string next = kOrder[(i + 1) % 3];
+            SetS("ge_screen_ratio", next);
+            if (GetB("fullscreen")) return;
+            const int w = std::atoi(GetS("ge_window_width").c_str());
+            const int h = std::atoi(GetS("ge_window_height").c_str());
+            const std::vector<WindowSize> sizes = OfferedWindowSizes(next);
+            const WindowSize* best = &sizes.front();
+            for (const WindowSize& s : sizes) {
+              if (s.w == w && s.h == h) return;  // already this shape
+              if (std::abs(s.h - h) < std::abs(best->h - h)) best = &s;
+            }
+            SetWindowSize(*best);
+          },
+          [] { return EffectiveScreenRatio(); });
+      rows.push_back(Row{RowKind::Toggle, "V-Sync:", "vsync"});
+      // No Graphics API row: Auto picks it (NVIDIA -> Direct3D 12, other GPUs
+      // -> Vulkan); gpu = "d3d12" / "vulkan" in ge.toml still overrides it.
+      AddAction(
+          rows, "Render Scale:",
+          [] {
+            // 1x -> 1.5x -> 2x -> 3x -> 1x. 1.5x (1920x1080) is the native
+            // renderer's; the classic one scales by whole numbers only.
+            const float cur = DesiredRenderScale();
+            const float next = cur >= 3.0f   ? 1.0f
+                               : cur >= 2.0f ? 3.0f
+                               : cur >= 1.5f || g_renderer_active != 1 ? 2.0f
+                                                                        : 1.5f;
+            SetS("ge_render_scale", RenderScaleText(next));
+          },
+          [] {
+            // Any change restarts the game on Done; above 1x always says so.
+            const float scale = DesiredRenderScale();
+            std::string text = RenderScaleText(scale) + "x";
+            if (g_render_scale_active && scale != g_render_scale_active)
+              text += " - restarts";
+            else if (scale > 1)
+              text += " (restart)";
+            return text;
+          });
+      // FSR (FSR 1 / CAS) or plain bilinear for stretching the Render Scale
+      // picture to the window; applies at once.
+      AddChoice(rows, "Upscaling:", "ge_upscaling", {{"FSR", "on"}, {"OFF", "off"}});
+      // Texture Filtering: anisotropic filtering of the game's mipmapped
+      // textures, applied at once. The native renderer registers the setting
+      // itself (it is the classic renderer's), see ge_app.h.
+      AddChoice(rows, "Texture Filtering:", "anisotropic_override",
+                {{"Bilinear", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}});
+      // Native renderer: the scene's MSAA, applied at once (4x by default, as the
+      // Xbox 360 renders); the classic renderer's FXAA post effect does nothing there.
+      if (g_renderer_active == 1)
+        AddChoice(rows, "Anti-Aliasing:", "gpu_native_msaa", {{"OFF", "1"}, {"2x", "2"}, {"4x", "4"}});
+      else
+        AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
+                  {{"OFF", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
+      // No Renderer row: the classic Xenos renderer stays a ge.toml fallback
+      // (gpu_native = false), read when the game starts.
+      AddSlider(rows, "Field of View:", "ge_fov_extra", 0.0f, 30.0f, 1.0f);
+      // No Frame Limit row: the game always runs at its own 60 FPS (its clock
+      // is the 60 Hz vblank; a lower cap slowed the game itself down).
+      rows.push_back(Row{RowKind::Toggle, "Show FPS:", "ge_show_fps"});
       AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
-      AddAction(rows, "Done", [] { g_leave_page = true; });
+      // Run Setup Again is the last row of Other Settings.
+      AddAction(rows, "Done", [] {
+        RestartIfRenderScaleChanged();
+        g_leave_page = true;
+      });
       break;
     }
     case Page::PostFx:
@@ -409,6 +733,9 @@ std::vector<Row> BuildPage(Page page) {
       AddAction(rows, "Done", [] { g_leave_page = true; });
       break;
     }
+    case Page::Update:
+      BuildUpdatePage(rows);
+      break;
     case Page::None:
       break;
   }
@@ -544,12 +871,31 @@ bool ButtonHeld(PPCContext& ctx, uint8_t* base, uint32_t mask) {
   return ctx.r3.u32 != 0;
 }
 
-float RowY(int i) { return kRowY0 + kRowSpacing * static_cast<float>(i); }
+// Row spacing of the page being shown: pages longer than ten rows squeeze
+// them into the height of ten (the game's text stays its own size).
+float g_row_spacing = kRowSpacing;
+void SetRowCount(size_t count) {
+  g_row_spacing = count > kRowsAtFullSpacing
+                      ? kRowSpacing * (kRowsAtFullSpacing - 1) / static_cast<float>(count - 1)
+                      : kRowSpacing;
+}
+
+float RowY(int i) { return kRowY0 + g_row_spacing * static_cast<float>(i); }
+
+// Text drawn at row y has its middle this far below it, where the crosshair
+// sits when it points at the text (measured on Other Settings: 12-14 units).
+// A row is hovered over the band one row spacing tall centred there, so the
+// next row only lights up once the crosshair is past the gap between them.
+constexpr float kTextMiddle = 13.0f;
+bool InRowBand(float cursor_y, float row_y, float spacing) {
+  const float top = row_y + kTextMiddle - spacing * 0.5f;
+  return cursor_y >= top && cursor_y < top + spacing;
+}
 
 int RowAtCursor(uint8_t* base, int count) {
   const float y = LDF32(base, kCursorY);
   for (int i = 0; i < count; ++i) {
-    if (y >= RowY(i) - 4.0f && y < RowY(i) - 4.0f + kRowSpacing) return i;
+    if (InRowBand(y, RowY(i), g_row_spacing)) return i;
   }
   return -1;
 }
@@ -645,6 +991,7 @@ void BeginCapture(const Row& r) {
 void DrawPage(PPCContext& ctx, uint8_t* base) {
   if (!EnsureGuestBlocks(base)) return;
   const std::vector<Row> rows = BuildPage(g_page);
+  SetRowCount(rows.size());
   GuestFrame frame(ctx);
   const uint32_t sp = frame.sp;
   for (size_t i = 0; i < rows.size(); ++i) {
@@ -655,7 +1002,7 @@ void DrawPage(PPCContext& ctx, uint8_t* base) {
     SetCustomText(base, value_id, ValueText(r, static_cast<int>(i)));
     const float y = RowY(static_cast<int>(i));
     const uint32_t label = LookupText(ctx, base, label_id);
-    if (static_cast<int>(i) == g_hover) {
+    if (static_cast<int>(i) == g_hover && r.kind != RowKind::Label) {
       int w = 0, h = 0;
       MeasureText(ctx, base, sp, label, w, h);
       const float pad = LDF32(base, kHighlightPad);
@@ -715,6 +1062,7 @@ void Activate(Row& r) {
 bool UpdatePage(PPCContext& ctx, uint8_t* base) {
   UpdateCapture();
   std::vector<Row> rows = BuildPage(g_page);
+  SetRowCount(rows.size());
   if (g_capture_cvar) return false;  // typing: the menu waits
   g_hover = RowAtCursor(base, static_cast<int>(rows.size()));
 
@@ -740,10 +1088,16 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
                         : (g_page >= Page::Bindings1 && g_page <= Page::Bindings2) ? Page::Keyboard
                                                                                    : Page::None;
     PlaySelectSound(ctx, base);
+    if (g_page == Page::Update) {
+      LeaveUpdatePage();
+      g_leave_page = false;
+      return true;
+    }
     if (parent != Page::None) {
       g_page = parent;
       return false;
     }
+    if (g_page == Page::Video) RestartIfRenderScaleChanged();
     return true;
   }
   g_name_arrow = 0;
@@ -759,7 +1113,7 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
       return false;
     }
   }
-  if (g_hover >= 0 && ButtonPressed(ctx, base, kSelectMask)) {
+  if (g_hover >= 0 && rows[g_hover].kind != RowKind::Label && ButtonPressed(ctx, base, kSelectMask)) {
     Row& r = rows[g_hover];
     PlaySelectSound(ctx, base);
     if (r.kind == RowKind::Slider) {
@@ -784,6 +1138,13 @@ void SetNativeMenuCallbacks(std::function<void(bool)> fullscreen, std::function<
   g_persist = std::move(persist);
   g_restart = std::move(restart);
 }
+void PersistSettings() {
+  if (g_persist) g_persist();
+}
+void SetActiveRenderer(bool native) { g_renderer_active = native ? 1 : 0; }
+// The renderer is fixed for the run (gpu_native may change in the menu: it
+// applies after the restart).
+bool NativeRendererActive() { return g_renderer_active == 1; }
 void SetWindowSizeHandler(std::function<void(int, int)> handler) {
   g_window_size = std::move(handler);
 }
@@ -807,9 +1168,9 @@ bool ge_str_lookup(PPCRegister& r3) {
 
 // --- Help & Options (menu 33) ---------------------------------------------
 // Rows: 0 How to Play, 1 Gamepad, 2 Keyboard & Mouse, 3 Video, 4 Online,
-//       5 Other Settings, 6 Credits, 7 Done.
+//       5 Other Settings, 6 Credits, 7 Check for Updates, 8 Done.
 namespace {
-constexpr int kHelpRows = 8;
+constexpr int kHelpRows = 9;
 void PrepareHelpTable(uint8_t* base) {
   if (!EnsureGuestBlocks(base)) return;
   static bool done = false;
@@ -819,12 +1180,14 @@ void PrepareHelpTable(uint8_t* base) {
   SetCustomText(base, kTxtKeyboard, "Keyboard & Mouse");
   SetCustomText(base, kTxtVideo, "Video Settings");
   SetCustomText(base, kTxtOnline, "Online Settings");
-  const uint32_t ids[kHelpRows] = {0x9D55, kTxtGamepad, kTxtKeyboard, kTxtVideo,
-                                   kTxtOnline, 0x9D54, 0x9D67, 0x9D66};
+  SetCustomText(base, kTxtUpdates, "Check for Updates");
+  const uint32_t ids[kHelpRows] = {0x9D55, kTxtGamepad, kTxtKeyboard, kTxtVideo, kTxtOnline,
+                                   0x9D54, 0x9D67, kTxtUpdates, 0x9D66};
   for (int i = 0; i < kHelpRows; ++i) ST32(base, g_help_table + i * 4, ids[i]);
-  // Eight rows need a tighter column than the original five.
-  STF32(base, kHelpY0, 118.0f);
-  STF32(base, kHelpSpacing, 24.0f);
+  // Nine rows need a tighter column than the original five; Done stays where
+  // it was with eight rows (118 + 7 * 24).
+  STF32(base, kHelpY0, 114.0f);
+  STF32(base, kHelpSpacing, 21.5f);
 }
 }  // namespace
 
@@ -857,6 +1220,11 @@ void ge_help_route(PPCRegister& r9) {
     case 4: g_page = Page::Online; r9.u64 = 2; break;
     case 5: g_page = Page::None; r9.u64 = 2; break;             // Other Settings
     case 6: r9.u64 = 3; break;                                  // Credits
+    case 7:                                                     // Check for Updates
+      g_page = Page::Update;
+      StartUpdateCheck();
+      r9.u64 = 2;
+      break;
     default: r9.u64 = 4; break;                                 // Done
   }
   g_hover = -1;
@@ -893,8 +1261,11 @@ bool ge_other_update(PPCRegister& r25) {
 // We draw rows 2-7 instead so a "Show Crosshair" row (white dot at the centre
 // of the screen when not aiming, ge_center_dot) sits third, the game's rows 2-6
 // move down one place and row 7 (Screen Ratio, set from the window shape) is
-// gone. The hovered row (0x8272C4FC) is a screen position; ge_other_row_select
-// maps it back to the game's row when one is chosen.
+// gone. A "Camera Bob" row (ge_view_bob, ge_hooks.cpp) follows Camera Roll
+// While Walking, and Run Setup Again comes last. Rows 2 and on are drawn
+// closer together than the game's own (so the last stays on the page) and are
+// hovered by our own cursor test; ge_other_row_select maps a chosen row back
+// to the game's row.
 REXCVAR_DEFINE_BOOL(ge_center_dot, false, "Controls",
                     "Show a white dot at the centre of the screen when not aiming");
 namespace {
@@ -902,6 +1273,34 @@ constexpr uint32_t kOtherText = 0x8272C500;   // 16 bytes a row: label id, value
 constexpr uint32_t kOtherPos = 0x8272C580;    // label x, value x, first y, row spacing
 constexpr uint32_t kOtherHover = 0x8272C4FC;  // hovered row (screen position)
 constexpr int kCenterDotRow = 2;              // screen position of Show Crosshair
+constexpr int kCameraBobRow = 7;              // screen position of Camera Bob
+constexpr int kSetupRow = 9;                  // screen position of Run Setup Again
+// Rows 2..9 fit where the game's rows 2..8 were.
+constexpr float kOtherSpacing = 6.0f / 7.0f;  // of the game's row spacing
+
+// The game's row shown at a screen position (-1: one of ours).
+int OtherGameRow(int pos) {
+  if (pos > kCenterDotRow && pos < kCameraBobRow) return pos - 1;  // rows 2..5
+  if (pos == kCameraBobRow + 1) return 6;                           // Screen Letterbox
+  return -1;
+}
+float OtherRowY(uint8_t* base, int pos) {
+  const float y0 = LDF32(base, kOtherPos + 8);
+  const float step = LDF32(base, kOtherPos + 12);
+  return y0 + step * (2.0f + kOtherSpacing * static_cast<float>(pos - 2));
+}
+// The row of ours under the crosshair (2..9), or -1 (the volume sliders, or
+// off the rows).
+int OtherHoverRow(uint8_t* base) {
+  static const bool have_launcher = !ge::LauncherPath().empty();
+  const int last = have_launcher ? kSetupRow : kSetupRow - 1;
+  const float step = LDF32(base, kOtherPos + 12) * kOtherSpacing;
+  const float cy = LDF32(base, kCursorY);
+  for (int pos = 2; pos <= last; ++pos) {
+    if (InRowBand(cy, OtherRowY(base, pos), step)) return pos;
+  }
+  return -1;
+}
 
 // The game's value for its row 2..6 (the getters its own draw calls).
 uint32_t OtherRowValue(PPCContext& ctx, uint8_t* base, int row) {
@@ -930,45 +1329,70 @@ void ge_other_rows_draw() {
     const uint32_t sp = frame.sp;
     const float label_x = LDF32(base, kOtherPos);
     const float value_x = LDF32(base, kOtherPos + 4);
-    const float y0 = LDF32(base, kOtherPos + 8);
-    const float step = LDF32(base, kOtherPos + 12);
-    const int hover = static_cast<int32_t>(LD32(base, kOtherHover));
     SetCustomText(base, kTxtFirstDynamic + 122, "Show Crosshair:");
-    for (int pos = 2; pos <= 7; ++pos) {
-      const float y = y0 + step * static_cast<float>(pos);
-      uint32_t label_id, value_id;
+    SetCustomText(base, kTxtFirstDynamic + 123, "Run Setup Again");
+    SetCustomText(base, kTxtFirstDynamic + 124, "Camera Bob:");
+    // Our rows are hovered by our own test (the game's assumes its spacing
+    // and only rows 0-7); over the volume sliders the game's hover stands.
+    // Below its rows the game keeps its last hover, so rows 8 and 9 are set
+    // here for its select to fire (as Run Setup Again always was).
+    const int ours = OtherHoverRow(base);
+    if (ours >= 8) ST32(base, kOtherHover, static_cast<uint32_t>(ours));
+    const int game_hover = static_cast<int32_t>(LD32(base, kOtherHover));
+    const int hover_now = ours >= 0 ? ours : game_hover < 2 ? game_hover : -1;
+    // Run Setup Again: release layout only.
+    static const bool have_launcher = !ge::LauncherPath().empty();
+    const int last = have_launcher ? kSetupRow : kSetupRow - 1;
+    // The ON/OFF texts of the game's own toggle rows.
+    auto on_off = [&](bool on) { return LD32(base, kOtherText + 2 * 16 + 4 + (on ? 4 : 0)); };
+    for (int pos = 2; pos <= last; ++pos) {
+      const float y = OtherRowY(base, pos);
+      uint32_t label_id, value_id = 0;
+      const int row = OtherGameRow(pos);
       if (pos == kCenterDotRow) {
         label_id = kTxtFirstDynamic + 122;
-        // The ON/OFF texts of the game's own toggle rows.
-        value_id = LD32(base, kOtherText + 2 * 16 + 4 + (REXCVAR_GET(ge_center_dot) ? 4 : 0));
+        value_id = on_off(REXCVAR_GET(ge_center_dot));
+      } else if (pos == kCameraBobRow) {
+        label_id = kTxtFirstDynamic + 124;
+        value_id = on_off(GetB("ge_view_bob"));
+      } else if (pos == kSetupRow) {
+        label_id = kTxtFirstDynamic + 123;
       } else {
-        const int row = pos - 1;  // the game's row shown here
         const uint32_t entry = kOtherText + static_cast<uint32_t>(row) * 16u;
         const uint32_t value = std::min<uint32_t>(OtherRowValue(*ctx, base, row), 2u);
         label_id = LD32(base, entry);
         value_id = LD32(base, entry + 4 + value * 4);
       }
       const uint32_t label = LookupText(*ctx, base, label_id);
-      if (pos == hover) {
+      if (pos == hover_now) {
         int w = 0, h = 0;
         MeasureText(*ctx, base, sp, label, w, h);
         const float pad = LDF32(base, kHighlightPad);
         DrawBox(*ctx, base, 50, label_x - pad, y - pad, label_x - pad + w + 4, y - pad + h + 4);
       }
       DrawText(*ctx, base, sp, label, label_x, y, 255);
-      DrawText(*ctx, base, sp, LookupText(*ctx, base, value_id), value_x, y, 255);
+      if (value_id) DrawText(*ctx, base, sp, LookupText(*ctx, base, value_id), value_x, y, 255);
     }
   }
   *ctx = saved;
 }
 
-// A row was chosen (r11 = hovered screen position): Show Crosshair toggles
-// here; the game's rows below it are passed on as their own row numbers.
+// A row was chosen (r11 = the game's hovered row): over our rows the row is
+// the one under the crosshair. Show Crosshair and Camera Bob toggle here; the
+// game's rows are passed on as their own row numbers.
 void ge_other_row_select(PPCRegister& r11) {
-  const int pos = r11.s32;
-  if (pos == kCenterDotRow) {
-    PPCContext* ctx; uint8_t* base; getcb(ctx, base);
-    SetS("ge_center_dot", REXCVAR_GET(ge_center_dot) ? "false" : "true");
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  const int ours = OtherHoverRow(base);
+  if (ours < 0 && r11.s32 >= 2) {  // below or between our rows: nothing
+    r11.u64 = 0xFFFFFFFFu;
+    return;
+  }
+  const int pos = ours >= 0 ? ours : r11.s32;
+  if (pos == kCenterDotRow || pos == kCameraBobRow) {
+    if (pos == kCenterDotRow)
+      SetS("ge_center_dot", REXCVAR_GET(ge_center_dot) ? "false" : "true");
+    else
+      SetS("ge_view_bob", GetB("ge_view_bob") ? "false" : "true");
     const PPCContext saved = *ctx;
     {
       GuestFrame frame(*ctx);
@@ -976,8 +1400,13 @@ void ge_other_row_select(PPCRegister& r11) {
     }
     *ctx = saved;
     r11.u64 = 0xFFFFFFFFu;  // nothing for the game to do
-  } else if (pos > kCenterDotRow && pos <= 7) {
-    r11.u64 = static_cast<uint32_t>(pos - 1);
+  } else if (pos == kSetupRow) {
+    // Re-run the launcher's setup (re-import the game, extras); closes the game.
+    ge::PersistSettings();
+    ge::RunSetupAgain();
+    r11.u64 = 0xFFFFFFFFu;
+  } else if (pos >= 2) {
+    r11.u64 = static_cast<uint32_t>(OtherGameRow(pos));
   }
 }
 
@@ -1155,6 +1584,183 @@ std::string ReadVersionText() {
 }
 }  // namespace
 
+// --- Render Scale -------------------------------------------------------------
+// The SDK's resolution_scale multiplies the game's 1280x720 render targets
+// (2x = 2560x1440). It is read once when the emulated GPU starts, so a change
+// applies by restarting the game (done for the player on leaving the Video
+// page). 1x by default; 1.5x, 2x and 3x are the player's choice. The native
+// renderer sizes its own targets by the scale (1.5x = 1920x1080).
+// Upscaling (see ge::ApplyUpscaling).
+REXCVAR_DEFINE_STRING(ge_upscaling, "on", "Video", "Upscaling: on (FSR 1 / CAS) or off (bilinear)")
+    .allowed({"on", "off"});
+REXCVAR_DEFINE_STRING(ge_render_scale, "1", "Video",
+                      "Render scale: 1 (1280x720, the default), 1.5 (1920x1080, native renderer; "
+                      "2 on the classic one), 2 (2560x1440) or 3 (3840x2160)")
+    .allowed({"auto", "1", "1.5", "2", "3"});  // "auto" (older ge.toml files) now means 1
+namespace ge {
+void ApplyRenderScale() {
+  g_scale_gpu = DetectGpuForScale();
+  const std::string choice = GetS("ge_render_scale");
+  g_render_scale_active = DesiredRenderScale();
+  // resolution_scale belongs to the GPU plugin, which is not loaded yet:
+  // ApplyRenderScaleToGpu sets it once the plugin is in (setting it here was
+  // silently rejected, so every scale drew at the plugin's default 2x).
+  REXLOG_INFO("Render scale {}x (setting {}; GPU {}, {}, {} MB video memory)",
+              g_render_scale_active, choice, g_scale_gpu.name,
+              g_scale_gpu.integrated ? "integrated" : "dedicated", g_scale_gpu.video_memory_mb);
+}
+// performance_diagnostics (ge.toml, off by default): the one setting players
+// change to send a detailed log. It turns on the existing detailed timing,
+// vblank_timing_log (slow frames with what the game waited on, GPU waits,
+// input/SDL/file timers, the stall sampler, frame and present statistics),
+// which is never saved itself. Off, only the header, the minute line and
+// warnings/errors are logged. Called once the GPU plugin is loaded.
+REXCVAR_DEFINE_BOOL(performance_diagnostics, false, "Diagnostics",
+                    "Detailed performance logging for bug reports (restart to apply)");
+void ApplyDiagnostics() {
+  if (GetB("performance_diagnostics")) {
+    rex::cvar::SetFlagByName("vblank_timing_log", "true");
+    // Write the log out every 2 s, so a game that freezes and is closed from
+    // Task Manager still leaves the lines that lead up to it.
+    spdlog::flush_every(std::chrono::seconds(2));
+  }
+  // Keep the 20 newest session logs (each run starts a new ge_NNN.log).
+#if !defined(_WIN32)
+  {
+    namespace fs = std::filesystem;
+    const fs::path dir = rex::filesystem::GetExecutableFolder() / "logs";
+    std::vector<std::pair<int, fs::path>> logs;
+    std::error_code ec;
+    for (const fs::directory_entry& entry : fs::directory_iterator(dir, ec)) {
+      const std::string name = entry.path().filename().string();
+      if (name.rfind("ge_", 0) != 0 || entry.path().extension() != ".log") continue;
+      const int seq = std::atoi(name.c_str() + 3);
+      if (seq > 0) logs.emplace_back(seq, entry.path());
+    }
+    if (logs.size() <= 20) return;
+    std::sort(logs.begin(), logs.end());
+    for (size_t i = 0; i + 20 < logs.size(); ++i) fs::remove(logs[i].second, ec);
+    return;
+  }
+#else
+  wchar_t exe[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return;
+  std::wstring dir(exe, n);
+  dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"logs\\";
+  std::vector<std::pair<int, std::wstring>> logs;
+  WIN32_FIND_DATAW fd;
+  HANDLE find = FindFirstFileW((dir + L"ge_*.log").c_str(), &fd);
+  if (find == INVALID_HANDLE_VALUE) return;
+  do {
+    const int seq = _wtoi(fd.cFileName + 3);
+    if (seq > 0) logs.emplace_back(seq, fd.cFileName);
+  } while (FindNextFileW(find, &fd));
+  FindClose(find);
+  if (logs.size() <= 20) return;
+  std::sort(logs.begin(), logs.end());
+  for (size_t i = 0; i + 20 < logs.size(); ++i) DeleteFileW((dir + logs[i].second).c_str());
+#endif
+}
+
+// The top of every log: what a bug report needs to know about the player's
+// PC and settings, once at start-up (nothing runs per frame).
+void LogSessionHeader() {
+#if defined(_WIN32)
+  std::string windows = "unknown";
+  if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    if (auto rtl_get_version =
+            reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"))) {
+      RTL_OSVERSIONINFOW vi{};
+      vi.dwOSVersionInfoSize = sizeof(vi);
+      if (rtl_get_version(&vi) == 0) {
+        windows = std::to_string(vi.dwMajorVersion) + "." + std::to_string(vi.dwMinorVersion) +
+                  " build " + std::to_string(vi.dwBuildNumber);
+      }
+    }
+  }
+  std::string cpu = "unknown";
+  {
+    wchar_t name[128] = {};
+    DWORD size = sizeof(name);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     L"ProcessorNameString", RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS) {
+      char utf8[256] = {};
+      WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+      cpu = utf8;
+      while (!cpu.empty() && cpu.back() == ' ') cpu.pop_back();
+    }
+  }
+  MEMORYSTATUSEX mem{};
+  mem.dwLength = sizeof(mem);
+  GlobalMemoryStatusEx(&mem);
+  const std::string os = "Windows " + windows;
+  const uint64_t ram = mem.ullTotalPhys;
+#else
+  auto sysctl_string = [](const char* name) {
+    char value[256] = {};
+    size_t size = sizeof(value) - 1;
+    return sysctlbyname(name, value, &size, nullptr, 0) == 0 ? std::string(value) : std::string("unknown");
+  };
+  const std::string os = "macOS " + sysctl_string("kern.osproductversion");
+  const std::string cpu = sysctl_string("machdep.cpu.brand_string");
+  uint64_t ram = 0;
+  size_t ram_size = sizeof(ram);
+  sysctlbyname("hw.memsize", &ram, &ram_size, nullptr, 0);
+#endif
+  const std::string version = ReadVersionText();
+  REXLOG_INFO("==== GoldenEye 007 XBLA PC Recomp {} ====", version.empty() ? "dev build" : version);
+  REXLOG_INFO("PC: {}; {} ({} threads); {} GB RAM", os, cpu,
+              std::thread::hardware_concurrency(), (ram + (512ull << 20)) >> 30);
+  REXLOG_INFO("GPU: {} ({}, {} MB video memory), driver {}",
+              g_scale_gpu.name.empty() ? "unknown" : g_scale_gpu.name,
+              g_scale_gpu.integrated ? "integrated" : "dedicated", g_scale_gpu.video_memory_mb,
+              g_scale_gpu.driver.empty() ? "unknown" : g_scale_gpu.driver);
+  REXLOG_INFO("Display: {}; {} {}x{}", StartupDisplayMode(std::atoi(GetS("monitor").c_str())),
+              GetB("fullscreen") ? "fullscreen, window" : "windowed", GetS("ge_window_width"),
+              GetS("ge_window_height"));
+  REXLOG_INFO("Settings: renderer {}, render scale {} ({}x), V-Sync {}, mouse look {}",
+              g_renderer_active == 1 ? "native (graphics API " + GetS("gpu_native_api") + ")"
+                                     : "classic (graphics API " + GetS("gpu") + ")",
+              GetS("ge_render_scale"), g_render_scale_active, GetS("vsync"),
+              GetS("ge_mouselook_enable"));
+  REXLOG_INFO("Performance diagnostics: {}",
+              GetB("performance_diagnostics") ? "on" : "off (set performance_diagnostics = true "
+                                                       "in ge.toml for a detailed log)");
+}
+// Upscaling (ge_upscaling, on by default): AMD FidelityFX Super Resolution 1
+// when the game's picture is smaller than the window or screen (1x on a
+// 1080p or 1440p display), Contrast Adaptive Sharpening when it is the same
+// size or larger. One or two full-screen passes, at the final output only, so
+// the HUD and text are sharpened with the scene and our own overlays (FPS,
+// crosshair dot) are drawn after it. Off is the plain bilinear stretch.
+void ApplyUpscaling() {
+  rex::cvar::SetFlagByName("present_effect", GetS("ge_upscaling") == "off" ? "bilinear" : "fsr");
+}
+void SetUpscalingChangedHandler(std::function<void()> handler) {
+  g_upscaling_changed = std::move(handler);
+}
+// The scale this run draws at (the native renderer sizes its targets by it).
+float ActiveRenderScale() { return g_render_scale_active > 0 ? g_render_scale_active : 2.0f; }
+void ApplyRenderScaleToGpu() {
+  // resolution_scale is the Xenos plugin's; the native renderer reads the
+  // scale itself (ActiveRenderScale), so there's nothing to set (and no
+  // "could not set" warning in every player's log).
+  if (NativeRendererActive()) return;
+  // The classic renderer scales by whole numbers: 1.5x draws at 2x there.
+  const float scale = g_render_scale_active > 0 ? g_render_scale_active : 2.0f;
+  const std::string want = std::to_string(static_cast<int>(std::ceil(scale)));
+  const bool ok = rex::cvar::SetFlagByName("resolution_scale", want);
+  const std::string now = rex::cvar::GetFlagByName("resolution_scale");
+  if (ok && now == want) {
+    REXLOG_INFO("Render scale: resolution_scale = {}", now);
+  } else {
+    REXLOG_WARN("Render scale: could not set resolution_scale to {} (it is {})", want, now);
+  }
+}
+}  // namespace ge
+
 // Run-time state shared with the renderer (never saved to ge.toml).
 REXCVAR_DEFINE_BOOL(ge_backdrop_active, false, "Transient",
                     "The front end is up: the renderer shows the menu backdrop picture");
@@ -1168,6 +1774,22 @@ void ge_backdrop_tick(bool front_end) {
   last = static_cast<int>(front_end);
   rex::cvar::SetFlagByName("ge_backdrop_active", front_end ? "true" : "false");
 }
+
+namespace ge {
+// Whether the desk goes behind the frame being presented, from the game's state
+// at that moment (the same test as ge_backdrop_tick's caller): the folder menus
+// of the front end, menu 7 and up, but not the mission black-out (12) or the
+// agent showcase (24, 25). ge_backdrop_active follows the controller polls,
+// which can come a frame after the main menu first shows: that frame had no
+// desk, the folder filling the screen for a moment between logo and menu.
+bool BackdropActiveNow() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks || !ks->memory()) return false;
+  uint8_t* base = ks->memory()->virtual_membase();
+  const uint32_t stage = LD32(base, 0x82423E00u), menu = LD32(base, 0x8272B35Cu);
+  return stage == 90u && menu >= 7u && menu != 12u && menu != 24u && menu != 25u;
+}
+}  // namespace ge
 
 // Front-end menus: the open folder is a 3D model (sub_820F5898, drawn first by
 // every menu) framed for a 4:3 screen, so a wide window showed black where the
