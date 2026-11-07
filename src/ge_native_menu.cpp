@@ -41,18 +41,22 @@
 #include <rex/kernel/xam/ge_online_control.h>
 #include <rex/system/xam/user_profile.h>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#include <filesystem>
+
+#include <rex/filesystem.h>  // GetExecutableFolder
+
+#if !defined(_WIN32)
+#include <sys/sysctl.h>  // the log header's system details
 #endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+
+#include "ge_win32_compat.h"  // <windows.h>, or its SDL3 stand-in elsewhere
 
 #include <atomic>
 #include <mutex>
 
-#include "ge_update.h"      // Check for Updates
+#if defined(_WIN32)
+#include "ge_update.h"      // Check for Updates (WinHTTP; no launcher elsewhere)
+#endif
 #include "ge_version_rc.h"  // GE_VERSION_STR, from VERSION
 
 namespace ge {
@@ -237,12 +241,22 @@ std::string EffectiveScreenRatio() {
   int w = std::atoi(GetS("ge_window_width").c_str());
   int h = std::atoi(GetS("ge_window_height").c_str());
   if (GetB("fullscreen")) {
+#if defined(_WIN32)
     MONITORINFO mi{sizeof(mi)};
     HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
     if (mon && GetMonitorInfoW(mon, &mi)) {
       w = mi.rcMonitor.right - mi.rcMonitor.left;
       h = mi.rcMonitor.bottom - mi.rcMonitor.top;
     }
+#else
+    SDL_Rect r{};
+    HWND win = GetForegroundWindow();
+    const SDL_DisplayID display = win ? SDL_GetDisplayForWindow(win) : SDL_GetPrimaryDisplay();
+    if (display && SDL_GetDisplayBounds(display, &r)) {
+      w = r.w;
+      h = r.h;
+    }
+#endif
   }
   if (w <= 0 || h <= 0) return "16:9";
   const float aspect = static_cast<float>(w) / static_cast<float>(h);
@@ -401,6 +415,7 @@ void StartUpdateCheck() {
     if (g_update.state != UpdateState::Checking) return;
     check = ++g_update_check;
   }
+#if defined(_WIN32)
   REXLOG_INFO("[update] asking {} for the latest release", ge::update::Narrow(ge::update::ApiUrl()));
   std::thread([check] {
     ge::update::Release release;
@@ -415,6 +430,9 @@ void StartUpdateCheck() {
     REXLOG_INFO("[update] latest release {} (this copy {}): {}", release.version.empty() ? "?" : release.version,
                 GE_VERSION_STR, newer > 0 ? "newer" : newer == 0 ? "not newer" : error);
   }).detach();
+#else
+  (void)check;
+#endif
 }
 
 // Back to Help & Options, where Check for Updates is.
@@ -443,6 +461,7 @@ void StartUpdater() {
   }
   const std::wstring launcher = ge::LauncherPath();
   if (launcher.empty()) return;
+#if defined(_WIN32)
   ge::PersistSettings();
   const std::wstring folder = std::filesystem::path(launcher).parent_path().wstring();
   std::wstring command = L"\"" + launcher + L"\" --update";
@@ -462,6 +481,7 @@ void StartUpdater() {
   REXLOG_INFO("Game closing for the launcher to install an update");
   rex::FlushLogging();
   TerminateProcess(GetCurrentProcess(), 0);
+#endif
 }
 
 // The page's text, in lines short enough for the page (the game's own font
@@ -587,11 +607,19 @@ std::vector<Row> BuildPage(Page page) {
           },
           [] {
             if (GetB("fullscreen")) {  // the size of the screen the game is on
+#if !defined(_WIN32)
+              SDL_Rect r{};
+              HWND win = GetForegroundWindow();
+              const SDL_DisplayID display = win ? SDL_GetDisplayForWindow(win) : SDL_GetPrimaryDisplay();
+              if (display && SDL_GetDisplayBounds(display, &r))
+                return std::to_string(r.w) + "x" + std::to_string(r.h);
+#else
               MONITORINFO mi{sizeof(mi)};
               HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
               if (mon && GetMonitorInfoW(mon, &mi))
                 return std::to_string(mi.rcMonitor.right - mi.rcMonitor.left) + "x" +
                        std::to_string(mi.rcMonitor.bottom - mi.rcMonitor.top);
+#endif
               return std::string("Screen size");
             }
             return GetS("ge_window_width") + "x" + GetS("ge_window_height");
@@ -1537,13 +1565,13 @@ bool LanRefreshHover(uint8_t* base, float y, int w) {
 // show nothing. Called by the main menu's row draw (ge_f2_driver).
 namespace {
 std::string ReadVersionText() {
-  wchar_t path[MAX_PATH];
-  const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) return {};
-  std::wstring dir(path, n);
-  dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
-  for (const std::wstring& file : {dir + L"resources\\version.txt", dir + L"version.txt"}) {
+  const std::filesystem::path dir = rex::filesystem::GetExecutableFolder();
+  for (const std::filesystem::path& file : {dir / "resources" / "version.txt", dir / "version.txt"}) {
+#if defined(_WIN32)
     FILE* f = _wfopen(file.c_str(), L"rb");
+#else
+    FILE* f = std::fopen(file.c_str(), "rb");
+#endif
     if (!f) continue;
     char buf[32] = {};
     const size_t got = std::fread(buf, 1, sizeof(buf) - 1, f);
@@ -1597,6 +1625,24 @@ void ApplyDiagnostics() {
     spdlog::flush_every(std::chrono::seconds(2));
   }
   // Keep the 20 newest session logs (each run starts a new ge_NNN.log).
+#if !defined(_WIN32)
+  {
+    namespace fs = std::filesystem;
+    const fs::path dir = rex::filesystem::GetExecutableFolder() / "logs";
+    std::vector<std::pair<int, fs::path>> logs;
+    std::error_code ec;
+    for (const fs::directory_entry& entry : fs::directory_iterator(dir, ec)) {
+      const std::string name = entry.path().filename().string();
+      if (name.rfind("ge_", 0) != 0 || entry.path().extension() != ".log") continue;
+      const int seq = std::atoi(name.c_str() + 3);
+      if (seq > 0) logs.emplace_back(seq, entry.path());
+    }
+    if (logs.size() <= 20) return;
+    std::sort(logs.begin(), logs.end());
+    for (size_t i = 0; i + 20 < logs.size(); ++i) fs::remove(logs[i].second, ec);
+    return;
+  }
+#else
   wchar_t exe[MAX_PATH];
   const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
   if (n == 0 || n >= MAX_PATH) return;
@@ -1614,11 +1660,13 @@ void ApplyDiagnostics() {
   if (logs.size() <= 20) return;
   std::sort(logs.begin(), logs.end());
   for (size_t i = 0; i + 20 < logs.size(); ++i) DeleteFileW((dir + logs[i].second).c_str());
+#endif
 }
 
 // The top of every log: what a bug report needs to know about the player's
 // PC and settings, once at start-up (nothing runs per frame).
 void LogSessionHeader() {
+#if defined(_WIN32)
   std::string windows = "unknown";
   if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
     using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
@@ -1647,10 +1695,24 @@ void LogSessionHeader() {
   MEMORYSTATUSEX mem{};
   mem.dwLength = sizeof(mem);
   GlobalMemoryStatusEx(&mem);
+  const std::string os = "Windows " + windows;
+  const uint64_t ram = mem.ullTotalPhys;
+#else
+  auto sysctl_string = [](const char* name) {
+    char value[256] = {};
+    size_t size = sizeof(value) - 1;
+    return sysctlbyname(name, value, &size, nullptr, 0) == 0 ? std::string(value) : std::string("unknown");
+  };
+  const std::string os = "macOS " + sysctl_string("kern.osproductversion");
+  const std::string cpu = sysctl_string("machdep.cpu.brand_string");
+  uint64_t ram = 0;
+  size_t ram_size = sizeof(ram);
+  sysctlbyname("hw.memsize", &ram, &ram_size, nullptr, 0);
+#endif
   const std::string version = ReadVersionText();
   REXLOG_INFO("==== GoldenEye 007 XBLA PC Recomp {} ====", version.empty() ? "dev build" : version);
-  REXLOG_INFO("PC: Windows {}; {} ({} threads); {} GB RAM", windows, cpu,
-              std::thread::hardware_concurrency(), (mem.ullTotalPhys + (512ull << 20)) >> 30);
+  REXLOG_INFO("PC: {}; {} ({} threads); {} GB RAM", os, cpu,
+              std::thread::hardware_concurrency(), (ram + (512ull << 20)) >> 30);
   REXLOG_INFO("GPU: {} ({}, {} MB video memory), driver {}",
               g_scale_gpu.name.empty() ? "unknown" : g_scale_gpu.name,
               g_scale_gpu.integrated ? "integrated" : "dedicated", g_scale_gpu.video_memory_mb,
@@ -1912,6 +1974,7 @@ void ge_controller_tick() {
   static int countdown = 0;
   if (--countdown > 0) return;
   countdown = 60;
+#if defined(_WIN32)
   typedef DWORD(WINAPI * GetStateFn)(DWORD, void*);
   static GetStateFn get_state = [] {
     HMODULE m = LoadLibraryW(L"xinput1_4.dll");
@@ -1922,15 +1985,13 @@ void ge_controller_tick() {
   bool connected = false;
   alignas(8) unsigned char state[16] = {};
   for (DWORD i = 0; i < 4 && !connected; ++i) connected = get_state(i, state) == ERROR_SUCCESS;
+#else
+  bool connected = SDL_HasGamepad();
+#endif
   // Testing aid: a file named fakepad.txt beside the exe stands for a controller.
   if (!connected) {
-    wchar_t exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) {
-      std::wstring dir(exe, n);
-      dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"fakepad.txt";
-      connected = GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
+    std::error_code ec;
+    connected = std::filesystem::exists(rex::filesystem::GetExecutableFolder() / "fakepad.txt", ec);
   }
   static int last = -1;
   if (last == static_cast<int>(connected)) return;

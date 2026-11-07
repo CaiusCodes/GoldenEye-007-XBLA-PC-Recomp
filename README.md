@@ -125,7 +125,7 @@ Older installations using a separate setup executable and `Game` folder can also
 
 ## Known Limitations
 
-- Windows only.
+- Windows only (an experimental macOS build can be built from source, see [Building on macOS](#building-on-macos-experimental)).
 - Only the supported GoldenEye 007 XBLA build (Title ID `584108A9`) is accepted.
 - Some issues inherited from the original incomplete unreleased build may remain.
 - Windows SmartScreen may warn about the unsigned executable.
@@ -148,6 +148,34 @@ Found a bug? [Open a GitHub Issue](https://github.com/CaiusCodes/GoldenEye-007-X
 5. Set diagnostics back to `false` afterwards.
 
 For NPC pathfinding or mission progression problems, use `npc_path_log = true` instead.
+
+## Building on macOS (experimental)
+
+The game can be built from source on Apple Silicon Macs with Xcode's command
+line tools (AppleClang 16 or newer), `brew install cmake ninja` and Python 3.
+There is no launcher on macOS: `tools/extract_stfs.py` extracts your package.
+The game uses the classic renderer there (Vulkan on MoltenVK, which the build
+places next to it); the native renderer needs Microsoft's shader compiler and
+is Windows only for now.
+
+```bash
+python3 tools/extract_stfs.py <your package> game
+cmake --preset mac-arm64-release
+cmake --build --preset mac-arm64-release --target ge_codegen
+cmake --preset mac-arm64-release
+cmake --build --preset mac-arm64-release
+ln -sfn ../../../game "out/build/mac-arm64-release/assets"
+"out/build/mac-arm64-release/GoldenEye 007"
+```
+
+A setup window comes up before the game starts (graphics, controls, key
+bindings); untick "Show this window at start" or set `ge_show_setup = false`
+to skip it. The internal resolution starts at 1x, which ran at 60 FPS on an
+M3 Pro; 2x and 3x look sharper but cost a lot more.
+
+The macOS port is new: fullscreen can come up black, so the game starts
+windowed by default. Run Setup Again and Check for Updates belong to the
+Windows launcher and are not shown on macOS.
 
 ## Development & Credits
 

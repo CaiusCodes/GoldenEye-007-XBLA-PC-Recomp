@@ -20,11 +20,13 @@
 #include <cctype>
 #include <cstdlib>
 #include <functional>
+#include <optional>
 #include <string>
 
 #include "ge_menu.h"
 #include "ge_postfx.h"
 #include "ge_native_shaders.h"
+#include "ge_setup.h"
 
 // Relaunch the current executable as a fresh process (implemented in
 // ge_hooks.cpp, which owns the Win32 includes). Used by the ONLINE menu's
@@ -160,6 +162,35 @@ class GeApp : public rex::ReXApp {
 
   void OnConfigureFonts(ImFontAtlas* atlas) override { ge::AddOverlayFont(atlas); }
 
+  // The setup window (ge_setup.h) comes before the game: the runtime and GPU
+  // are only created once Play is pressed, so everything chosen there applies
+  // to this start.
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
+    if (!ge::ShowSetupAtStart() || !imgui_drawer()) return defaults;
+    ge::SetMouselookSuppressed(true);  // the pointer is needed here
+    if (window()) window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+    GeSetupDialog::Callbacks cb;
+    cb.persist_config = [this] { PersistConfig(); };
+    cb.resize_window = [this](int w, int h) {
+      app_context().CallInUIThreadDeferred([w, h] { ge::ResizeGameWindow(w, h); });
+    };
+    cb.play = [this, defaults, resume] {
+      app_context().CallInUIThreadDeferred([this, defaults, resume] {
+        if (window()) window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+        ge::SetMouselookSuppressed(false);
+        // The Render Scale was applied before this window (OnCreateDialogs);
+        // the emulated GPU starts with resume, so a scale chosen here counts now.
+        ge::ApplyRenderScale();
+        ge::ApplyRenderScaleToGpu();
+        resume(defaults);
+      });
+    };
+    cb.quit = [this] { app_context().CallInUIThreadDeferred([this] { app_context().QuitFromUIThread(); }); };
+    new GeSetupDialog(imgui_drawer(), std::move(cb));  // deletes itself on close
+    return std::nullopt;
+  }
+
   // Render Scale (ge_render_scale): picks the scale once the config is loaded;
   // OnCreateDialogs hands it to the GPU plugin before the emulated GPU starts.
   void OnPreSetup(rex::RuntimeConfig& config) override {
@@ -172,12 +203,18 @@ class GeApp : public rex::ReXApp {
     // Without Microsoft's shader compiler (dxcompiler.dll beside the exe) the
     // native renderer could not translate the game's shaders: classic this run.
     if (REXCVAR_GET(gpu_native)) {
+#if defined(_WIN32)
       if (HMODULE dxc = LoadLibraryW(L"dxcompiler.dll")) {
         FreeLibrary(dxc);
       } else {
         REXLOG_WARN("dxcompiler.dll not found: using the classic renderer this run");
         rex::cvar::SetFlagByName("gpu_native", "false");
       }
+#else
+      // No bundled shader compiler for the native renderer outside Windows yet:
+      // the classic Xenos renderer (Vulkan on MoltenVK on macOS).
+      rex::cvar::SetFlagByName("gpu_native", "false");
+#endif
     }
     ge::SetActiveRenderer(REXCVAR_GET(gpu_native));
     if (REXCVAR_GET(gpu_native)) {
