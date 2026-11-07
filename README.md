@@ -170,14 +170,12 @@ ln -sfn ../../../game "out/build/mac-arm64-release/assets"
 
 A setup window comes up before the game starts (graphics, controls, key
 bindings); untick "Show this window at start" or set `ge_show_setup = false`
-to skip it. If the frame rate is low, set the internal resolution to 1x there
-(in testing, 1x ran at about 60 FPS where the default 2x ran at about 15).
+to skip it. The internal resolution starts at 1x, which ran at 60 FPS on an
+M3 Pro; 2x and 3x look sharper but cost a lot more.
 
-The macOS port is new and still has known issues. Faint dotted lines can show
-along some triangle edges: Apple GPUs give unusable texture coordinate
-derivatives at edge pixels with MSAA, and the workaround in the SDK patch
-(`quad_robust_texture_derivatives`) removes most but not all of them.
-Fullscreen can come up black; the game starts windowed by default.
+The macOS port is new: fullscreen can come up black, so the game starts
+windowed by default. Run Setup Again and Check for Updates belong to the
+Windows launcher and are not shown on macOS.
 
 ## Development & Credits
 
