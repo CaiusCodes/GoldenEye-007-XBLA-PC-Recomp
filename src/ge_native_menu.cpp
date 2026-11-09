@@ -1,10 +1,11 @@
 // ge - native PC settings pages inside the game's own Help & Options menu.
 //
 // Help & Options (menu 33) normally lists five rows from a table of text ids at
-// 0x8272C344. We give it nine:
-//   How to Play | Gamepad Settings | Keyboard & Mouse | Video Settings |
-//   Online Settings | Other Settings | Credits | Check for Updates | Done
-// The three PC rows open the game's Other Settings page (menu 35) with a page
+// 0x8272C344. We give it ten:
+//   How to Play | Gamepad Settings | Gamepad Look | Keyboard & Mouse |
+//   Video Settings | Online Settings | Other Settings | Credits |
+//   Check for Updates | Done
+// The PC rows open the game's Other Settings page (menu 35) with a page
 // flag set; while the flag is set, the Other Settings draw and update
 // functions are skipped and our own rows are drawn with the game's own text,
 // highlight and sound routines, and driven by the game's menu cursor and
@@ -113,14 +114,14 @@ constexpr uint32_t kCustomBase = 0xF000;
 constexpr uint32_t kCustomCount = 256;
 constexpr uint32_t kCustomChars = 64;
 uint32_t g_string_block = 0;  // guest address of kCustomCount * kCustomChars UTF-16 chars
-uint32_t g_help_table = 0;    // guest address of our 8-entry Help & Options table
+uint32_t g_help_table = 0;    // guest address of our Help & Options table (kHelpRows ids)
 std::vector<std::string> g_custom_text(kCustomCount);
 
 bool EnsureGuestBlocks(uint8_t* base) {
   if (g_string_block) return true;
   auto* mem = rex::system::kernel_state()->memory();
   g_string_block = mem->SystemHeapAlloc(kCustomCount * kCustomChars * 2);
-  g_help_table = mem->SystemHeapAlloc(16 * 4);  // Help & Options rows (nine used)
+  g_help_table = mem->SystemHeapAlloc(16 * 4);  // Help & Options rows (ten used)
   if (!g_string_block || !g_help_table) return false;
   std::memset(base + g_string_block, 0, kCustomCount * kCustomChars * 2);
   return true;
@@ -149,6 +150,7 @@ enum : uint32_t {
   kTxtRefresh,
   kTxtVersion,
   kTxtUpdates,
+  kTxtGamepadLook,
   kTxtFirstDynamic = kCustomBase + 16,  // page labels and values, rewritten per frame
 };
 
@@ -159,7 +161,7 @@ std::function<void()> g_restart;
 std::function<void(int, int)> g_window_size;
 
 // ---------------------------------------------------------------- pages ---
-enum class Page { None, Keyboard, Video, PostFx, Online, Bindings1, Bindings2, Update };
+enum class Page { None, Keyboard, Video, PostFx, Online, Bindings1, Bindings2, Update, Gamepad };
 Page g_page = Page::None;
 bool g_leave_page = false;  // a Done row asked to go back to Help & Options
 
@@ -534,6 +536,31 @@ std::vector<Row> BuildPage(Page page) {
       rows.push_back(Row{RowKind::Toggle, "Keyboard Controls:", "ge_keyboard_enable"});
       AddAction(rows, "Key Bindings: Movement", [] { g_page = Page::Bindings1; });
       AddAction(rows, "Key Bindings: Buttons", [] { g_page = Page::Bindings2; });
+      AddAction(rows, "Done", [] { g_leave_page = true; });
+      break;
+    }
+    case Page::Gamepad: {
+      // Modern stick look (ge_hooks.cpp, ge_pad_look): the look stick turns the
+      // camera directly, for every pad. The speed and deadzone rows only matter
+      // with it on. Up/down inversion stays the game's own Look Up/Down option
+      // (Gamepad Settings), so each player keeps their own.
+      rows.push_back(Row{RowKind::Toggle, "Modern Stick Look:", "ge_pad_modern_look"});
+      // Second row: a short value, clear of the crest picture at the top right.
+      AddAction(
+          rows, "Response:",
+          [] {
+            const float c = GetF("ge_pad_look_curve");
+            SetS("ge_pad_look_curve", c < 1.25f ? "1.5" : c < 1.75f ? "2" : "1");
+          },
+          [] {
+            const float c = GetF("ge_pad_look_curve");
+            return std::string(c < 1.25f ? "Linear" : c < 1.75f ? "Smooth" : "Fine Centre");
+          });
+      AddSlider(rows, "Look Speed:", "ge_pad_look_sens", 0.25f, 3.0f, 0.05f);
+      AddSlider(rows, "Up/Down Speed:", "ge_pad_look_sens_y", 0.25f, 1.5f, 0.05f);
+      AddSlider(rows, "Precise Aim Speed:", "ge_pad_aim_sens", 0.1f, 1.5f, 0.05f);
+      AddSlider(rows, "Deadzone:", "ge_pad_deadzone", 0.0f, 0.5f, 0.01f);
+      AddSlider(rows, "Outer Deadzone:", "ge_pad_outer_deadzone", 0.0f, 0.3f, 0.01f);
       AddAction(rows, "Done", [] { g_leave_page = true; });
       break;
     }
@@ -1085,6 +1112,22 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
       return false;
     }
   }
+  // Sliders also step with left / right, so a pad can set them without
+  // dragging: a twentieth of the range a press, on the slider's own steps.
+  if (g_hover >= 0 && rows[g_hover].kind == RowKind::Slider) {
+    const Row& r = rows[g_hover];
+    const int dir = ButtonPressed(ctx, base, 0x0202) ? -1 : ButtonPressed(ctx, base, 0x0101) ? 1 : 0;
+    if (dir) {
+      const float step = std::max(r.step, std::round((r.max - r.min) / 20.0f / r.step) * r.step);
+      float v = std::clamp(GetF(r.cvar) + dir * step, r.min, r.max);
+      v = std::round(v / r.step) * r.step;
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%.3f", v);
+      PlaySelectSound(ctx, base);
+      SetS(r.cvar, buf);
+      return false;
+    }
+  }
   if (g_hover >= 0 && rows[g_hover].kind != RowKind::Label && ButtonPressed(ctx, base, kSelectMask)) {
     Row& r = rows[g_hover];
     PlaySelectSound(ctx, base);
@@ -1139,10 +1182,10 @@ bool ge_str_lookup(PPCRegister& r3) {
 }
 
 // --- Help & Options (menu 33) ---------------------------------------------
-// Rows: 0 How to Play, 1 Gamepad, 2 Keyboard & Mouse, 3 Video, 4 Online,
-//       5 Other Settings, 6 Credits, 7 Check for Updates, 8 Done.
+// Rows: 0 How to Play, 1 Gamepad, 2 Gamepad Look, 3 Keyboard & Mouse, 4 Video,
+//       5 Online, 6 Other Settings, 7 Credits, 8 Check for Updates, 9 Done.
 namespace {
-constexpr int kHelpRows = 9;
+constexpr int kHelpRows = 10;
 void PrepareHelpTable(uint8_t* base) {
   if (!EnsureGuestBlocks(base)) return;
   static bool done = false;
@@ -1153,13 +1196,14 @@ void PrepareHelpTable(uint8_t* base) {
   SetCustomText(base, kTxtVideo, "Video Settings");
   SetCustomText(base, kTxtOnline, "Online Settings");
   SetCustomText(base, kTxtUpdates, "Check for Updates");
-  const uint32_t ids[kHelpRows] = {0x9D55, kTxtGamepad, kTxtKeyboard, kTxtVideo, kTxtOnline,
-                                   0x9D54, 0x9D67, kTxtUpdates, 0x9D66};
+  SetCustomText(base, kTxtGamepadLook, "Gamepad Look");
+  const uint32_t ids[kHelpRows] = {0x9D55, kTxtGamepad, kTxtGamepadLook, kTxtKeyboard, kTxtVideo,
+                                   kTxtOnline, 0x9D54, 0x9D67, kTxtUpdates, 0x9D66};
   for (int i = 0; i < kHelpRows; ++i) ST32(base, g_help_table + i * 4, ids[i]);
-  // Nine rows need a tighter column than the original five; Done stays where
-  // it was with eight rows (118 + 7 * 24).
-  STF32(base, kHelpY0, 114.0f);
-  STF32(base, kHelpSpacing, 21.5f);
+  // Ten rows need a tighter column than the original five; Done ends up about
+  // where it was with eight rows (118 + 7 * 24 = 286).
+  STF32(base, kHelpY0, 112.0f);
+  STF32(base, kHelpSpacing, 19.5f);
 }
 }  // namespace
 
@@ -1187,12 +1231,13 @@ void ge_help_route(PPCRegister& r9) {
   switch (r9.s32) {
     case 0: r9.u64 = 0; break;                                  // How to Play
     case 1: r9.u64 = 1; break;                                  // Gamepad
-    case 2: g_page = Page::Keyboard; r9.u64 = 2; break;         // -> menu 35, ours
-    case 3: g_page = Page::Video; r9.u64 = 2; break;
-    case 4: g_page = Page::Online; r9.u64 = 2; break;
-    case 5: g_page = Page::None; r9.u64 = 2; break;             // Other Settings
-    case 6: r9.u64 = 3; break;                                  // Credits
-    case 7:                                                     // Check for Updates
+    case 2: g_page = Page::Gamepad; r9.u64 = 2; break;          // -> menu 35, ours
+    case 3: g_page = Page::Keyboard; r9.u64 = 2; break;
+    case 4: g_page = Page::Video; r9.u64 = 2; break;
+    case 5: g_page = Page::Online; r9.u64 = 2; break;
+    case 6: g_page = Page::None; r9.u64 = 2; break;             // Other Settings
+    case 7: r9.u64 = 3; break;                                  // Credits
+    case 8:                                                     // Check for Updates
       g_page = Page::Update;
       StartUpdateCheck();
       r9.u64 = 2;

@@ -61,7 +61,7 @@ The native renderer PLUME significantly reduces CPU and GPU overhead compared wi
 ### Controls & Quality of Life
 
 - Full **keyboard and mouse** support with rebindable keys and adjustable sensitivity
-- **Xbox controller** support
+- **Xbox controller** support, with optional modern stick look (linear camera, adjustable deadzones, every pad in split-screen)
 - Native PC settings menus
 - Optional 100% completion unlocks for missions, difficulties and cheats
 - Improved aiming, including mouse-controlled tank turret and sniper zoom
@@ -97,7 +97,7 @@ The native renderer PLUME significantly reduces CPU and GPU overhead compared wi
 
 Keys can be customised under **Help & Options → Keyboard & Mouse** or through the in-game watch menu.
 
-Xbox controllers use the original console controls.
+Xbox controllers use the original console controls. Turn on **Help & Options → Gamepad Look → Modern Stick Look** for a linear right-stick camera like the mouse: no acceleration ramp, no spring back to the middle when aiming or letting go, and your own deadzone, speed and response curve. It works for every controller in split-screen, and each player keeps their own Look Up/Down setting.
 
 ## Improvements & Fixes
 

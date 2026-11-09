@@ -813,3 +813,26 @@ address = 0x8218BE00
 name = "ge_jungle_set_texture"
 registers = ["r5"]
 after_instruction = false
+
+# Modern stick look (ge_pad_modern_look, issue #20). Inside the per-player
+# camera routine sub_820B99E8 (N64 bondviewMove): f1/f2 and f3/f4 are that
+# player's two sticks, saved at r1+548/556 and r1+580/588; styles 1 and 2
+# swap them so r1+580/588 is the look stick from 0x820B9BFC on. The first hook
+# remembers the player's control style (sub_820C2B08's result), the second
+# takes the look stick away from the game's own (deadzone + acceleration) look
+# and turns the camera linearly instead.
+[[midasm_hook]]
+address = 0x820B9BBC
+name = "ge_pad_look_style"
+registers = ["r3"]
+[[midasm_hook]]
+address = 0x820B9BFC
+name = "ge_pad_look"
+registers = ["r1", "r18", "f0", "f11"]
+# Modern stick look: the game re-levels the view (player+524 set, pitch eased
+# back toward level) when it sees no look input; with modern look it sees
+# none, so the view sprang back. Cleared here, where the flag is acted on.
+[[midasm_hook]]
+address = 0x820BB488
+name = "ge_pad_look_hold_pitch"
+registers = ["r11"]

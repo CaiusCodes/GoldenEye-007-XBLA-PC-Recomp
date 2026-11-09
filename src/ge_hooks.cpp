@@ -2989,6 +2989,148 @@ void ge_mouse_camera(uint8_t* base) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Modern stick look (issue #20, off by default). The game's own right-stick
+// look has a large deadzone and turns with an acceleration ramp, and in aim
+// mode the stick moves the crosshair, which springs back to the middle when
+// the stick is let go. With ge_pad_modern_look the look stick turns the camera
+// directly instead, at a speed in proportion to how far it is pushed (after a
+// small adjustable deadzone), as mouse-look does.
+//
+// It works inside the game's per-player camera routine sub_820B99E8, which the
+// game runs for each player with that player's own two sticks (N64 units,
+// -80..80), so every pad in split-screen gets it independently, with that
+// player's own Look Up/Down setting. At 0x820B9BFC the look stick (after the
+// control style's swap: style 2 is southpaw) is at r1+548 / r1+556 and in
+// f0 / f11; we read it, zero it so the game's own look does nothing, and turn
+// that player's yaw/pitch (player+0x254 / +0x264, degrees, as mouse-look
+// writes them). Control styles 1 and 3 turn and look up/down with the move
+// stick instead, so they keep the game's own handling, as does the tank.
+// ---------------------------------------------------------------------------
+REXCVAR_DEFINE_BOOL(ge_pad_modern_look, false, "Input",
+                    "Controller: the look stick turns the camera directly and linearly "
+                    "(no acceleration, no spring back, own deadzone)");
+REXCVAR_DEFINE_DOUBLE(ge_pad_look_sens, 1.0, "Input",
+                      "Controller look speed with modern stick look (1 = 210 degrees a second "
+                      "at full tilt)")
+    .range(0.1, 4.0);
+REXCVAR_DEFINE_DOUBLE(ge_pad_look_sens_y, 0.7, "Input",
+                      "Controller look up/down speed, as a share of the left/right speed")
+    .range(0.1, 2.0);
+REXCVAR_DEFINE_DOUBLE(ge_pad_aim_sens, 0.5, "Input",
+                      "Controller look speed while holding precise aim (share of the look speed)")
+    .range(0.1, 2.0);
+REXCVAR_DEFINE_DOUBLE(ge_pad_deadzone, 0.12, "Input",
+                      "Controller look stick inner deadzone (share of full tilt)")
+    .range(0.0, 0.6);
+REXCVAR_DEFINE_DOUBLE(ge_pad_outer_deadzone, 0.05, "Input",
+                      "Controller look stick outer deadzone: this much short of full tilt "
+                      "already counts as full speed")
+    .range(0.0, 0.4);
+REXCVAR_DEFINE_DOUBLE(ge_pad_look_curve, 1.0, "Input",
+                      "Controller look response: 1 = linear, higher = finer near the centre")
+    .range(1.0, 3.0);
+REXCVAR_DEFINE_BOOL(ge_debug_pad_look, false, "Debug",
+                    "Test-only: log the look stick values the camera routine gets");
+
+namespace {
+int g_pad_look_style = 0;  // the current player's control style (ge_pad_look_style)
+bool g_pad_look_on = false;  // modern look drives the current player's camera this update
+// The game's look stick at full tilt, in the units the camera routine gets.
+constexpr float kPadStickMax = 80.0f;
+constexpr float kPadYawPerSec = 210.f;  // degrees a second at full tilt, sens 1 (the game's own top speed)
+constexpr float kPadFrameSec = 1.f / 60.f;  // the game's update rate
+}  // namespace
+
+void ge_pad_look_style(PPCRegister& r3) { g_pad_look_style = r3.s32; }
+
+void ge_pad_look(PPCRegister& r1, PPCRegister& r18, PPCRegister& f0, PPCRegister& f11) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  const uint32_t ax = r1.u32 + 548u, ay = r1.u32 + 556u;
+  const float sx = LDF32(base, ax), sy = LDF32(base, ay);
+  if (REXCVAR_GET(ge_debug_pad_look)) {
+    const float mx = LDF32(base, r1.u32 + 580u), my = LDF32(base, r1.u32 + 588u);
+    static int n = 0, logged = 0;
+    const uint32_t p = LD32(base, GE_BONDVIEW_CUR);
+    if ((n++ % 6) == 0 && logged++ < 3000)
+      REXKRNL_INFO("GEPADLOOK player {} style {} r18 {} look {:.3f} {:.3f} move {:.3f} {:.3f} "
+                   "yaw {:.3f} pitch {:.3f} aim {} crosshair {:.3f} {:.3f}",
+                   LD32(base, 0x82F1FC70u), g_pad_look_style, r18.u32, sx, sy, mx, my,
+                   p ? LDF32(base, p + GE_OFF_CAM_X) : 0.f, p ? LDF32(base, p + GE_OFF_CAM_Y) : 0.f,
+                   p ? LD32(base, p + GE_OFF_AIM_MODE) : 0u, p ? LDF32(base, p + GE_OFF_CH_X) : 0.f,
+                   p ? LDF32(base, p + GE_OFF_CH_Y) : 0.f);
+  }
+  g_pad_look_on = false;
+  if (!REXCVAR_GET(ge_pad_modern_look)) return;
+  if (g_pad_look_style == 1 || g_pad_look_style == 3) return;
+  const uint32_t player = LD32(base, GE_BONDVIEW_CUR);
+  if (!player) return;
+  if (LD32(base, GE_IN_TANK_FLAG) == 1u && LD32(base, GE_PLAYER_TANK_PROP) != 0u) return;
+  g_pad_look_on = true;
+
+  // The game's own look gets nothing from the stick from here on (both paths
+  // to 0x820B9BFC have already loaded the pair into f0 / f11 too).
+  STF32(base, ax, 0.f);
+  STF32(base, ay, 0.f);
+  f0.f64 = 0.0;
+  f11.f64 = 0.0;
+  if (LD32(base, player + GE_OFF_DISABLED) || LD32(base, player + GE_OFF_WATCH)) return;
+
+  // Radial deadzone: inside it nothing, then 0..1 from its edge to the outer
+  // edge, shaped by the response curve (1 = linear).
+  float x = sx / kPadStickMax, y = sy / kPadStickMax;
+  const float mag = std::sqrt(x * x + y * y);
+  const float inner = static_cast<float>(REXCVAR_GET(ge_pad_deadzone));
+  const float outer = std::max(inner + 0.01f, 1.f - static_cast<float>(REXCVAR_GET(ge_pad_outer_deadzone)));
+  const uint32_t aim_mode = LD32(base, player + GE_OFF_AIM_MODE);
+  if (mag > inner) {
+    float t = (std::min(mag, outer) - inner) / (outer - inner);
+    t = std::pow(t, static_cast<float>(REXCVAR_GET(ge_pad_look_curve)));
+    x = x / mag * t;
+    y = y / mag * t;
+    float speed = kPadYawPerSec * kPadFrameSec * static_cast<float>(REXCVAR_GET(ge_pad_look_sens));
+    if (aim_mode == 1) {
+      // Precise aim: slower, and slower again the further the weapon zooms
+      // (the same rule as the mouse, ge_aim_zoom_scaling).
+      speed *= static_cast<float>(REXCVAR_GET(ge_pad_aim_sens));
+      if (REXCVAR_GET(ge_aim_zoom_scaling)) {
+        const float fov = LDF32(base, player + GE_OFF_FOV);
+        if (fov > 0.5f && fov < 60.f) {
+          constexpr float kDegToRad = 3.14159265358979323846f / 180.f;
+          speed *= std::tan(fov * 0.5f * kDegToRad) / std::tan(30.f * kDegToRad);
+        }
+      }
+    }
+    // The game's Look Up/Down option still decides up/down: r18 is 0 for
+    // Upright, where the game's own look raises the pitch with the stick up.
+    const float invert = r18.u32 == 0 ? 1.f : -1.f;
+    STF32(base, player + GE_OFF_CAM_X, LDF32(base, player + GE_OFF_CAM_X) + x * speed);
+    const float pitch = LDF32(base, player + GE_OFF_CAM_Y) +
+                        invert * y * speed * static_cast<float>(REXCVAR_GET(ge_pad_look_sens_y));
+    STF32(base, player + GE_OFF_CAM_Y, std::clamp(pitch, -90.f, 90.f));  // the game's own limits
+  }
+  // Aim mode: the camera turns and the crosshair stays in the middle, so there
+  // is nothing to spring back.
+  if (aim_mode == 1) {
+    STF32(base, player + GE_OFF_CH_X, 0.f);
+    STF32(base, player + GE_OFF_CH_Y, 0.f);
+    STF32(base, player + GE_OFF_GUN_X, 0.f);
+    STF32(base, player + GE_OFF_GUN_Y, 0.f);
+  }
+}
+
+// Later in the same update (0x820BB488, r11 = the player): the game's
+// re-levelling flag. It is set when the game sees no look input, and then eases
+// the pitch back toward level; with modern look the game never sees the look
+// stick, so the view sprang back each time the stick was let go. Keep it off:
+// the pitch stays where the player put it.
+void ge_pad_look_hold_pitch(PPCRegister& r11) {
+  if (!g_pad_look_on) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  const uint32_t player = LD32(base, GE_BONDVIEW_CUR);
+  if (player && player == r11.u32) ST32(base, player + 524u, 0);
+}
+
 
 // ---------------------------------------------------------------------------
 // 100% completion (Setup extra, ge_unlock_all). The save data inside the
@@ -3428,6 +3570,8 @@ struct GeScriptPress {
   uint16_t buttons = 0;
   uint8_t lt = 0, rt = 0;
   int16_t lx = 0, ly = 0;
+  int16_t rx = 0, ry = 0;
+  int hold = 6;  // polls the press lasts
 };
 std::deque<GeScriptPress> g_script_queue;
 // Test pads 2-4 (ge_debug_pads): words prefixed "P2:" .. "P4:" go to their
@@ -3545,6 +3689,13 @@ void ge_script_read_new_lines() {
         else if (word == "SDOWN") press.ly = -32767;
         else if (word == "SLEFT") press.lx = -32767;
         else if (word == "SRIGHT") press.lx = 32767;
+        else if (word.rfind("R=", 0) == 0) {  // test: look stick "R=x,y,polls" (s16 values)
+          int x = 0, y = 0, n = 6;
+          if (std::sscanf(word.c_str() + 2, "%d,%d,%d", &x, &y, &n) < 2) continue;
+          press.rx = static_cast<int16_t>(std::clamp(x, -32767, 32767));
+          press.ry = static_cast<int16_t>(std::clamp(y, -32767, 32767));
+          press.hold = std::clamp(n, 1, 6000);
+        }
         else if (word != "WAIT") continue;
         if (pad) g_extra_pads[pad - 1].queue.push_back(press);
         else g_script_queue.push_back(press);
@@ -3564,7 +3715,7 @@ void ge_script_apply(uint8_t* base) {
     } else if (!pad.queue.empty()) {
       pad.current = pad.queue.front();
       pad.queue.pop_front();
-      pad.phase = 6;
+      pad.phase = pad.current.hold;
     }
   }
   if (g_script_phase > 0) {
@@ -3574,7 +3725,7 @@ void ge_script_apply(uint8_t* base) {
   } else if (!g_script_queue.empty()) {
     g_script_current = g_script_queue.front();
     g_script_queue.pop_front();
-    g_script_phase = 6;
+    g_script_phase = g_script_current.hold;
     REXKRNL_INFO("GESCRIPT press buttons={:04X} lt={} rt={} menu={}", g_script_current.buttons,
                  g_script_current.lt, g_script_current.rt, LD32(base, 0x8272B35Cu));
   }
@@ -3585,6 +3736,8 @@ void ge_script_apply(uint8_t* base) {
     if (g_script_current.rt) base[GE_PAD0 + 3] = g_script_current.rt;
     if (g_script_current.lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(g_script_current.lx));
     if (g_script_current.ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(g_script_current.ly));
+    if (g_script_current.rx) ST16(base, GE_PAD0 + 8, static_cast<uint16_t>(g_script_current.rx));
+    if (g_script_current.ry) ST16(base, GE_PAD0 + 10, static_cast<uint16_t>(g_script_current.ry));
   }
 }
 
@@ -3606,7 +3759,8 @@ extern "C" REX_FUNC(sub_824082E8) {
     base[state + 7] = p.rt;
     ST16(base, state + 8, static_cast<uint16_t>(p.lx));
     ST16(base, state + 10, static_cast<uint16_t>(p.ly));
-    ST32(base, state + 12, 0);  // right stick
+    ST16(base, state + 12, static_cast<uint16_t>(p.rx));  // right stick
+    ST16(base, state + 14, static_cast<uint16_t>(p.ry));
     ctx.r3.u64 = 0;             // ERROR_SUCCESS
     return;
   }

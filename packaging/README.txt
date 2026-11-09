@@ -78,6 +78,16 @@ SETTINGS
 --------
 
 Help & Options on the main menu holds the PC settings:
+  Gamepad Look       Modern Stick Look (off by default): the look stick
+                     turns the camera directly and evenly, as the mouse
+                     does, with no speed-up, no spring back when aiming or
+                     letting go, and a small deadzone of your choosing.
+                     Also response (linear, smooth, fine centre), look
+                     speed, up/down speed, precise aim speed, deadzone and
+                     outer deadzone. Works for every pad in split-screen;
+                     up/down inversion stays each player's Look Up/Down
+                     option. Control styles that look up/down with the
+                     move stick keep the original controls.
   Keyboard & Mouse   mouse look, sensitivity, precise aim sensitivity,
                      invert look, key bindings
   Video Settings     windowed or fullscreen, window size (up to 3840x2160),
