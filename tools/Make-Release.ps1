@@ -260,6 +260,25 @@ if (Test-Path -LiteralPath $assetsRoot) {
     }
 }
 
+# Personal details: no shipped file may name the builder's Windows account, PC
+# or profile folders (a build without the -ffile-prefix-map source path mapping,
+# e.g. one made against an installed SDK, records them through __FILE__).
+$personal = @($env:USERNAME, $env:COMPUTERNAME, $env:USERPROFILE, $env:OneDrive) |
+    Where-Object { $_ -and $_.Length -ge 3 } | Select-Object -Unique
+$personal += @($personal | Where-Object { $_ -like "*\*" } | ForEach-Object { $_.Replace("\", "/") })
+$latin1 = [System.Text.Encoding]::GetEncoding(28591)
+foreach ($file in $stagedFiles) {
+    $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+    $asText = $latin1.GetString($bytes)
+    $asWide = [System.Text.Encoding]::Unicode.GetString($bytes) + [System.Text.Encoding]::Unicode.GetString($bytes, 1, [Math]::Max(0, $bytes.Length - 1))
+    foreach ($needle in $personal) {
+        if ($asText.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $asWide.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "Release file $($file.FullName) contains the builder's user, PC or profile name. Build with REXSDK_DIR set (the presets) so source paths are mapped."
+        }
+    }
+}
+
 # --- 5. The release ZIP ---------------------------------------------------------
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zipPath,
