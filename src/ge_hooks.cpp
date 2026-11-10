@@ -2856,7 +2856,13 @@ void ge_mouse_camera(uint8_t* base) {
   }
 
   const uint32_t aim_mode = LD32(base, player + GE_OFF_AIM_MODE);
+  // #21: who is aiming this time, the mouse or the controller's look stick.
+  // Only mouse aim pins the crosshair to the middle (#61); with the stick the
+  // game's own precise aim runs (the crosshair moves, the view turns near the
+  // screen edge, as on the Xbox 360).
+  static bool mouse_aim = false;
   if (aim_mode != prev_aim_mode) {
+    mouse_aim = false;
     if (aim_mode != 0) {  // entering aim mode -> reset gun position
       STF32(base, player + GE_OFF_GUN_X, 0.f);
       STF32(base, player + GE_OFF_GUN_Y, 0.f);
@@ -2891,6 +2897,7 @@ void ge_mouse_camera(uint8_t* base) {
     // v1.2.2) and hold the crosshair + gun centred, so there is nothing for the
     // game to spring back to.
     if (look_mdx != 0.f || mdy != 0.f) {
+      mouse_aim = true;
       float camX = LDF32(base, player + GE_OFF_CAM_X);
       float camY = LDF32(base, player + GE_OFF_CAM_Y);
       camX += (invert_x ? -1.f : 1.f) * (look_mdx / 10.f) * aim_sens;
@@ -2898,10 +2905,18 @@ void ge_mouse_camera(uint8_t* base) {
       STF32(base, player + GE_OFF_CAM_X, camX);
       STF32(base, player + GE_OFF_CAM_Y, camY);
     }
-    STF32(base, player + GE_OFF_CH_X, 0.f);
-    STF32(base, player + GE_OFF_CH_Y, 0.f);
-    STF32(base, player + GE_OFF_GUN_X, 0.f);
-    STF32(base, player + GE_OFF_GUN_Y, 0.f);
+    // The slot-0 pad's right stick (RX +8, RY +10, s16 BE) past the game's
+    // own deadzone hands the aim back to the controller.
+    constexpr uint32_t kPad0 = 0x830C8B9Cu;  // GE_PAD0
+    const int rx = static_cast<int16_t>(LD16(base, kPad0 + 8));
+    const int ry = static_cast<int16_t>(LD16(base, kPad0 + 10));
+    if (std::abs(rx) > 6000 || std::abs(ry) > 6000) mouse_aim = false;
+    if (mouse_aim) {
+      STF32(base, player + GE_OFF_CH_X, 0.f);
+      STF32(base, player + GE_OFF_CH_Y, 0.f);
+      STF32(base, player + GE_OFF_GUN_X, 0.f);
+      STF32(base, player + GE_OFF_GUN_Y, 0.f);
+    }
     start_centering = false;   // nothing to centre -> no spring-back
     disable_sway = false;
   } else {
