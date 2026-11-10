@@ -15,7 +15,8 @@
 //
 // For automated tests (no window):
 //   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,complete]
-//           [--shortcut-folder <dir>]
+//           [--shortcut-folder <dir>] [--saves-folder <dir>]
+//   (--saves-folder: saves and settings in that folder instead of resources\userdata)
 //   Exit code 0 imported, 1 failed, 2 several packages found (pass --package), 3 none found.
 //
 // Any other arguments are passed on to the game.
@@ -39,7 +40,7 @@ namespace {
 
 using namespace ge;
 
-int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstring& extras) {
+int RunUnattended(Paths& p, const SetupOptions& options, const std::wstring& extras, const fs::path& saves_folder) {
   Log(L"Unattended setup");
   std::vector<Source> found;
   std::wstring why;
@@ -57,6 +58,13 @@ int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstrin
   const fs::path saves_from = found[0].kind == SourceKind::PreviousInstall ? found[0].path : FindPreviousInstall(p);
   ImportResult result = Import(p, found[0], saves_from, cancel, nullptr);
   if (!result.ok) return 1;
+  // The saves folder first, so the extras (fullscreen, 100%) are written there.
+  if (!saves_folder.empty()) {
+    std::wstring message;
+    const bool ok = SetUserDataLocation(p, saves_folder, &message);
+    Log(L"Unattended: " + message);
+    if (!ok) return 1;
+  }
   Extras want;
   want.fullscreen = extras.find(L"fullscreen") != std::wstring::npos;
   want.shortcut = extras.find(L"shortcut") != std::wstring::npos;
@@ -74,6 +82,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   bool setup = false, unattended = false, update = false;
   std::wstring extras;
+  fs::path saves_folder;
   SetupOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::wstring arg = argv[i];
@@ -87,6 +96,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       options.package = argv[++i];
     } else if (arg == L"--extras" && i + 1 < argc) {
       extras = argv[++i];
+    } else if (arg == L"--saves-folder" && i + 1 < argc) {
+      saves_folder = argv[++i];
     } else if (arg == L"--shortcut-folder" && i + 1 < argc) {
       options.shortcut_folder = argv[++i];
     } else {
@@ -99,7 +110,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   // itself won't start.
   if (GetAsyncKeyState(VK_SHIFT) & 0x8000) setup = true;
 
-  const Paths p = MakePaths();
+  Paths p = MakePaths();
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
   // What an update cut off half-way (or the old launcher exe it could not
@@ -134,6 +145,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   if (!installed) {
     RecoverInterruptedSwap(p);
     installed = IsInstalled(p, &missing);
+  }
+  if (installed && !setup && options.package.empty() && p.custom_userdata &&
+      GetFileAttributesW(p.userdata.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    // A saves folder chosen in setup that is gone (a drive not connected):
+    // never start the game with empty saves in its place.
+    LogTo(p.logs);
+    Log(L"The saves folder is missing: " + p.userdata.wstring());
+    const std::wstring text = L"GoldenEye 007 can't find your saves and settings folder:\n\n" + p.userdata.wstring() +
+                              L"\n\nConnect the drive it is on and try again, or press OK to open setup "
+                              L"and choose another folder.";
+    if (MessageBoxW(nullptr, text.c_str(), L"GoldenEye 007", MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
+      CoUninitialize();
+      return 1;
+    }
+    setup = true;
   }
   if (installed && !setup && options.package.empty()) {
     if (GetFileAttributesW(p.config.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -171,7 +197,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   LogTo(p.logs);
   options.forced = installed;
   options.reason = installed ? L"--setup" : L"missing " + missing;
-  const int code = unattended ? RunUnattended(p, options, extras) : RunSetupWindow(instance, p, options);
+  const int code = unattended ? RunUnattended(p, options, extras, saves_folder) : RunSetupWindow(instance, p, options);
   if (mutex) {
     ReleaseMutex(mutex);
     CloseHandle(mutex);

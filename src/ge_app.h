@@ -25,6 +25,7 @@
 #include "ge_menu.h"
 #include "ge_postfx.h"
 #include "ge_native_shaders.h"
+#include "ge_paths.h"
 
 // Relaunch the current executable as a fresh process (implemented in
 // ge_hooks.cpp, which owns the Win32 includes). Used by the ONLINE menu's
@@ -82,22 +83,6 @@ void SetNativeMenuCallbacks(std::function<void(bool)> fullscreen, std::function<
                             std::function<void()> restart);
 }
 
-namespace ge {
-// Release layout: the game program lives in <release>\resources\runtime and its
-// data beside that folder (resources\assets, resources\userdata with ge.toml);
-// the launcher in the release root starts it. Dev builds keep everything
-// beside the exe (assets, userdata, ge.toml).
-inline std::filesystem::path DataRoot() {
-  const auto exe = rex::filesystem::GetExecutableFolder();
-  std::string name = exe.filename().string();
-  for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return name == "runtime" ? exe.parent_path() : exe;
-}
-inline std::filesystem::path ConfigPath() {
-  const auto root = DataRoot();
-  return root == rex::filesystem::GetExecutableFolder() ? root / "ge.toml" : root / "userdata" / "ge.toml";
-}
-}  // namespace ge
 
 class GeApp : public rex::ReXApp {
  public:
@@ -132,8 +117,21 @@ class GeApp : public rex::ReXApp {
     }
     // Portable install: saves, caches and settings live in the release folder
     // (resources\userdata), like the PD and Hexic ports, instead of in the
-    // Windows user profile.
-    const auto user_data = data_root / "userdata";
+    // Windows user profile -- or in the folder the player chose in setup.
+    const auto custom = ge::CustomUserDataRoot();
+    std::error_code exists_ec;
+    if (!custom.empty() && !std::filesystem::is_directory(custom, exists_ec)) {
+      // A chosen saves folder that is gone (a drive not connected, say): never
+      // start with empty saves in its place.
+      rex::ShowSimpleMessageBox(
+          rex::SimpleMessageBoxType::Error,
+          "GoldenEye 007 can't find your saves and settings folder:\n\n" +
+              std::string(reinterpret_cast<const char*>(custom.u8string().c_str())) +
+              "\n\nConnect the drive it is on, or open \"GoldenEye 007.exe\" while holding Shift "
+              "to choose another folder.");
+      std::exit(1);
+    }
+    const auto user_data = ge::UserDataRoot();
     paths.user_data_root = user_data;
     paths.cache_root = user_data / "cache";
     paths.config_path = ge::ConfigPath();

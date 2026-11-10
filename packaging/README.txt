@@ -40,7 +40,9 @@ FIRST-TIME SETUP
    tells you if it is the wrong file or an unsupported version; the import
    starts as soon as it is accepted. You can cancel it at any time.
 4. Tick any extras you want (all optional, all off unless ticked):
-     Start in fullscreen, Create desktop shortcut, 100% game completion.
+     Start in fullscreen, Create desktop shortcut, 100% game completion,
+     Keep saves and settings in another folder ("Choose folder" picks it;
+     see PORTABLE DATA).
 5. Click "Play" once it says READY FOR DUTY.
 
 From then on, opening "GoldenEye 007.exe" starts the game straight away.
@@ -139,10 +141,20 @@ Everything stays inside the extracted "GoldenEye 007" folder:
 Paths are relative, so the folder can be moved or copied anywhere (a USB
 drive works too). To back up your progress, copy resources\userdata.
 
+To keep your saves and settings somewhere else (another drive, or a synced
+folder), open setup (see below), tick "Keep saves and settings in another
+folder" and choose a folder. When you press Play, what is in
+resources\userdata is copied there (nothing already there is overwritten,
+and the old copy is left as it was), and resources\userdata-location.txt
+records the folder. Untick it to go back to resources\userdata. Updates
+never change this. If the chosen folder is missing (a drive not connected),
+the game does not start with empty saves: connect the drive, or open setup
+and choose another folder.
+
 SETUP AGAIN, UPDATING AND OLDER RELEASES
 ----------------------------------------
 
-To change your extras or import your package again, open the setup window:
+To change your extras or saves folder, or import your package again, open the setup window:
 hold Shift while opening GoldenEye 007.exe (or its shortcut), or choose
 Help & Options > Other Settings > Run Setup Again in the game. Starting
 GoldenEye 007.exe with --setup works too. Importing again replaces resources\assets only;

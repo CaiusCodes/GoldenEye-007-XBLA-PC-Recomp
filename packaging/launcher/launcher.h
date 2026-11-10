@@ -6,7 +6,8 @@
 //   resources\
 //     runtime\            the game (GoldenEye 007.exe, DLLs, the port's pictures), logs\
 //     assets\             imported once from the player's own Xbox 360 package
-//     userdata\           saves, caches and ge.toml (settings)
+//     userdata\           saves, caches and ge.toml (settings), unless
+//                         userdata-location.txt names another folder
 //
 // Everything is found relative to this exe, so the folder can be moved.
 #pragma once
@@ -31,8 +32,10 @@ struct Paths {
   fs::path runtime;    // resources\runtime
   fs::path game_exe;   // runtime\GoldenEye 007.exe
   fs::path assets;     // resources\assets
-  fs::path userdata;   // resources\userdata
+  fs::path userdata;   // resources\userdata, or the folder the player chose (custom_userdata)
   fs::path config;     // userdata\ge.toml
+  fs::path userdata_pointer;     // resources\userdata-location.txt: the chosen folder, if any
+  bool custom_userdata = false;  // saves and settings live in a folder the player chose
   fs::path logs;       // runtime\logs (the game's own logs go there too)
   fs::path staging;    // resources\.import        (an import in progress)
   fs::path previous;   // resources\.assets-previous (the old copy during the swap)
@@ -102,6 +105,20 @@ struct ImportResult {
 // settings are copied into resources\userdata where none exist yet (may be empty).
 ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_from,
                     const std::atomic<bool>& cancel, const Report& report);
+
+// ---------------------------------------------------- saves and settings --
+// Where saves, settings and caches live: resources\userdata by default, or a
+// folder the player chose in setup, recorded (absolute, UTF-8) in
+// resources\userdata-location.txt, which the game reads too. Updates never
+// touch either. The saves folder named by a resources folder (its pointer
+// file, else its userdata folder); used for previous installs too.
+fs::path UserDataIn(const fs::path& resources);
+// Moves to `folder` (empty: back to resources\userdata): checks it can be
+// written and is not inside the program or game data folders, copies the
+// current saves and settings there (never over files already there; the old
+// copy is left as it was), then writes or removes the pointer file and updates
+// p. *message gets a sentence for the player either way.
+bool SetUserDataLocation(Paths& p, const fs::path& folder, std::wstring* message);
 
 // ------------------------------------------------------------- settings --
 // ge.toml holds one "key = value" per line. Set replaces the key's line or

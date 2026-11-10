@@ -324,7 +324,7 @@ std::wstring MigrateUserData(const Paths& p, const fs::path& from) {
       have_saves = true;
   }
   int copied = 0;
-  const fs::path saves = from / L"userdata";
+  const fs::path saves = UserDataIn(from);  // that install's chosen saves folder, if it had one
   if (!have_saves && DirExists(saves)) {
     for (fs::recursive_directory_iterator it(saves, fs::directory_options::skip_permission_denied, ec), end;
          !ec && it != end; it.increment(ec)) {
@@ -345,7 +345,7 @@ std::wstring MigrateUserData(const Paths& p, const fs::path& from) {
   }
   bool settings = false;
   if (!FileExists(p.config)) {
-    for (const fs::path& old : {from / L"ge.toml", from / L"userdata" / L"ge.toml"}) {
+    for (const fs::path& old : {from / L"ge.toml", saves / L"ge.toml"}) {
       if (FileExists(old) && CopyOne(old, p.config, nullptr, nullptr)) {
         settings = true;
         break;
@@ -368,6 +368,100 @@ std::wstring Stats(int files, int total_files, uint64_t done, uint64_t total) {
 }  // namespace
 
 // ================================================================ paths ==
+namespace {
+// The folder named in <resources>\userdata-location.txt; empty when there is none.
+fs::path ReadUserDataPointer(const fs::path& resources) {
+  HANDLE file = CreateFileW((resources / L"userdata-location.txt").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return {};
+  char buffer[4096] = {};
+  DWORD got = 0;
+  ReadFile(file, buffer, sizeof(buffer) - 1, &got, nullptr);
+  CloseHandle(file);
+  std::string line(buffer, got);
+  if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF) line.erase(0, 3);  // BOM
+  const size_t end = line.find_first_of("\r\n");
+  if (end != std::string::npos) line.resize(end);
+  while (!line.empty() && line.back() == ' ') line.pop_back();
+  return line.empty() ? fs::path() : fs::path(Widen(line));
+}
+
+bool IsInside(const fs::path& path, const fs::path& folder) {
+  std::error_code ec;
+  const std::wstring a = fs::weakly_canonical(path, ec).wstring() + L"\\";
+  const std::wstring b = fs::weakly_canonical(folder, ec).wstring() + L"\\";
+  return a.size() >= b.size() && _wcsnicmp(a.c_str(), b.c_str(), b.size()) == 0;
+}
+}  // namespace
+
+fs::path UserDataIn(const fs::path& resources) {
+  const fs::path custom = ReadUserDataPointer(resources);
+  return custom.empty() ? resources / L"userdata" : custom;
+}
+
+bool SetUserDataLocation(Paths& p, const fs::path& folder, std::wstring* message) {
+  const fs::path target = folder.empty() ? p.resources / L"userdata" : fs::path(folder).make_preferred();
+  if (!folder.empty()) {
+    if (!target.is_absolute()) return *message = L"Choose a full folder path for your saves.", false;
+    if (IsInside(target, p.runtime) || IsInside(target, p.assets) || IsInside(p.resources, target) ||
+        IsInside(target, p.staging) || IsInside(target, p.previous) || IsInside(target, p.resources / L".update"))
+      return *message = L"That folder holds the game itself. Choose a folder of its own for your saves.", false;
+  }
+  std::error_code ec;
+  fs::create_directories(target, ec);
+  const fs::path probe = target / L".ge-write-test";
+  HANDLE file = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+  if (file == INVALID_HANDLE_VALUE)
+    return *message = L"GoldenEye 007 can't write to " + target.wstring() + L". Choose a folder you can save files in.",
+           false;
+  CloseHandle(file);
+  DeleteFileW(probe.c_str());
+
+  // Copy what is there now (not the caches, which rebuild themselves).
+  int copied = 0;
+  if (!SameFile(target, p.userdata) && DirExists(p.userdata)) {
+    for (fs::recursive_directory_iterator it(p.userdata, fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+      const fs::path relative = it->path().lexically_relative(p.userdata);
+      if (!relative.empty() && (_wcsicmp(relative.begin()->c_str(), L"cache") == 0 ||
+                                _wcsicmp(relative.begin()->c_str(), L"native_shaders") == 0)) {
+        if (it->is_directory()) it.disable_recursion_pending();
+        continue;
+      }
+      const fs::path to = target / relative;
+      std::error_code item_ec;
+      if (it->is_directory(item_ec)) {
+        fs::create_directories(to, item_ec);
+      } else if (it->is_regular_file(item_ec) && !FileExists(to)) {
+        fs::create_directories(to.parent_path(), item_ec);
+        if (CopyOne(it->path(), to, nullptr, nullptr)) ++copied;
+      }
+    }
+  }
+  if (folder.empty()) {
+    DeleteFileW(p.userdata_pointer.c_str());
+  } else {
+    const std::string line = Narrow(target.wstring()) + "\r\n";
+    HANDLE out = CreateFileW(p.userdata_pointer.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                             nullptr);
+    DWORD written = 0;
+    const bool ok = out != INVALID_HANDLE_VALUE && WriteFile(out, line.data(), DWORD(line.size()), &written, nullptr) &&
+                    written == line.size();
+    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    if (!ok) return *message = L"Could not record the saves folder in resources (is the folder read-only?).", false;
+  }
+  const fs::path from = p.userdata;
+  p.userdata = target;
+  p.custom_userdata = !folder.empty();
+  p.config = p.userdata / L"ge.toml";
+  Log(L"Saves and settings folder: " + target.wstring() + L" (" + std::to_wstring(copied) + L" files copied from " +
+      from.wstring() + L")");
+  *message = copied ? L"Your saves and settings were copied to " + target.wstring() + L". The old copy in " +
+                          from.wstring() + L" was left as it was."
+                    : L"Saves and settings will be kept in " + target.wstring() + L".";
+  return true;
+}
+
 Paths MakePaths() {
   std::vector<wchar_t> buffer(32768);
   const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
@@ -378,7 +472,9 @@ Paths MakePaths() {
   p.runtime = p.resources / L"runtime";
   p.game_exe = p.runtime / L"GoldenEye 007.exe";
   p.assets = p.resources / L"assets";
-  p.userdata = p.resources / L"userdata";
+  p.userdata_pointer = p.resources / L"userdata-location.txt";
+  p.userdata = UserDataIn(p.resources);
+  p.custom_userdata = !ReadUserDataPointer(p.resources).empty();
   p.config = p.userdata / L"ge.toml";
   p.logs = p.runtime / L"logs";
   p.staging = p.resources / L".import";

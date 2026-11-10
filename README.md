@@ -22,7 +22,7 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 1. Download the latest ZIP and extract the **GoldenEye 007** folder.
 2. Run `GoldenEye 007.exe`.
 3. Select your GoldenEye 007 XBLA package using **Browse Package**, or place it alongside the executable for automatic detection.
-4. Choose your preferred options, including fullscreen, desktop shortcut and optional 100% game completion.
+4. Choose your preferred options, including fullscreen, desktop shortcut, optional 100% game completion and an optional folder of your own for saves and settings.
 5. Click **Play**.
 
 ![Setup window](docs/screenshots/setup.png)
@@ -31,7 +31,7 @@ After setup, simply run `GoldenEye 007.exe` to play. Your original game package 
 
 **To reopen setup:** Hold **Shift** while launching, or select **Help & Options → Other Settings → Run Setup Again**.
 
-The installation is portable, with imported game files, saves and settings stored inside the game folder.
+The installation is portable, with imported game files, saves and settings stored inside the game folder. Saves and settings can be kept in another folder instead (another drive or a synced folder): tick **Keep saves and settings in another folder** in setup.
 
 ### System Requirements
 
