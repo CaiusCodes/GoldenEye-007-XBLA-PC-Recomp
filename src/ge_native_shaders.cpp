@@ -46,7 +46,8 @@ namespace {
 
 // Bumped whenever a translated shader changes: XenosRecomp fixes or patch_hlsl.
 // 2: bool-conditioned exec blocks (cexec bN) honour their condition.
-constexpr int kTranslationVersion = 2;
+// 3: pixel shader inputs interpolated at the centroid under MSAA (centroid_inputs).
+constexpr int kTranslationVersion = 3;
 
 // XenosRecomp's shared definitions, prepended to every translated shader.
 constexpr char kShaderCommon[] =
@@ -93,10 +94,27 @@ void replace_once(std::string& s, const std::string& from, const std::string& to
   if (at != std::string::npos) s.replace(at, from.size(), to);
 }
 
+// Pixel shader inputs interpolated at the centroid, as GoldenEye sets the
+// Xenos up (the classic renderer reads SQ_CONTEXT_MISC / SQ_INTERPOLATOR_CNTL
+// and gets centroids). At the pixel centre, a pixel only partly covered by a
+// thin triangle extrapolated its texture coordinates past the triangle's edge:
+// with MSAA the PP7 slide's highlight band came out as a bright dotted line,
+// and thin edges sparkled elsewhere (issue #17). Without MSAA, centroid =
+// centre.
+void centroid_inputs(std::string& text) {
+  if (text.find("in float4 iPos : SV_Position") == std::string::npos) return;  // vertex shader
+  for (const std::string from : {"\tin float4 iTexCoord", "\tin float4 iColor"}) {
+    const std::string to = "\tin centroid float4 " + from.substr(from.rfind(' ') + 1);
+    for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size()))
+      text.replace(at, from.size(), to);
+  }
+}
+
 // The HLSL the renderer needs, as native/translate_shaders.ps1 makes it: the
 // spec constants and position scale/offset come from the shared constants
 // (c17.y, c18), alpha test is always compiled in (threshold 0 = off).
 std::string patch_hlsl(std::string text, bool spirv) {
+  centroid_inputs(text);
   if (spirv) {
     // XenosRecomp's Vulkan side: constants through buffer addresses in push
     // constants. The same shared fields (c17.y, c18) as below, and the spec
