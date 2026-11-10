@@ -1938,7 +1938,7 @@ void SetPointerVisibleHandler(std::function<void(bool)> handler) {
 // cannot compound. The normal 60 degree view gets the full extra; zoomed views
 // (sniper, watch) blend back to their own value below 30 degrees, so zoom
 // levels are unchanged.
-REXCVAR_DEFINE_DOUBLE(ge_fov_extra, 10.0, "Video",
+REXCVAR_DEFINE_DOUBLE(ge_fov_extra, 0.0, "Video",
                       "Degrees added to the normal field of view (0 = original)")
     .range(0.0, 30.0);
 
@@ -3580,6 +3580,7 @@ REXCVAR_DEFINE_STRING(ge_debug_input_file, "", "Debug",
                       "Test-only: text file of pad presses to play back (empty = off)");
 
 int g_test_aim = 0;  // test pipe: "AIM=n" holds aim (left trigger) for n polls
+int g_test_fire = 0;  // test pipe: "FIRE=n" pulls the right trigger n times (12 polls each)
 
 struct GeScriptPress {
   uint16_t buttons = 0;
@@ -3665,6 +3666,10 @@ void ge_script_read_new_lines() {
         if (word.rfind("POINTER=", 0) == 0) {
           if (std::sscanf(word.c_str() + 8, "%f,%f", &g_test_pointer_x, &g_test_pointer_y) == 2)
             g_test_pointer = true;
+          continue;
+        }
+        if (word.rfind("FIRE=", 0) == 0) {  // test: n trigger pulls, alongside any stick hold
+          g_test_fire = std::atoi(word.c_str() + 5) * 12;
           continue;
         }
         if (word.rfind("AIM=", 0) == 0) {  // test: hold aim (left trigger) for n polls
@@ -5181,6 +5186,10 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (g_test_aim > 0) {
     --g_test_aim;
     base[GE_PAD0 + 2] = 0xFF;
+  }
+  if (g_test_fire > 0) {
+    --g_test_fire;
+    if (g_test_fire % 12 >= 8) base[GE_PAD0 + 3] = 0xFF;
   }
   ge_sniper_aim_tick(base);
   if (REXCVAR_GET(ge_keyboard_enable) && ge_input_active()) {
