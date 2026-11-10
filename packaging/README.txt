@@ -98,7 +98,7 @@ Help & Options on the main menu holds the PC settings:
                      restart the game), upscaling (FSR or off), texture
                      filtering, anti-aliasing (4x by default with the new
                      renderer), post-processing
-                     (colour filter), field of view, FPS counter
+                     (colour filter), FPS counter
   Online Settings    player name and the online server options
   Other Settings     the game's own options, Camera Bob (turn off the head
                      bob while walking) and Run Setup Again

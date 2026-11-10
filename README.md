@@ -51,7 +51,7 @@ The installation is portable, with imported game files, saves and settings store
 - **Render Scale:** 1x, 1.5x, 2x or 3x
 - **AMD FSR** upscaling and texture filtering options
 - **4x Anti-Aliasing** by default with the native renderer
-- **Adjustable Field of View**, color filters and Camera Bob toggle
+- Color filters and Camera Bob toggle
 - **Classic and Enhanced Graphics:** Switch instantly using F or RB
 
 The native renderer PLUME significantly reduces CPU and GPU overhead compared with the previous renderer, making the game more accessible on older laptops and integrated graphics.

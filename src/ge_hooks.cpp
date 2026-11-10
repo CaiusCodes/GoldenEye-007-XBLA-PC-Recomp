@@ -1943,6 +1943,14 @@ REXCVAR_DEFINE_DOUBLE(ge_fov_extra, 0.0, "Video",
     .range(0.0, 30.0);
 
 void ge_fov_set(PPCRegister& f2) {
+  // Off (#21): this widens only the fov the game keeps for its crosshair-to-
+  // shot and culling maths (player+4444), not the one the picture is drawn with
+  // (the viewport's own, passed to the projection in sub_8210DF98), so the view
+  // never widened and every off-centre shot landed outside the crosshair. A
+  // working FOV must widen both; until then the game keeps its own view, and a
+  // value saved in ge.toml does nothing.
+  constexpr bool kFovExtraEnabled = false;
+  if (!kFovExtraEnabled) return;
   const double extra = REXCVAR_GET(ge_fov_extra);
   if (extra <= 0.0) return;
   const double fov = f2.f64;
