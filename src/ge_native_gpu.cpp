@@ -2345,10 +2345,12 @@ struct PreparedTexture {
 // DXT1/3/5 textures go to the GPU compressed (BC1/2/3), with the game's own mip
 // chain: level 0 at the base address, levels 1.. one after another from the mip
 // address, each padded to 32x32-block tiles and 4 KB. From the first level
-// with a side of 16 texels or less they're packed together on the 360 and
-// aren't taken (the host chain stops before them; dumps showed those levels
-// garbled when only the longer side was checked). Power-of-two sizes with the
-// plain swizzle only; returns false to leave the texture to the RGBA path.
+// with a side of 16 texels or less they're packed together into one tile (the
+// mip tail), each at its own offset, as the classic renderer reads them. They
+// used to be left out, so small textures had no mips at all: the PP7's 64x32
+// texture sampled only its sharp top level on the slide's edge-on bevel and
+// drew a bright dotted line (issue #17). Power-of-two sizes with the plain
+// swizzle only; returns false to leave the texture to the RGBA path.
 bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture& p) {
   constexpr uint32_t swizzle_identity = 0x688;
   const uint32_t fmt = f[1] & 0x3F, endian = (f[1] >> 6) & 3;
@@ -2363,15 +2365,36 @@ bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture&
   p.format = fmt == 18 ? RenderFormat::BC1_UNORM : fmt == 19 ? RenderFormat::BC2_UNORM : RenderFormat::BC3_UNORM;
   p.width = width; p.height = height; p.block_bytes = bpb; p.block = 4;
   const uint32_t mip_phys = f[5] & 0xFFFFF000u, guest_last = (f[4] >> 6) & 0xF;
+  const auto log2_ceil = [](uint32_t v) { uint32_t l = 0; while ((1u << l) < v) ++l; return l; };
+  // The packed mip tail: from the first level whose shorter side is 16 texels or
+  // less, the remaining levels share one 32x32-block tile at the address that
+  // level would have, each at its own offset (the SDK's GetPackedMipOffset).
+  const bool packed_mips = (f[5] >> 11) & 1;
+  const uint32_t min_log = std::min(log2_ceil(width), log2_ceil(height));
+  const uint32_t packed_level = packed_mips ? (min_log > 4 ? min_log - 4 : 0) : 32;
   uint32_t levels = 1;
   if (tiled && mip_phys)
-    while (levels <= guest_last && std::min(width >> levels, height >> levels) > 16) ++levels;
+    while (levels <= guest_last && std::max(width >> levels, height >> levels) >= 1) ++levels;
   const uint32_t mip_addr = levels > 1 ? (mip_phys >= 0xE0000000u ? gpu_view(mip_phys) : cpu_view_of_physical(mip_phys & 0x1FFFFFFFu, 4096))
                                        : 0;
   if (levels > 1 && !mip_addr) levels = 1;
+  // Block offset of level l inside the packed tail.
+  const auto packed_offset = [&](uint32_t l, uint32_t& bx, uint32_t& by) {
+    const uint32_t lw = log2_ceil(width), lh = log2_ceil(height);
+    const uint32_t base = min_log > 4 ? min_log - 4 : 0, pm = l - base;
+    uint32_t x = 0, y = 0;
+    if (pm < 3) {
+      if (lw > lh) y = 16 >> pm; else x = 16 >> pm;
+    } else {
+      if (lw > lh) x = (1u << (lw - base)) >> (pm - 2); else y = (1u << (lh - base)) >> (pm - 2);
+    }
+    bx = x / 4;
+    by = y / 4;
+  };
   size_t total = 0;
   for (uint32_t l = 0; l < levels; ++l) {
-    const uint32_t w = width >> l, h = height >> l, bw = std::max(1u, w / 4), bh = std::max(1u, h / 4);
+    const uint32_t w = std::max(1u, width >> l), h = std::max(1u, height >> l), bw = std::max(1u, w / 4),
+                   bh = std::max(1u, h / 4);
     const uint32_t row_pitch = (bw * bpb + 255) & ~255u;
     p.levels.push_back({w, h, bh, row_pitch, total});
     total += size_t(row_pitch) * bh;
@@ -2381,10 +2404,14 @@ bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture&
   for (uint32_t l = 0; l < levels; ++l) {
     const PreparedTexture::Level& lv = p.levels[l];
     const uint32_t bw = std::max(1u, lv.w / 4), bh = lv.rows;
-    const uint32_t pitch_blocks = l == 0 ? std::max(pitch / 4, bw) : bw;
+    const bool in_tail = l >= 1 && l >= packed_level;
+    // A level in the packed tail is addressed within the tail level's tiles.
+    const uint32_t tail = std::max(packed_level, 1u);
+    uint32_t pitch_blocks = l == 0 ? std::max(pitch / 4, bw) : in_tail ? std::max(1u, (width >> tail) / 4) : bw;
     if (l == 1) level_addr = mip_addr;
     uint32_t ox = 0, oy = 0;
     if (l == 0) packed_base_offset(f, width, height, 4, ox, oy);
+    else if (in_tail) packed_offset(l, ox, oy);
     if (!untile_blocks_seh(level_addr, endian, tiled, bw, bh, pitch_blocks, bpb, p.data.data() + lv.offset, lv.row_pitch,
                            ox, oy)) {
       if (l == 0) return true;  // handled, failed
@@ -2397,7 +2424,7 @@ bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture&
                              lv.w * 4, ox, oy))
         dump_texture(tex + l * 0x10000000u, fmt, lv.w, lv.h, rgba.data(), lv.w * 4);
     }
-    if (l >= 1) {  // next level: this one's 32x32-block tiles, 4 KB aligned
+    if (l >= 1 && !in_tail) {  // next level: this one's 32x32-block tiles, 4 KB aligned (the tail stays put)
       const uint64_t size = uint64_t((bw + 31) & ~31u) * ((bh + 31) & ~31u) * bpb;
       level_addr += uint32_t((size + 4095) & ~4095ull);
     }
@@ -2782,13 +2809,17 @@ bool texture_pending(uint32_t tex) {
 uint32_t sampler_slot(uint32_t dev, uint32_t sampler, uint32_t tex) {
   if (!tex) return 0;
   const uint32_t fetch = dev + 1152 + sampler * 24;
-  const uint32_t d0 = g32(fetch), d3 = g32(fetch + 12), d4 = g32(fetch + 16);
+  const uint32_t d0 = g32(fetch), d3 = g32(fetch + 12), d4 = g32(fetch + 16), d5 = g32(fetch + 20);
   const uint32_t clamp_x = (d0 >> 10) & 7, clamp_y = (d0 >> 13) & 7, mag = (d3 >> 19) & 3, min = (d3 >> 21) & 3;
   const uint32_t mip = (d3 >> 23) & 3, mip_min = (d4 >> 2) & 0xF, mip_max = std::max((d4 >> 6) & 0xF, mip_min);
   const int32_t bias = int32_t(d4 << 10) >> 22;  // bits 12-21, sign-extended
   const int32_t override_aniso = ge::g_native_aniso.load(std::memory_order_relaxed);
   uint32_t aniso = (d3 >> 25) & 7;
-  if (override_aniso > -1 && override_aniso < 6 && mip != 2 && mag == 1 && min == 1 && mip_max > 0) aniso = uint32_t(override_aniso);
+  // As the classic renderer: the Texture Filtering setting applies only to a
+  // texture that really has mips (a mip address; without one the fetch
+  // constant's mip range is ignored and the game's own anisotropy stays).
+  const bool has_mips = (d5 >> 12) != 0 && mip_max > mip_min;
+  if (override_aniso > -1 && override_aniso < 6 && mip != 2 && mag == 1 && min == 1 && has_mips) aniso = uint32_t(override_aniso);
   aniso = std::min<uint32_t>(aniso, 5);
   const uint64_t key = uint64_t(clamp_x) | clamp_y << 3 | mag << 6 | min << 8 | mip << 10 | aniso << 12 | mip_min << 15 |
                        mip_max << 19 | uint64_t(uint32_t(bias) & 0x3FF) << 23;
@@ -3151,6 +3182,11 @@ void set_common_state(uint32_t dev) {
   NTRACE("  bools {:08X} alpha ref {} threshold {} sampler0 slot {} fetch d0 {:08X} d3 {:08X}", sh[64], st.alpha_ref,
          threshold, sh[48], g32(dev + 1152), g32(dev + 1152 + 12));
   if (tracing()) {
+    std::string fs;
+    for (uint32_t t = 0; t < 4; ++t)
+      fs += fmt::format(" s{} d0 {:08X} d3 {:08X} d4 {:08X}", t, g32(dev + 1152 + t * 24), g32(dev + 1152 + t * 24 + 12),
+                        g32(dev + 1152 + t * 24 + 16));
+    NTRACE("  fetch{}", fs);
     const float* c = reinterpret_cast<const float*>(g.upload_ptr + vs);
     NTRACE("  vs c0-3 [{} {} {} {}] [{} {} {} {}] [{} {} {} {}] [{} {} {} {}]", c[0], c[1], c[2], c[3], c[4], c[5], c[6],
            c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
@@ -3357,8 +3393,11 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
       break;
     }
     case 13:  // quad list
+      // Split along the 1-3 diagonal, as the classic renderer does (its quad
+      // geometry shader emits the strip 0, 1, 3, 2), so a quad that isn't flat
+      // or evenly lit shades the same in both.
       for (size_t i = 0; i + 3 < idx.size(); i += 4)
-        list.insert(list.end(), {idx[i], idx[i + 1], idx[i + 2], idx[i], idx[i + 2], idx[i + 3]});
+        list.insert(list.end(), {idx[i], idx[i + 1], idx[i + 3], idx[i + 1], idx[i + 2], idx[i + 3]});
       break;
     case 1: topo = RenderPrimitiveTopology::POINT_LIST; list = idx; break;
     case 2: topo = RenderPrimitiveTopology::LINE_LIST; list = idx; break;
