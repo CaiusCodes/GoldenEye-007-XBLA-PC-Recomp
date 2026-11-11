@@ -1666,6 +1666,8 @@ bool ensure_device() {
   // device+10940, has msaa_samples = 2): the scene and its depth match, and
   // resolves / present average the samples.
   g.msaa.sampleCount = pick_msaa();
+  REXKRNL_INFO("GENATIVE anti-aliasing: {}x MSAA (gpu_native_msaa {})", uint32_t(g.msaa.sampleCount),
+               REXCVAR_GET(gpu_native_msaa));
   create_scene_targets();
 
   // Slot 0 of the texture heap: 1x1 white, sampled by anything not yet supported.
