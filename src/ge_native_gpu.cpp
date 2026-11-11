@@ -132,6 +132,11 @@ REXCVAR_DEFINE_INT32(gpu_native_profile_frame, 0, "GPU",
                      "Native renderer test: GPU-time every draw, clear and resolve of this frame and log the costliest");
 REXCVAR_DEFINE_DOUBLE(gpu_native_long_frame_ms, 25.0, "GPU",
                       "Native renderer test: with gpu_native_frame_stats, log frames longer than this");
+// Measured against the classic renderer (Dam, same frame and settings): the
+// native renderer's textures came out ~0.5 mip level sharper (7% more fine
+// detail, a more jagged PP7 highlight); +0.5 matches classic's detail.
+REXCVAR_DEFINE_DOUBLE(gpu_native_lod_bias, 0.5, "GPU",
+                      "Native renderer: added to every texture's mip LOD bias (0.5 = classic's sharpness; 0 = sharper)");
 REXCVAR_DEFINE_STRING(gpu_native_fxaa, "none", "GPU",
                       "Native renderer: FXAA on top of the MSAA, as the classic renderer's swap_post_effect: none, "
                       "fxaa or fxaa_extreme (the Video page's FXAA row)");
@@ -2894,7 +2899,7 @@ uint32_t sampler_slot(uint32_t dev, uint32_t sampler, uint32_t tex) {
     sd.anisotropyEnabled = true;
     sd.maxAnisotropy = 1u << (aniso - 1);
   }
-  sd.mipLODBias = float(bias) / 32.0f;
+  sd.mipLODBias = float(bias) / 32.0f + float(REXCVAR_GET(gpu_native_lod_bias));
   sd.minLOD = float(mip_min);
   sd.maxLOD = mip == 2 ? float(mip_min) : float(mip_max);  // base map: no mips
   sd.addressU = addr(clamp_x);
