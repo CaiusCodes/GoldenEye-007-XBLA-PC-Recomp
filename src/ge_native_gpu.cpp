@@ -2090,7 +2090,7 @@ void decode_element(const Element& el, uint32_t addr, uint32_t endian, uint8_t* 
     if (sign && ((raw >> (bits - 1)) & 1)) v -= int64_t(1) << bits;
     u[c] = uint32_t(v);
     float x = float(v);
-    if (!integer) x = sign ? std::max(x / float((1 << (bits - 1)) - 1), -1.0f) : x / float((int64_t(1) << bits) - 1);
+    if (!integer) x =sign ? std::max(x / float((1 << (bits - 1)) - 1), -1.0f) : x / float((int64_t(1) << bits) - 1);
     f[c] = x * scale;
   };
   switch (fmt) {
@@ -3750,10 +3750,11 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
     std::string tex;
     for (uint32_t t = 0; t < 8; ++t)
       if (g_textures[t]) tex += fmt::format(" s{}={:08X}->{} sign {:02X} fmt {}", t, g_textures[t], texture_slot(g_textures[t]), (g32(dev + 1152 + t * 24) >> 2) & 0xFF, g32(dev + 1152 + t * 24 + 4) & 0x3F);
-    NTRACE("draw#{} prim {} n {} verts {} vs {:016X} ps {:016X} z {}{} f{} cull {} blend {} {}/{}/{} mask {:X} at {} {}{}",
+    NTRACE("draw#{} prim {} n {} verts {} vs {:016X} ps {:016X} z {}{} f{} cull {} blend {} {}/{}/{} mask {:X} at {} {}{} "
+           "| rt {:08X} depth {:08X} {}",
            g.draws, prim, count, vcount, g.shaders[vs_obj].hash, g.shaders[g32(dev + kDevPixelShader)].hash,
            st.z_enable, st.z_write ? "w" : "", st.z_func, st.cull, st.blend, st.src, st.dst, st.op, st.write_mask,
-           st.alpha_test, st.alpha_func, tex);
+           st.alpha_test, st.alpha_func, tex, g.guest_rt, g.guest_depth, g.bound_scene ? "scene" : "single-sample");
     float vp[6];
     for (int i = 0; i < 6; ++i) { const uint32_t u = g32(dev + kDevViewport + i * 4); std::memcpy(&vp[i], &u, 4); }
     const float* p0 = reinterpret_cast<const float*>(g.upload_ptr + voff);
