@@ -176,10 +176,13 @@ if(WIN32)
     target_link_libraries(ge_vk_out PRIVATE rex::runtime)  # the SDK's headers and definitions
     # renderdoc_app.h (included by the SDK's Vulkan headers): the installed SDK's
     # include/renderdoc, or the SDK source tree's thirdparty/renderdoc.
+    # The game uses it too: a test pipe word captures one frame when RenderDoc is attached.
     if(rexglue_DIR AND EXISTS "${rexglue_DIR}/../../../include/renderdoc/renderdoc_app.h")
         target_include_directories(ge_vk_out SYSTEM PRIVATE "${rexglue_DIR}/../../../include/renderdoc")
+        target_include_directories(ge SYSTEM PRIVATE "${rexglue_DIR}/../../../include/renderdoc")
     elseif(REXSDK_DIR AND EXISTS "${REXSDK_DIR}/thirdparty/renderdoc/renderdoc_app.h")
         target_include_directories(ge_vk_out SYSTEM PRIVATE "${REXSDK_DIR}/thirdparty/renderdoc")
+        target_include_directories(ge SYSTEM PRIVATE "${REXSDK_DIR}/thirdparty/renderdoc")
     endif()
     target_link_libraries(ge PRIVATE ge_vk_out)
 endif()

@@ -86,6 +86,13 @@ int NativeAnisotropy() { return g_native_aniso.load(std::memory_order_relaxed); 
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+#if __has_include("renderdoc_app.h")  // test frame captures (renderdoc_tick)
+#include "renderdoc_app.h"
+#define GE_HAS_RENDERDOC 1
+#else
+#define GE_HAS_RENDERDOC 0
+#endif
+
 REXCVAR_DEFINE_BOOL(gpu_native, true, "GPU",
                     "Draw with the native renderer (false: the classic Xenos renderer of 0.9.6c and before)");
 REXCVAR_DECLARE(bool, gpu_native_translate);  // ge_native_shaders.cpp
@@ -135,6 +142,8 @@ REXCVAR_DEFINE_DOUBLE(gpu_native_long_frame_ms, 25.0, "GPU",
 // Measured against the classic renderer (Dam, same frame and settings): the
 // native renderer's textures came out ~0.5 mip level sharper (7% more fine
 // detail, a more jagged PP7 highlight); +0.5 matches classic's detail.
+REXCVAR_DEFINE_BOOL(gpu_native_rdc_capture, false, "GPU",
+                    "Test: capture the next frame with RenderDoc when it is attached");
 REXCVAR_DEFINE_DOUBLE(gpu_native_lod_bias, 0.5, "GPU",
                       "Native renderer: added to every texture's mip LOD bias (0.5 = classic's sharpness; 0 = sharper)");
 REXCVAR_DEFINE_STRING(gpu_native_fxaa, "none", "GPU",
@@ -204,6 +213,10 @@ constexpr uint32_t kDevVertexDecl = 11812;
 constexpr uint32_t kDevPixelShader = 12684;
 constexpr uint32_t kDevVertexShader = 12688;
 constexpr uint32_t kDevViewport = 12640;    // X, Y, W, H, MinZ, MaxZ (floats)
+// The device's register shadows are the GPU packets back to back: values
+// 0x2100-0x2114 at 10444, program 0x2180-0x2184, control 0x2200-0x220B at
+// 10548, tessellator 0x2280-0x2294, misc from 0x2300 at 10680.
+constexpr uint32_t kDevVtxCntl = 10688;     // PA_SU_VTX_CNTL (0x2302): bit 0 = pixel centre
 
 // --- native device ----------------------------------------------------------
 
@@ -2406,8 +2419,12 @@ struct PreparedTexture {
 // mip tail), each at its own offset, as the classic renderer reads them. They
 // used to be left out, so small textures had no mips at all: the PP7's 64x32
 // texture sampled only its sharp top level on the slide's edge-on bevel and
-// drew a bright dotted line (issue #17). Power-of-two sizes with the plain
-// swizzle only; returns false to leave the texture to the RGBA path.
+// drew a bright dotted line (issue #17). Sizes that aren't powers of two (the
+// PP7's 24x64 and 64x24 parts) store their mips as levels of the size rounded
+// up to powers of two, as the SDK's GetGuestTextureLayout reads them; they used
+// to go to the RGBA path, whose box-filtered mips differ from the game's and
+// broke the slide's thin side line into dashes. The plain swizzle and a base
+// level of whole blocks only; returns false to leave the texture to the RGBA path.
 bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture& p) {
   constexpr uint32_t swizzle_identity = 0x688;
   const uint32_t fmt = f[1] & 0x3F, endian = (f[1] >> 6) & 3;
@@ -2416,13 +2433,17 @@ bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture&
   const uint32_t pitch = ((f[0] >> 22) & 0x1FF) * 32, swizzle = (f[3] >> 1) & 0xFFF;
   if ((fmt != 18 && fmt != 19 && fmt != 20) || swizzle != swizzle_identity || !REXCVAR_GET(gpu_native_bc_textures))
     return false;
+  if (width % 4 || height % 4) return false;  // the host's BCn base level is whole blocks
   const bool pow2 = (width & (width - 1)) == 0 && (height & (height - 1)) == 0;
-  if (!pow2 || width < 4 || height < 4) return false;
+  if (!pow2 && !tiled) return false;  // (linear mips: the RGBA path's rebuilt chain, as before)
   const uint32_t bpb = fmt == 18 ? 8 : 16;
   p.format = fmt == 18 ? RenderFormat::BC1_UNORM : fmt == 19 ? RenderFormat::BC2_UNORM : RenderFormat::BC3_UNORM;
   p.width = width; p.height = height; p.block_bytes = bpb; p.block = 4;
   const uint32_t mip_phys = f[5] & 0xFFFFF000u, guest_last = (f[4] >> 6) & 0xF;
   const auto log2_ceil = [](uint32_t v) { uint32_t l = 0; while ((1u << l) < v) ++l; return l; };
+  const auto blocks = [](uint32_t texels) { return std::max(1u, (texels + 3) / 4); };
+  // Mips are stored (pitch, tiles, size) as levels of the base size rounded up to powers of two.
+  const uint32_t pow2_w = 1u << log2_ceil(width), pow2_h = 1u << log2_ceil(height);
   // The packed mip tail: from the first level whose shorter side is 16 texels or
   // less, the remaining levels share one 32x32-block tile at the address that
   // level would have, each at its own offset (the SDK's GetPackedMipOffset).
@@ -2450,8 +2471,7 @@ bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture&
   };
   size_t total = 0;
   for (uint32_t l = 0; l < levels; ++l) {
-    const uint32_t w = std::max(1u, width >> l), h = std::max(1u, height >> l), bw = std::max(1u, w / 4),
-                   bh = std::max(1u, h / 4);
+    const uint32_t w = std::max(1u, width >> l), h = std::max(1u, height >> l), bw = blocks(w), bh = blocks(h);
     const uint32_t row_pitch = (bw * bpb + 255) & ~255u;
     p.levels.push_back({w, h, bh, row_pitch, total});
     total += size_t(row_pitch) * bh;
@@ -2460,11 +2480,12 @@ bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture&
   uint32_t level_addr = addr;
   for (uint32_t l = 0; l < levels; ++l) {
     const PreparedTexture::Level& lv = p.levels[l];
-    const uint32_t bw = std::max(1u, lv.w / 4), bh = lv.rows;
+    const uint32_t bw = blocks(lv.w), bh = lv.rows;
+    const uint32_t stored_bw = blocks(pow2_w >> l), stored_bh = blocks(pow2_h >> l);
     const bool in_tail = l >= 1 && l >= packed_level;
     // A level in the packed tail is addressed within the tail level's tiles.
     const uint32_t tail = std::max(packed_level, 1u);
-    uint32_t pitch_blocks = l == 0 ? std::max(pitch / 4, bw) : in_tail ? std::max(1u, (width >> tail) / 4) : bw;
+    uint32_t pitch_blocks = l == 0 ? std::max(pitch / 4, bw) : in_tail ? blocks(pow2_w >> tail) : stored_bw;
     if (l == 1) level_addr = mip_addr;
     uint32_t ox = 0, oy = 0;
     if (l == 0) packed_base_offset(f, width, height, 4, ox, oy);
@@ -2482,7 +2503,7 @@ bool prepare_bc(const uint32_t* f, uint32_t addr, uint32_t tex, PreparedTexture&
         dump_texture(tex + l * 0x10000000u, fmt, lv.w, lv.h, rgba.data(), lv.w * 4);
     }
     if (l >= 1 && !in_tail) {  // next level: this one's 32x32-block tiles, 4 KB aligned (the tail stays put)
-      const uint64_t size = uint64_t((bw + 31) & ~31u) * ((bh + 31) & ~31u) * bpb;
+      const uint64_t size = uint64_t((stored_bw + 31) & ~31u) * ((stored_bh + 31) & ~31u) * bpb;
       level_addr += uint32_t((size + 4095) & ~4095ull);
     }
   }
@@ -3355,11 +3376,15 @@ void set_common_state(uint32_t dev) {
   // VIEWPORTENABLE setter: 0x43F on, 0x400 off). With the viewport transform off
   // the shader outputs window coordinates, mapped here to NDC for the target.
   const bool vte = (g32(dev + 10572) & 0x3F) != 0;
-  // The 360 puts pixel centres on whole coordinates (D3D9), D3D12 half a pixel
-  // on: everything moves right and down by half a pixel, as XenosRecomp's
-  // g_HalfPixelOffset intends (without it text lands on texel centres and
-  // comes out thinner than on Xenos).
-  const bool half = REXCVAR_GET(gpu_native_half_pixel);
+  // With PA_SU_VTX_CNTL's pixel centre at 0 (D3D9) the 360 puts pixel centres
+  // on whole coordinates, D3D12 half a pixel on: those draws move right and
+  // down by half a pixel, as XenosRecomp's g_HalfPixelOffset intends (without
+  // it text lands on texel centres and comes out thinner than on Xenos).
+  // Draws with the centre at 0.5 already match D3D12 and stay put, as on the
+  // classic renderer: offsetting them made the copy of the resolved frame
+  // into the HUD pass point-sample exactly between texels, dropping and
+  // doubling pixel columns and rows across the whole picture.
+  const bool half = REXCVAR_GET(gpu_native_half_pixel) && (g32(dev + kDevVtxCntl) & 1) == 0;
   float pos[4] = {1.0f, 1.0f, half ? 1.0f / kGuestW : 0.0f, half ? -1.0f / kGuestH : 0.0f};
   if (!vte) { pos[0] = 2.0f / kGuestW; pos[1] = -2.0f / kGuestH; pos[2] = -1.0f + pos[2]; pos[3] = 1.0f + pos[3]; }
   std::memcpy(&sh[72], pos, sizeof(pos));
@@ -3760,6 +3785,12 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
     const float* p0 = reinterpret_cast<const float*>(g.upload_ptr + voff);
     NTRACE("  vte {:X} viewport {} {} {} {} {} {} pos0 {} {} {} {} (el0 usage {} fmt {})", g32(dev + 10572), vp[0], vp[1],
            vp[2], vp[3], vp[4], vp[5], p0[0], p0[1], p0[2], p0[3], els[0].usage, els[0].type & 0x3F);
+    float vps[2], gb[4];
+    for (int i = 0; i < 2; ++i) { const uint32_t u = g32(dev + 10504 + i * 8); std::memcpy(&vps[i], &u, 4); }
+    for (int i = 0; i < 4; ++i) { const uint32_t u = g32(dev + kDevVtxCntl + 4 + i * 4); std::memcpy(&gb[i], &u, 4); }
+    NTRACE("  vport scale {} {} | line {:X} aa {:X} vtx_cntl {:X} gb {} {} {} {} | copy {:X} {:08X}", vps[0], vps[1],
+           g32(dev + kDevVtxCntl - 8), g32(dev + kDevVtxCntl - 4), g32(dev + kDevVtxCntl), gb[0], gb[1], gb[2], gb[3],
+           g32(dev + kDevVtxCntl + 0x16 * 4), g32(dev + kDevVtxCntl + 0x17 * 4));
     std::string e;
     for (size_t i = 0; i < els.size() * std::min<size_t>(vcount, 4); ++i) {
       const float* v = p0 + i * 4;
@@ -4604,6 +4635,48 @@ void frame_stats(double interval_ms, double swap_ms) {
   swap_total = swap_max = 0;
 }
 
+// Test: with RenderDoc attached (renderdoccmd capture), CVAR=gpu_native_rdc_capture=true
+// on the pipe captures the next whole frame: the native renderer's device Swap to
+// Swap in native mode, the next presented frame (the Xenos path's) otherwise.
+#if GE_HAS_RENDERDOC
+RENDERDOC_API_1_0_1* renderdoc_api() {
+  static RENDERDOC_API_1_0_1* api = []() -> RENDERDOC_API_1_0_1* {
+    HMODULE m = GetModuleHandleA("renderdoc.dll");
+    if (!m) return nullptr;
+    auto get = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(m, "RENDERDOC_GetAPI"));
+    RENDERDOC_API_1_0_1* a = nullptr;
+    if (!get || get(eRENDERDOC_API_Version_1_0_1, reinterpret_cast<void**>(&a)) != 1) return nullptr;
+    return a;
+  }();
+  return api;
+}
+
+void renderdoc_tick() {
+  static bool capturing = false;
+  static void* device = nullptr;
+  RENDERDOC_API_1_0_1* api = renderdoc_api();
+  if (!api) return;
+  if (capturing) {
+    const uint32_t ok = api->EndFrameCapture(device, nullptr);
+    capturing = false;
+    REXKRNL_INFO("GENATIVE RenderDoc capture {}", ok ? "written" : "FAILED");
+  }
+  if (!REXCVAR_GET(gpu_native_rdc_capture)) return;
+  rex::cvar::SetFlagByName("gpu_native_rdc_capture", "false");
+  api->MaskOverlayBits(0, 0);  // keep RenderDoc's overlay out of test screenshots
+  device = NATIVE_ON() && g.device && !g_vulkan ? static_cast<void*>(static_cast<D3D12Device*>(g.device.get())->d3d) : nullptr;
+  if (device) {
+    api->StartFrameCapture(device, nullptr);
+    capturing = true;
+  } else {
+    api->TriggerCapture();  // the Xenos path draws on its own thread: next present to present
+  }
+  REXKRNL_INFO("GENATIVE RenderDoc capture started ({})", device ? "native device, swap to swap" : "next presented frame");
+}
+#else
+void renderdoc_tick() {}
+#endif
+
 // The game's per-frame copy of its graphics setting into the render flag (see
 // ModeWarm): inverted while a hidden warm-up frame is drawn.
 extern "C" REX_FUNC(sub_82099708) {
@@ -4642,6 +4715,7 @@ extern "C" REX_FUNC(sub_821996F8) {
       REXKRNL_INFO("GENATIVE stage {}: drawing {} hidden frames in the other graphics mode", stage, kWarmFrames);
     }
   }
+  renderdoc_tick();
   QueryPerformanceCounter(&t1);
   const auto ms = [&](int64_t ticks) { return double(ticks) * 1000.0 / double(freq.QuadPart); };
   frame_stats(last.QuadPart ? ms(t0.QuadPart - last.QuadPart) : 0.0, ms(t1.QuadPart - t0.QuadPart));
