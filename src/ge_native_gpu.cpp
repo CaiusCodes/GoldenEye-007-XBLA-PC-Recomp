@@ -132,6 +132,9 @@ REXCVAR_DEFINE_INT32(gpu_native_profile_frame, 0, "GPU",
                      "Native renderer test: GPU-time every draw, clear and resolve of this frame and log the costliest");
 REXCVAR_DEFINE_DOUBLE(gpu_native_long_frame_ms, 25.0, "GPU",
                       "Native renderer test: with gpu_native_frame_stats, log frames longer than this");
+REXCVAR_DEFINE_BOOL(gpu_native_warm_modes, true, "GPU",
+                    "Native renderer: draw two hidden frames in the other graphics mode as a level starts, so the "
+                    "first switch (F / RB) doesn't stutter");
 REXCVAR_DEFINE_BOOL(gpu_native_warm_shaders, true, "GPU",
                     "Native renderer: translate a level's shaders while it loads, not at their first draw");
 REXCVAR_DEFINE_BOOL(gpu_native_stage_textures, true, "GPU",
@@ -3862,8 +3865,26 @@ void note_present() {
   g.last_counter = counter;
 }
 
+// Hidden warm-up of the other graphics mode. The first switch (F / RB) in a
+// level drew the other mode's models and textures for the first time, all in
+// one frame (a 30-65 ms hitch). Once per stage, when it first draws a real
+// scene, two frames are drawn in the other mode and not shown, so that work is
+// done while the level starts. The game copies its graphics setting into the
+// render flag every frame (sub_82099708, from the main loop); those two frames
+// the copy is inverted afterwards.
+struct ModeWarm {
+  uint32_t stage = 0;
+  bool done = true;
+  int left = 0;  // frames still to draw in the other mode (and hide)
+} g_mode_warm;
+constexpr uint32_t kRenderModeFlag = 0x82F0DF11u;  // 1 = classic graphics
+constexpr uint32_t kFrontEndStage = 90u;
+constexpr int kWarmFrames = 2;
+constexpr uint32_t kWarmMinDraws = 100;  // a level scene, not a loading picture
+
 void present_frame() {
   if (!ensure_device()) return;
+  const bool hide = g_mode_warm.left > 0;
   if (REXCVAR_GET(gpu_native_trace_frame) == -1)  // the test pipe's TRACE: the next frame
     rex::cvar::SetFlagByName("gpu_native_trace_frame", std::to_string(g.frames + 2));
   if (const int32_t pf = REXCVAR_GET(gpu_native_profile_frame); pf < 0)  // test: -n = the frame n from now
@@ -3883,7 +3904,7 @@ void present_frame() {
   if (g.out.vk) {
     // The presenter's device reads the shared frame once its GPU work is done:
     // a worker waits for that (present_to_presenter_vk), not the game thread.
-    vk_frame = copy_to_presenter_vk();
+    vk_frame = hide ? UINT32_MAX : copy_to_presenter_vk();
     have_image = vk_frame != UINT32_MAX;
     if (g.timestamps) g.cmd->writeTimestamp(g.timestamps.get(), g.slot * 2 + 1);
     g.cmd->end();
@@ -3893,7 +3914,7 @@ void present_frame() {
     p3 = now_ms();
   } else if (g.out.presenter) {
     const uint32_t k = g.out.next;
-    have_image = copy_to_presenter_texture(k);
+    have_image = !hide && copy_to_presenter_texture(k);
     if (g.timestamps) g.cmd->writeTimestamp(g.timestamps.get(), g.slot * 2 + 1);
     g.cmd->end();
     g.recording = false;
@@ -4536,6 +4557,13 @@ void frame_stats(double interval_ms, double swap_ms) {
   swap_total = swap_max = 0;
 }
 
+// The game's per-frame copy of its graphics setting into the render flag (see
+// ModeWarm): inverted while a hidden warm-up frame is drawn.
+extern "C" REX_FUNC(sub_82099708) {
+  __imp__sub_82099708(ctx, base);
+  if (NATIVE_ON() && g_mode_warm.left > 0) base[kRenderModeFlag] ^= 1;
+}
+
 extern "C" REX_FUNC(sub_821996F8) {
   static LARGE_INTEGER freq{}, last{};
   if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
@@ -4550,7 +4578,23 @@ extern "C" REX_FUNC(sub_821996F8) {
   if (NATIVE_ON() && ctx.r3.u32) gmem()[ctx.r3.u32 + 10941] |= 0x02;
   if (NATIVE_ON()) g.front_buffer = ctx.r4.u32;
   __imp__sub_821996F8(ctx, base);
-  if (NATIVE_ON()) present_frame();
+  if (NATIVE_ON()) {
+    present_frame();
+    ModeWarm& w = g_mode_warm;
+    const uint32_t stage = g32(0x82423E00u);
+    if (stage != w.stage) {
+      w.stage = stage;
+      w.done = stage == kFrontEndStage || !REXCVAR_GET(gpu_native_warm_modes);
+      w.left = 0;
+    }
+    if (w.left > 0) {
+      --w.left;  // that frame was drawn in the other mode and not shown
+    } else if (!w.done && g.draws >= kWarmMinDraws) {
+      w.done = true;
+      w.left = kWarmFrames;
+      REXKRNL_INFO("GENATIVE stage {}: drawing {} hidden frames in the other graphics mode", stage, kWarmFrames);
+    }
+  }
   QueryPerformanceCounter(&t1);
   const auto ms = [&](int64_t ticks) { return double(ticks) * 1000.0 / double(freq.QuadPart); };
   frame_stats(last.QuadPart ? ms(t0.QuadPart - last.QuadPart) : 0.0, ms(t1.QuadPart - t0.QuadPart));
