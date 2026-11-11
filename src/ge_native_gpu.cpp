@@ -34,10 +34,13 @@
 #include <thread>
 #include <cmath>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -591,6 +594,9 @@ GpuAlloc pool_alloc_impl(BufferPool& pool, uint64_t size) {
 }
 
 // Back to its pool's free list once no frame in flight can use it.
+// Converted vertex and index data kept on the GPU (see end_frame) up to this.
+constexpr uint64_t kGeometryBudget = 256ull << 20;
+
 void retire(BufferPool& pool, GpuAlloc& a) {
   if (!a) return;
   g.retired.push_back({g.frames, &pool, a});
@@ -2987,6 +2993,99 @@ bool decode_vertices_seh(const Element* els, size_t n_els, const Source* srcs, c
   return true;
 }
 
+// Helper threads for converting big meshes: the game thread waits for them in
+// the draw, so nothing else touches guest memory meanwhile. A level's big
+// meshes (17-43k vertices in Dam) cost ~10 ms each on one core; the first
+// switch to the other graphics mode converted dozens in one frame.
+class DecodeWorkers {
+ public:
+  static DecodeWorkers& get() {
+    static DecodeWorkers* w = new DecodeWorkers;  // never destroyed: threads live as long as the process
+    return *w;
+  }
+  uint32_t count() const { return uint32_t(threads_.size()) + 1; }
+  // Runs fn(0..jobs-1) on the helpers and this thread; returns when all are done.
+  void run(uint32_t jobs, const std::function<void(uint32_t)>& fn) {
+    if (threads_.empty() || jobs < 2) {
+      for (uint32_t i = 0; i < jobs; ++i) fn(i);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      fn_ = &fn;
+      jobs_ = jobs;
+      next_ = 0;
+      left_ = jobs;
+      ++generation_;
+    }
+    wake_.notify_all();
+    work();
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_.wait(lock, [&] { return left_ == 0; });
+    fn_ = nullptr;
+  }
+
+ private:
+  DecodeWorkers() {
+    const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t helpers = std::min(7u, hw > 2 ? hw - 2 : 0u);
+    for (uint32_t i = 0; i < helpers; ++i)
+      threads_.emplace_back([this] {
+        uint64_t seen = 0;
+        for (;;) {
+          {
+            std::unique_lock<std::mutex> lock(mutex_);
+            wake_.wait(lock, [&] { return generation_ != seen; });
+            seen = generation_;
+          }
+          work();
+        }
+      });
+    for (auto& t : threads_) t.detach();
+  }
+  // Jobs are claimed under the lock with the function they belong to, so a
+  // helper late from one run can never call it for another.
+  void work() {
+    for (;;) {
+      const std::function<void(uint32_t)>* fn;
+      uint32_t i;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!fn_ || next_ >= jobs_) return;
+        fn = fn_;
+        i = next_++;
+      }
+      (*fn)(i);
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (--left_ == 0) done_.notify_all();
+    }
+  }
+  std::vector<std::thread> threads_;
+  std::mutex mutex_;
+  std::condition_variable wake_, done_;
+  const std::function<void(uint32_t)>* fn_ = nullptr;
+  uint32_t jobs_ = 0, left_ = 0, next_ = 0;
+  uint64_t generation_ = 0;
+};
+
+// decode_vertices_seh, split across the helper threads for big meshes.
+bool decode_vertices(const Element* els, size_t n_els, const Source* srcs, const uint16_t* keys, size_t n_keys,
+                     uint32_t first, uint32_t vcount, uint8_t* out, uint32_t host_stride, const HostFmt* fmts,
+                     const uint32_t* offsets) {
+  constexpr uint32_t kChunk = 2048;
+  if (vcount < 2 * kChunk)
+    return decode_vertices_seh(els, n_els, srcs, keys, n_keys, first, vcount, out, host_stride, fmts, offsets);
+  const uint32_t jobs = (vcount + kChunk - 1) / kChunk;
+  std::atomic<bool> ok{true};
+  DecodeWorkers::get().run(jobs, [&](uint32_t j) {
+    const uint32_t a = j * kChunk, n = std::min(kChunk, vcount - a);
+    if (!decode_vertices_seh(els, n_els, srcs, keys, n_keys, first + a, n, out + uint64_t(a) * host_stride, host_stride,
+                             fmts, offsets))
+      ok.store(false);
+  });
+  return ok.load();
+}
+
 // --- frame ------------------------------------------------------------------
 
 void copy_scene_to(RenderTexture* dst);
@@ -3088,6 +3187,13 @@ void begin_frame() {
     }
     g.textures_by_fetch.clear();  // (a texture still on the worker is dropped with its job)
     if (n) REXKRNL_INFO("GENATIVE stage {}: {} textures from the last stage released", stage, n);
+    // The last stage's converted geometry too (see the geometry budget in end_frame).
+    const size_t geometry = g.vertex_cache.size() + g.index_cache.size();
+    for (auto& [key, e] : g.vertex_cache) retire(g.vertex_pool, e.buffer);
+    for (auto& [key, e] : g.index_cache) retire(g.index_pool, e.buffer);
+    g.vertex_cache.clear();
+    g.index_cache.clear();
+    if (geometry) REXKRNL_INFO("GENATIVE stage {}: {} cached geometry buffers released", stage, geometry);
   }
   g.cmd->begin();
   g.layout_bound = false;
@@ -3503,9 +3609,9 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
   const uint64_t voff = hit ? 0 : upload_alloc(vbytes, 16);
   if (voff == UINT64_MAX) return;
   const double t_vd = now_ms();
-  const bool decoded = hit || decode_vertices_seh(els.data(), els.size(), sources.data(), keys.data(), keys.size(),
-                                                  uint32_t(lo), vcount, g.upload_ptr + voff, host_stride,
-                                                  hfmts.data(), hoffsets.data());
+  const bool decoded = hit || decode_vertices(els.data(), els.size(), sources.data(), keys.data(), keys.size(),
+                                              uint32_t(lo), vcount, g.upload_ptr + voff, host_stride, hfmts.data(),
+                                              hoffsets.data());
   g.vdecode_ms += now_ms() - t_vd;
   if (!decoded) {
     static int logged = 0;
@@ -3760,6 +3866,8 @@ void present_frame() {
   if (!ensure_device()) return;
   if (REXCVAR_GET(gpu_native_trace_frame) == -1)  // the test pipe's TRACE: the next frame
     rex::cvar::SetFlagByName("gpu_native_trace_frame", std::to_string(g.frames + 2));
+  if (const int32_t pf = REXCVAR_GET(gpu_native_profile_frame); pf < 0)  // test: -n = the frame n from now
+    rex::cvar::SetFlagByName("gpu_native_profile_frame", std::to_string(g.frames + 1 - pf));
   begin_frame();
   const int32_t debug = REXCVAR_GET(gpu_native_debug_clear);
   if (g.draws == 0 && debug) {
@@ -3933,18 +4041,30 @@ void present_frame() {
     r.pool->free_lists[r.alloc.size_class].push_back(r.alloc);
     return true;
   });
-  if ((g.frames % 600) == 0)
+  // Converted geometry stays while the stage lasts (dropped at a stage change,
+  // begin_frame): each graphics mode has its own models, and dropping the other
+  // mode's after 10 s unused made a switch after a while convert them all again
+  // in one frame (a stutter). Past a budget, geometry unused for 10 s goes.
+  if ((g.frames % 600) == 0) {
+    uint64_t bytes = 0;
+    for (const auto& [key, e] : g.vertex_cache) bytes += e.capacity;
+    for (const auto& [key, e] : g.index_cache) bytes += e.capacity;
+    const bool over = bytes > kGeometryBudget;
+    if (over) REXKRNL_INFO("GENATIVE geometry cache {} MB over budget: unused entries released", bytes >> 20);
+    else if (REXCVAR_GET(gpu_native_frame_stats) > 0)
+      REXKRNL_INFO("GENATIVE geometry cache {} MB ({} vertex, {} index buffers)", bytes >> 20, g.vertex_cache.size(),
+                   g.index_cache.size());
     for (auto it = g.vertex_cache.begin(); it != g.vertex_cache.end();) {
-      if (g.frames - it->second.last_frame <= 600) { ++it; continue; }
+      if (!over || g.frames - it->second.last_frame <= 600) { ++it; continue; }
       retire(g.vertex_pool, it->second.buffer);
       it = g.vertex_cache.erase(it);
     }
-  if ((g.frames % 600) == 0)
     for (auto it = g.index_cache.begin(); it != g.index_cache.end();) {
-      if (g.frames - it->second.last_frame <= 600) { ++it; continue; }
+      if (!over || g.frames - it->second.last_frame <= 600) { ++it; continue; }
       retire(g.index_pool, it->second.buffer);
       it = g.index_cache.erase(it);
     }
+  }
   g.last_pipe_ms = g.pipe_ms; g.last_tex_ms = g.tex_ms; g.last_pipe_n = g.pipe_n; g.last_tex_n = g.tex_n;
   g.pipe_ms = g.tex_ms = 0; g.pipe_n = g.tex_n = 0; g.tex_requests = 0;
   if ((g.frames % 600) == 599) {
