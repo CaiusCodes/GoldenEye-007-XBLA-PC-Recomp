@@ -4888,22 +4888,27 @@ void see_through_colour(uint8_t* base, const std::pair<uint32_t, size_t>& f, boo
   }
 }
 
-// Scans the 0xA0000000 physical view (16-byte steps) for the stock blocks and
-// patches them. Returns how many blocks it changed.
-int see_through_patch_pass(uint8_t* base, bool classic) {
+// Scans [from, to) of the 0xA0000000 physical view (16-byte steps) for the
+// stock blocks and patches them; a block may run on past `to`. Returns how
+// many blocks it changed. The whole view is 512 MB: done in one go it held the
+// game thread ~200 ms (a stutter after every graphics switch), so the tick
+// below scans it a slice per frame.
+int see_through_patch_range(uint8_t* base, bool classic, uint8_t* from, uint8_t* to) {
   const auto& blocks = see_through_blocks();
   uint32_t firsts[std::size(kSeeThroughModels)] = {};
+  bool lead[256] = {};  // quick reject: the low byte of any block's first word
   bool any = false;
   for (size_t i = 0; i < blocks.size(); ++i) {
     if (blocks[i].empty()) continue;
     std::memcpy(&firsts[i], blocks[i].data(), 4);
+    lead[firsts[i] & 0xFF] = true;
     any = true;
   }
   if (!any) return 0;
   int changed = 0;
   uint8_t* lo = base + 0xA0000000ull;
   uint8_t* hi = base + 0xC0000000ull;
-  for (uint8_t* p = lo; p < hi;) {
+  for (uint8_t* p = from; p < to;) {
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
     uint8_t* end = std::min(static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize, hi);
@@ -4914,16 +4919,21 @@ int see_through_patch_pass(uint8_t* base, bool classic) {
                           (prot == PAGE_READWRITE || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READWRITE ||
                            prot == PAGE_EXECUTE_READ || prot == PAGE_WRITECOPY);
     if (readable) {
-      uint8_t* first = lo + ((static_cast<uint8_t*>(mbi.BaseAddress) - lo + 15) & ~uintptr_t(15));
-      for (uint8_t* q = first; q + 4 <= end; q += 16) {
+      uint8_t* first = lo + ((p - lo + 15) & ~uintptr_t(15));
+      uint8_t* stop = std::min(end, to);
+      for (uint8_t* q = first; q < stop && q + 4 <= end; q += 16) {
+        if (!lead[*q]) continue;
         uint32_t w;
         std::memcpy(&w, q, 4);
         for (size_t i = 0; i < blocks.size(); ++i) {
           const auto& b = blocks[i];
           if (b.empty() || w != firsts[i] || q + b.size() > end || std::memcmp(q, b.data(), b.size()) != 0)
             continue;
-          g_see_through_found.emplace_back(static_cast<uint32_t>(q - base), i);
-          see_through_colour(base, g_see_through_found.back(), classic);
+          const uint32_t at = static_cast<uint32_t>(q - base);
+          const bool known = std::any_of(g_see_through_found.begin(), g_see_through_found.end(),
+                                         [&](const auto& f) { return f.first == at; });
+          if (!known) g_see_through_found.emplace_back(at, i);
+          see_through_colour(base, {at, i}, classic);
           ++changed;
           break;
         }
@@ -4937,13 +4947,20 @@ int see_through_patch_pass(uint8_t* base, bool classic) {
 
 // Each frame (input poll): look for the blocks soon after a stage loads (and once
 // more after a graphics mode switch), and recolour them when the mode changes.
+// A look is a pass over the physical view, 16 MB per frame (32 frames).
 void ge_see_through_doors_tick(uint8_t* base) {
   static uint32_t frames = 0, last_setup = 0;
   static int toggle_wait = -1;
   static uint8_t last_classic = 0xFF;
+  static uint8_t* cursor = nullptr;  // the pass in progress (nullptr: none)
+  static bool again = false;         // another pass asked for during this one
+  static int pass_changed = 0;
+  constexpr size_t kSlice = 16u << 20;
   if (LD32(base, GE_CURRENT_STAGE) == GE_TITLE_STAGE) {
     last_setup = 0;
     g_see_through_found.clear();
+    cursor = nullptr;
+    again = false;
     return;
   }
   const uint32_t setup = LD32(base, 0x82F30398u);
@@ -4951,6 +4968,8 @@ void ge_see_through_doors_tick(uint8_t* base) {
     last_setup = setup;
     frames = 0;
     g_see_through_found.clear();
+    cursor = nullptr;
+    again = false;
   }
   const uint8_t classic = base[0x82F0DF11u];  // old graphics flag (1 = classic)
   if (classic != last_classic) {
@@ -4963,9 +4982,21 @@ void ge_see_through_doors_tick(uint8_t* base) {
   ++frames;
   bool scan = frames == 2 || frames == 30 || frames == 120;
   if (toggle_wait >= 0 && toggle_wait-- == 0) scan = true;
-  if (!scan) return;
-  const int changed = see_through_patch_pass(base, classic != 0);
-  if (changed) REXKRNL_INFO("GEDOORS {} see-through door blocks made solid", changed);
+  uint8_t* lo = base + 0xA0000000ull;
+  uint8_t* hi = base + 0xC0000000ull;
+  if (scan) {
+    if (cursor) again = true;
+    else cursor = lo, pass_changed = 0;
+  }
+  if (!cursor) return;
+  uint8_t* next = cursor + std::min<size_t>(kSlice, size_t(hi - cursor));
+  pass_changed += see_through_patch_range(base, classic != 0, cursor, next);
+  cursor = next;
+  if (cursor < hi) return;
+  if (pass_changed) REXKRNL_INFO("GEDOORS {} see-through door blocks made solid", pass_changed);
+  cursor = again ? lo : nullptr;
+  again = false;
+  pass_changed = 0;
 }
 
 // Silo: the two missiles (model 93 on bound pads 10032/10033) reach up through
