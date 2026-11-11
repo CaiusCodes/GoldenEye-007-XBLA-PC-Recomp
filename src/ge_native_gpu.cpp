@@ -132,6 +132,9 @@ REXCVAR_DEFINE_INT32(gpu_native_profile_frame, 0, "GPU",
                      "Native renderer test: GPU-time every draw, clear and resolve of this frame and log the costliest");
 REXCVAR_DEFINE_DOUBLE(gpu_native_long_frame_ms, 25.0, "GPU",
                       "Native renderer test: with gpu_native_frame_stats, log frames longer than this");
+REXCVAR_DEFINE_STRING(gpu_native_fxaa, "none", "GPU",
+                      "Native renderer: FXAA on top of the MSAA, as the classic renderer's swap_post_effect: none, "
+                      "fxaa or fxaa_extreme (the Video page's FXAA row)");
 REXCVAR_DEFINE_BOOL(gpu_native_warm_modes, true, "GPU",
                     "Native renderer: draw two hidden frames in the other graphics mode as a level starts, so the "
                     "first switch (F / RB) doesn't stutter");
@@ -723,7 +726,7 @@ cbuffer push_consts : register(b0) {
   float uv_scale_x, uv_scale_y, uv_offset_x, uv_offset_y;
   float key_r, key_g, key_b, key_tolerance;
   uint layout_4x3;
-  uint mode;  // 1 backdrop, 2 boot cover (all black), 4 colour grade, 8 gamma ramp
+  uint mode;  // 1 backdrop, 2 boot cover (all black), 4 colour grade, 8 gamma ramp, 16 FXAA, 32 FXAA extreme
   float brightness, contrast, saturation, vibrance, temperature, gamma_;
   float tint_r, tint_g, tint_b, tint_strength;
 };
@@ -824,13 +827,44 @@ float3 grade(float3 c) {
   return saturate(c);
 }
 
+// FXAA as the classic renderer's (the SDK's swap FXAA: 16 = normal, 32 =
+// extreme), on the frame before the gamma ramp.
+float fxaa_luma(float2 uv) { return dot(src.SampleLevel(image_sampler, uv, 0.0).rgb, float3(0.299, 0.587, 0.114)); }
+
+float3 fxaa(uint2 id, bool extreme) {
+  float edge = extreme ? 0.063 : 0.166, edge_min = extreme ? 0.0312 : 0.0833, span_max = extreme ? 12.0 : 8.0;
+  float2 texel = 1.0 / float2(size);
+  float2 uv = (float2(id) + 0.5) * texel;
+  float3 rgbm = src.SampleLevel(image_sampler, uv, 0.0).rgb;
+  float luma_m = dot(rgbm, float3(0.299, 0.587, 0.114));
+  float luma_nw = fxaa_luma(uv + float2(-texel.x, -texel.y));
+  float luma_ne = fxaa_luma(uv + float2(texel.x, -texel.y));
+  float luma_sw = fxaa_luma(uv + float2(-texel.x, texel.y));
+  float luma_se = fxaa_luma(uv + float2(texel.x, texel.y));
+  float luma_min = min(luma_m, min(min(luma_nw, luma_ne), min(luma_sw, luma_se)));
+  float luma_max = max(luma_m, max(max(luma_nw, luma_ne), max(luma_sw, luma_se)));
+  [branch] if (luma_max - luma_min < max(edge_min, luma_max * edge)) return rgbm;
+  float2 dir;
+  dir.x = -((luma_nw + luma_ne) - (luma_sw + luma_se));
+  dir.y = ((luma_nw + luma_sw) - (luma_ne + luma_se));
+  float reduce = max((luma_nw + luma_ne + luma_sw + luma_se) * (0.25 * 0.125), 1.0 / 128.0);
+  float rcp_min = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+  dir = clamp(dir * rcp_min, -span_max, span_max) * texel;
+  float3 rgb_a = 0.5 * (src.SampleLevel(image_sampler, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
+                        src.SampleLevel(image_sampler, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
+  float3 rgb_b = rgb_a * 0.5 + 0.25 * (src.SampleLevel(image_sampler, uv + dir * -0.5, 0.0).rgb +
+                                       src.SampleLevel(image_sampler, uv + dir * 0.5, 0.0).rgb);
+  float luma_b = dot(rgb_b, float3(0.299, 0.587, 0.114));
+  return (luma_b < luma_min || luma_b > luma_max) ? rgb_a : rgb_b;
+}
+
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
   [branch] if (id.x >= size.x || id.y >= size.y) return;
   [branch] if (mode & 2u) {
     dst[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
     return;
   }
-  float3 c = src[id.xy].rgb;
+  float3 c = (mode & 48u) ? fxaa(id.xy, (mode & 32u) != 0u) : src[id.xy].rgb;
   // The game's display gamma ramp, as the Xenos path applies its 256-entry
   // table before the port's own passes (the desk picture is not ramped).
   [branch] if (mode & 8u) {
@@ -1104,6 +1138,13 @@ int fill_output_constants(OutputConstants& c, const BackdropFn& backdrop) {
       // 16:9 folder outline, and the desk covered the 4:3 folder's right side.
       c.layout_4x3 = shown < 1.55f ? 1u : 0u;
     }
+  }
+  // FXAA on top of the scene's MSAA, as the classic renderer's Anti-Aliasing
+  // setting: not on the front end's desk (its colour key needs exact pixels).
+  if (!(c.mode & 3u)) {
+    const std::string fxaa = REXCVAR_GET(gpu_native_fxaa);
+    if (fxaa == "fxaa") c.mode |= 16;
+    else if (fxaa == "fxaa_extreme") c.mode |= 32;
   }
   if (rex::cvar::GetFlagByName("postfx_enabled") == "true") {
     c.mode |= 4;

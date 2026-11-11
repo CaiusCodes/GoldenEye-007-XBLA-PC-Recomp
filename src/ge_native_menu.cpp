@@ -685,9 +685,11 @@ std::vector<Row> BuildPage(Page page) {
                 {{"Bilinear", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}});
       // Native renderer: the scene's MSAA, applied at once (4x by default, as the
       // Xbox 360 renders); the classic renderer's FXAA post effect does nothing there.
-      if (g_renderer_active == 1)
+      if (g_renderer_active == 1) {
         AddChoice(rows, "Anti-Aliasing:", "gpu_native_msaa", {{"OFF", "1"}, {"2x", "2"}, {"4x", "4"}});
-      else
+        // FXAA on top, as the classic renderer's Anti-Aliasing row (applies at once).
+        AddChoice(rows, "FXAA:", "gpu_native_fxaa", {{"OFF", "none"}, {"ON", "fxaa"}, {"EXTREME", "fxaa_extreme"}});
+      } else
         AddChoice(rows, "Anti-Aliasing:", "swap_post_effect",
                   {{"OFF", "none"}, {"FXAA", "fxaa"}, {"FXAA Extreme", "fxaa_extreme"}});
       // No Renderer row: the classic Xenos renderer stays a ge.toml fallback
