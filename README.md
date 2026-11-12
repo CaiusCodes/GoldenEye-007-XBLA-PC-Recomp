@@ -75,6 +75,17 @@ The native renderer PLUME significantly reduces CPU and GPU overhead compared wi
 - Multiplayer music synchronised between players
 - Fixes for map boundaries, collision, weapons and character selection
 
+#### Playing over LAN or Radmin VPN
+
+You don't enter any IP address or forward any ports: the game finds matches on the network by itself.
+
+1. Every player runs the same version, joins the same network (for a virtual LAN, the same Radmin VPN / ZeroTier / Tailscale / Hamachi network) and can ping the others.
+2. In **Help & Options > Online Settings**, leave **Online Server Play OFF**. It is only for a separate relay server that isn't part of this download, and while it is on, LAN matches can't be found.
+3. When Windows Firewall asks, allow GoldenEye 007 on **both Private and Public** networks (virtual LANs usually count as public). If you missed it: *Windows Security > Firewall & network protection > Allow an app through firewall*, then tick both for every GoldenEye 007 entry.
+4. The host picks **Multiplayer > LAN or Virtual LAN > Create Match**. The others pick **Join Match** (the list keeps refreshing). In the lobby the host points the crosshair at **START** and presses A (E on the keyboard).
+
+Still nothing? The game uses UDP ports 1000 and 1001, so other firewall or antivirus software must allow them too. If the game picks the wrong network adapter, set `net_address = "<your virtual LAN address>"` in `resources\userdata\ge.toml`. The `[lan]` lines in the newest log in `resources\runtime\logs` show which address the game used. Please attach that log from each PC when you report a problem.
+
 ![GoldenEye 007 LAN Multiplayer](docs/screenshots/lan-match.jpg)
 
 ## Keyboard & Mouse Controls

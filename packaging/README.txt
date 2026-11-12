@@ -101,7 +101,9 @@ Help & Options on the main menu holds the PC settings:
                      filtering, anti-aliasing (4x by default with the new
                      renderer), post-processing
                      (colour filter), FPS counter
-  Online Settings    player name and the online server options
+  Online Settings    player name and the online server options (leave
+                     Online Server Play OFF for LAN and virtual LAN play,
+                     see MULTIPLAYER)
   Other Settings     the game's own options, Camera Bob (turn off the head
                      bob while walking) and Run Setup Again
   Check for Updates  asks GitHub for a newer version (see UPDATING)
@@ -109,19 +111,44 @@ Help & Options on the main menu holds the PC settings:
 MULTIPLAYER OVER LAN OR A VIRTUAL LAN
 -------------------------------------
 
-Main menu > Multiplayer > LAN or Virtual LAN:
-  Create Match   host a game; the others join it.
-  Join Match     lists the games on your network. The list keeps refreshing,
-                 so a game hosted after you opened it still shows up.
+There is no IP address to type in and no port to forward. The game finds
+matches on its own network by itself, the same way System Link did on the
+Xbox. It works on a home network and over a virtual LAN (Radmin VPN,
+ZeroTier, Tailscale, Hamachi and the like).
+
+Before you start (every player):
+  1. Use the same version of this port (shown on the main menu).
+  2. For a virtual LAN: join the same virtual network, and check that you
+     can ping each other's virtual address (Radmin VPN shows it, e.g.
+     26.x.x.x).
+  3. Help & Options > Online Settings: leave "Online Server Play" OFF.
+     That option is only for a separate relay server, which is not part
+     of this download. While it is ON, LAN matches cannot be found, and
+     the Server Address there is not the host's address.
+  4. Windows Firewall: the first time you host or join, Windows asks
+     whether GoldenEye 007 may use the network. Tick both Private and
+     Public (virtual LANs such as Radmin VPN usually count as public). If
+     you missed it: Windows Security > Firewall & network protection >
+     Allow an app through firewall > Change settings, then tick Private
+     and Public for every "GoldenEye 007" entry.
+
+Hosting: Main menu > Multiplayer > LAN or Virtual LAN > Create Match.
+Joining: Main menu > Multiplayer > LAN or Virtual LAN > Join Match. The
+         list keeps refreshing, so a game hosted after you opened it still
+         shows up.
 In the lobby the host points the crosshair at the START tab and presses A
 (E on the keyboard) once everyone has joined.
 
-This works on a home network and over a virtual LAN (Radmin VPN, ZeroTier,
-Tailscale, Hamachi and the like) when every player joins the same virtual
-network. Windows asks the first time you host or join whether GoldenEye 007
-may use the network; allow it on private and public networks (virtual LANs
-often count as public). If the game picks the wrong network adapter, set
-net_address in resources\userdata\ge.toml to your virtual LAN address.
+Still no matches?
+  - The game prefers a Radmin VPN or Hamachi address on its own. For
+    other virtual LANs, or if it picks the wrong network adapter, set
+    net_address = "<your virtual LAN address>" in
+    resources\userdata\ge.toml (with the game closed).
+  - The game talks over UDP ports 1000 and 1001. Other firewall or
+    antivirus programs must allow those too.
+  - Each start writes a log in resources\runtime\logs. The lines with
+    [lan] show the address the game used and the networks it searched.
+    Attach the newest log from each PC when you report a problem.
 
 PORTABLE DATA
 -------------
