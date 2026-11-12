@@ -5083,6 +5083,31 @@ void ge_frigate_mp_doors(uint8_t* base) {
     ST32(base, door + 0x9Cu, 0u);
   }
 }
+// End credits jungle (stage 0x36, background endofgamejungle): the setup places
+// 22 plants and palm trees (models 109 palm, 111 plant2b, 316 plant2, 317 plant3)
+// around Bond and Natalya, all with flags2 0x00010000 ("always visible, in
+// front"). N64 draws such objects in the alpha pass with the z-buffer off. XBLA
+// moved that test to a new third argument of the object draw (sub_820D9F30):
+// the room passes (sub_820CCD30) always pass 0, and the only caller that passes 1
+// (sub_82188B48) handles fading objects (alpha < 255) only. So solid objects with
+// the flag are never drawn and the credits show bare ground and the backdrop.
+// Clear the flag in the credits setup's own records (0x80 bytes each, copied
+// when the stage loads): the plants then draw as ordinary objects, depth-tested.
+void ge_credits_jungle_plants(uint8_t* base) {
+  constexpr uint32_t kFirst = 0x82D45BB8u;  // first of the credits setup's 22 objects
+  int fixed = 0;
+  for (uint32_t i = 0; i < 22u; ++i) {
+    const uint32_t rec = kFirst + i * 0x80u;
+    const uint16_t model = LD16(base, rec + 4u);
+    if ((LD32(base, rec) & 0xFFu) != 3u) break;  // standard object records only
+    if (model != 109u && model != 111u && model != 316u && model != 317u) break;
+    const uint32_t flags2 = LD32(base, rec + 12u);
+    if (!(flags2 & 0x00010000u)) continue;
+    ST32(base, rec + 12u, flags2 & ~0x00010000u);
+    ++fixed;
+  }
+  if (fixed) REXKRNL_INFO("GECE credits jungle: {} plants and palms made drawable", fixed);
+}
 }  // namespace
 
 // vblank_timing_log: how often the input poll runs and how long this hook takes
@@ -5145,6 +5170,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     ge_apply_ce_data_patches(base);
     ge::ApplyPortraitTable(base);  // ge_portraits.cpp: picture numbers in that list
     ge_frigate_mp_doors(base);
+    ge_credits_jungle_plants(base);
     REXKRNL_INFO("GECE community data bug-fixes applied");
   }
   ge_stan_edge_tick(base);
