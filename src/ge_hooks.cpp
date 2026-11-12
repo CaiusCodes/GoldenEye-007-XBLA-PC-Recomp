@@ -4999,6 +4999,70 @@ void ge_see_through_doors_tick(uint8_t* base) {
   pass_changed = 0;
 }
 
+// End credits jungle backdrop (stage 0x36): the wall around the clearing is six
+// rings textured with dark jungle foliage. The background's command list draws
+// them with material 0x4702 (blended, no depth write), whose pixel shader takes
+// its alpha from the texture's blue channel. These foliage textures have almost
+// no blue, so the rings came out ~3% opaque and the olive clear colour showed
+// through as a flat wall (both renderers, both graphics modes; the N64 shows the
+// foliage). Draw those rings with the ground's opaque material 0x4703 and depth
+// write on. Only the credits background's own list is changed: its 0x4702 op is
+// found as the one 0x1BC bytes after the list's first op (state 0x148 = 0),
+// as in both endofgamejungle files. The list is read each frame, so the edit
+// applies at once. Searched in 16 MB slices after the stage loads.
+namespace {
+int credits_backdrop_patch_range(uint8_t* base, uint8_t* from, uint8_t* to) {
+  static const uint8_t kXlu[16] = {0x00, 0x08, 0x1A, 0x00, 0x00, 0x00, 0x47, 0x02,
+                                   0x00, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x50};
+  static const uint8_t kFirst[8] = {0x00, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x48};
+  uint8_t* const lo = base + 0x40000000ull;
+  int changed = 0;
+  for (uint8_t* p = from; p < to;) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+    uint8_t* end = std::min(static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize, to);
+    const DWORD prot = mbi.Protect & 0xFF;
+    const bool writable = mbi.State == MEM_COMMIT && (prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE);
+    if (writable) {
+      uint8_t* q = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(p) + 3) & ~uintptr_t(3));
+      for (; q + 48 <= end; q += 4) {
+        if (q[2] != 0x1A || q[1] != 0x08 || std::memcmp(q, kXlu, 16) != 0) continue;
+        if (q - 0x1BC < lo || std::memcmp(q - 0x1BC, kFirst, 8) != 0) continue;
+        const uint32_t at = static_cast<uint32_t>(q - base);
+        ST32(base, at + 4u, 0x4703u);   // opaque background material
+        ST32(base, at + 16u, 1u);       // depth write on
+        ++changed;
+      }
+    }
+    p = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+  }
+  return changed;
+}
+}  // namespace
+
+void ge_credits_backdrop_tick(uint8_t* base) {
+  static uint32_t frames = 0;
+  static uint8_t* cursor = nullptr;
+  static int found = 0;
+  constexpr size_t kSlice = 16u << 20;
+  if (LD32(base, GE_CURRENT_STAGE) != 0x36u) {
+    frames = 0;
+    cursor = nullptr;
+    return;
+  }
+  uint8_t* const lo = base + 0x40000000ull;
+  uint8_t* const hi = base + 0x50000000ull;
+  ++frames;  // passes at 2, 60 and 180 frames in case the background loads late
+  if (!cursor && (frames == 2 || frames == 60 || frames == 180)) cursor = lo, found = 0;
+  if (!cursor) return;
+  uint8_t* next = cursor + std::min<size_t>(kSlice, size_t(hi - cursor));
+  found += credits_backdrop_patch_range(base, cursor, next);
+  cursor = next;
+  if (cursor < hi) return;
+  cursor = nullptr;
+  if (found) REXKRNL_INFO("GECE credits jungle: {} backdrop lists drawn opaque", found);
+}
+
 // Silo: the two missiles (model 93 on bound pads 10032/10033) reach up through
 // the walkway rooms around their shafts, but the level has no portals between
 // those rooms and the shafts, so each missile is only listed in its shaft's
@@ -5178,6 +5242,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   ge_corpse_slots_tick(base);
   ge_see_through_doors_tick(base);
   ge_egypt_glass_tick(base);
+  ge_credits_backdrop_tick(base);
 
   // Skip the boot screen that jokes about the Nintendo logo (menu 2, drawn by
   // sub_820ED378). The current menu is at 0x8272B35C and a requested change at
