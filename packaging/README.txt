@@ -101,7 +101,8 @@ Help & Options on the main menu holds the PC settings:
                      filtering, anti-aliasing (4x by default with the new
                      renderer), post-processing
                      (colour filter), FPS counter
-  Online Settings    player name
+  Online Settings    LAN Address (which network LAN play uses), this PC's
+                     address and the player name (see MULTIPLAYER)
   Other Settings     the game's own options, Camera Bob (turn off the head
                      bob while walking) and Run Setup Again
   Check for Updates  asks GitHub for a newer version (see UPDATING)
@@ -134,10 +135,10 @@ In the lobby the host points the crosshair at the START tab and presses A
 (E on the keyboard) once everyone has joined.
 
 Still no matches?
-  - The game prefers a Radmin VPN or Hamachi address on its own. For
-    other virtual LANs, or if it picks the wrong network adapter, set
-    net_address = "<your virtual LAN address>" in
-    resources\userdata\ge.toml (with the game closed).
+  - Check Help & Options > Online Settings > This PC's Address. On
+    Automatic the game picks a Radmin VPN or Hamachi network itself. For
+    other virtual LANs, or if it shows the wrong network, set LAN Address
+    to your virtual LAN (the game restarts when you leave the page).
   - The game talks over UDP ports 1000 and 1001. Other firewall or
     antivirus programs must allow those too.
   - Each start writes a log in resources\runtime\logs. The lines with

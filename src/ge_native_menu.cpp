@@ -53,6 +53,7 @@
 #include <atomic>
 #include <mutex>
 
+#include "ge_lan_adapters.h"  // Online Settings' LAN Address
 #include "ge_update.h"      // Check for Updates
 #include "ge_version_rc.h"  // GE_VERSION_STR, from VERSION
 
@@ -270,6 +271,70 @@ int g_renderer_active = -1;
 // (the emulated GPU reads the scale only when it starts).
 void RestartIfRenderScaleChanged() {
   if (g_render_scale_active && DesiredRenderScale() != g_render_scale_active && g_restart) {
+    g_restart();
+  }
+}
+
+// ------------------------------------------------- Online: LAN Address ---
+// LAN Address picks net_address: Automatic ("") or one of this PC's networks.
+// The LAN code reads net_address once, so leaving the page with a different
+// choice restarts the game, as Render Scale does.
+std::string g_net_address_at_start;
+bool g_net_address_captured = false;
+std::vector<ge::LanAdapter> g_lan_adapters;
+std::chrono::steady_clock::time_point g_lan_adapters_at{};
+
+const std::vector<ge::LanAdapter>& LanAdapters() {
+  const auto now = std::chrono::steady_clock::now();
+  if (g_lan_adapters_at == std::chrono::steady_clock::time_point{} ||
+      now - g_lan_adapters_at > std::chrono::seconds(3)) {
+    g_lan_adapters = ge::ListLanAdapters();
+    g_lan_adapters_at = now;
+  }
+  return g_lan_adapters;
+}
+
+void CaptureNetAddressAtStart() {
+  if (g_net_address_captured) return;
+  g_net_address_captured = true;
+  g_net_address_at_start = GetS("net_address");
+}
+
+// The menu font is wide: long adapter names are cut so the value stays clear
+// of the crest picture.
+std::string ShortName(std::string name) {
+  constexpr size_t kMax = 13;
+  if (name.size() > kMax) name = name.substr(0, kMax - 1) + ".";
+  return name;
+}
+
+std::string LanAddressText() {
+  const std::string cur = GetS("net_address");
+  if (cur.empty()) return "Automatic";
+  for (const auto& a : LanAdapters())
+    if (ge::FormatIPv4(a.address) == cur) return ShortName(a.name.empty() ? cur : a.name);
+  return cur;  // a network that is not connected now, or 127.x for tests
+}
+
+void CycleLanAddress() {
+  const std::string cur = GetS("net_address");
+  std::vector<std::string> values{""};
+  for (const auto& a : LanAdapters()) values.push_back(ge::FormatIPv4(a.address));
+  size_t idx = values.size();  // not in the list: next is Automatic
+  for (size_t i = 0; i < values.size(); ++i)
+    if (values[i] == cur) idx = i;
+  SetS("net_address", values[(idx + 1) % values.size()]);
+}
+
+std::string AddressInUseText() {
+  // After a change the new address applies once the game restarts (on Done).
+  if (g_net_address_captured && GetS("net_address") != g_net_address_at_start)
+    return "after restart";
+  return ge::FormatIPv4(rex::kernel::xam::GeLanAddressInUse());
+}
+
+void RestartIfNetAddressChanged() {
+  if (g_net_address_captured && GetS("net_address") != g_net_address_at_start && g_restart) {
     g_restart();
   }
 }
@@ -724,13 +789,21 @@ std::vector<Row> BuildPage(Page page) {
       // routed System Link through a relay server (GoldeneyeServer) that was
       // never published, so turning them on only broke LAN play.
       // ge_online_enable is forced off in ge_app.h OnPreSetup.
-      AddTextLines(rows, "LAN and virtual LAN matches need no address: see README.txt.");
-      // Below the text: lower down, the "<" ">" either side of the name are
-      // clear of the crest picture at the page's top right.
+      CaptureNetAddressAtStart();
+      // The values start on the third row: higher up they run into the crest
+      // picture at the page's top right.
+      rows.push_back(Row{RowKind::Label, "LAN PLAY"});
+      rows.push_back(Row{RowKind::Label, ""});
+      AddAction(rows, "LAN Address:", [] { CycleLanAddress(); }, [] { return LanAddressText(); });
+      rows.push_back(Row{RowKind::Label, "This PC's Address:", nullptr, {}, 0, 1, 0.1f, nullptr,
+                         [] { return AddressInUseText(); }});
       Row name{RowKind::Text, "Player Name:", "ge_username"};
       name.max_len = 15;
       rows.push_back(name);
-      AddAction(rows, "Done", [] { g_leave_page = true; });
+      AddAction(rows, "Done", [] {
+        RestartIfNetAddressChanged();
+        g_leave_page = true;
+      });
       break;
     }
     case Page::Update:
@@ -1098,6 +1171,7 @@ bool UpdatePage(PPCContext& ctx, uint8_t* base) {
       return false;
     }
     if (g_page == Page::Video) RestartIfRenderScaleChanged();
+    if (g_page == Page::Online) RestartIfNetAddressChanged();
     return true;
   }
   g_name_arrow = 0;

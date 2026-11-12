@@ -515,10 +515,10 @@ index cf0e3d1..3a13fe9 100644
    std::vector<ControllerState> controllers_;
 diff --git a/include/rex/kernel/xam/ge_online_control.h b/include/rex/kernel/xam/ge_online_control.h
 new file mode 100644
-index 0000000..e74637a
+index 0000000..8af6330
 --- /dev/null
 +++ b/include/rex/kernel/xam/ge_online_control.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,24 @@
 +// GoldenEye recomp - controls for the online multiplayer client (ge_online.cpp).
 +#pragma once
 +
@@ -537,6 +537,10 @@ index 0000000..e74637a
 +bool GeNetworkGameActive();
 +void GeNoteSessionCreated(uint32_t session_ptr, uint32_t flags);
 +void GeNoteSessionDeleted(uint32_t session_ptr);
++
++// The IPv4 address (host byte order) this copy uses for LAN play: net_address,
++// or the adapter picked automatically (a Radmin VPN / Hamachi one first).
++uint32_t GeLanAddressInUse();
 +
 +}  // namespace rex::kernel::xam
 diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
@@ -6146,10 +6150,10 @@ index 2b222da..a8ef2f3 100644
      }
 diff --git a/src/kernel/xam/ge_lan.cpp b/src/kernel/xam/ge_lan.cpp
 new file mode 100644
-index 0000000..7ee2ded
+index 0000000..6485d01
 --- /dev/null
 +++ b/src/kernel/xam/ge_lan.cpp
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,263 @@
 +#if defined(_WIN32)
 +#include <winsock2.h>
 +#include <ws2tcpip.h>
@@ -6157,6 +6161,7 @@ index 0000000..7ee2ded
 +
 +#include "ge_lan.h"
 +
++#include <atomic>
 +#include <cerrno>
 +#include <chrono>
 +#include <mutex>
@@ -6223,13 +6228,37 @@ index 0000000..7ee2ded
 +  return out;
 +}
 +
-+uint32_t ParseConfigured() {
-+  const std::string text = REXCVAR_GET(net_address);
++uint32_t ParseText(const std::string& text) {
 +  if (text.empty()) return 0;
 +  in_addr parsed{};
 +  if (inet_pton(AF_INET, text.c_str(), &parsed) != 1) return 0;
 +  return ntohl(parsed.s_addr);
 +}
++
++// net_address as it was when networking first asked. The Online Settings page
++// can change the cvar mid-run (it restarts the game to apply it); reading it
++// live would bind new sockets to one address while advertising another.
++uint32_t ParseConfigured() {
++  static std::once_flag once;
++  static uint32_t value = 0;
++  std::call_once(once, [] { value = ParseText(REXCVAR_GET(net_address)); });
++  return value;
++}
++
++// The address advertised to other players must be one they can reach.
++// A virtual LAN adapter (Radmin VPN 26.x.x.x, Hamachi 25.x.x.x) is only
++// there for playing with people on it, so it wins over the home network;
++// otherwise the first adapter. net_address overrides this.
++uint32_t ChooseAddress(uint32_t configured) {
++  if (configured) return configured;
++  const auto adapters = EnumerateAdapters();
++  for (const auto& a : adapters) {
++    if ((a.address >> 24) == 26 || (a.address >> 24) == 25) return a.address;
++  }
++  return adapters.empty() ? 0x7F000001u : adapters.front().address;
++}
++
++std::atomic<uint32_t> g_chosen{0};  // 0 until LocalAddress() decides
 +
 +}  // namespace
 +
@@ -6242,25 +6271,18 @@ index 0000000..7ee2ded
 +  static std::once_flag once;
 +  static uint32_t chosen = 0x7F000001u;
 +  std::call_once(once, [] {
-+    if (uint32_t configured = ParseConfigured()) {
-+      chosen = configured;
-+    } else {
-+      // The address advertised to other players must be one they can reach.
-+      // A virtual LAN adapter (Radmin VPN 26.x.x.x, Hamachi 25.x.x.x) is only
-+      // there for playing with people on it, so it wins over the home network;
-+      // otherwise the first adapter. net_address overrides this.
-+      const auto adapters = EnumerateAdapters();
-+      for (const auto& a : adapters) {
-+        if ((a.address >> 24) == 26 || (a.address >> 24) == 25) {
-+          chosen = a.address;
-+          break;
-+        }
-+      }
-+      if (chosen == 0x7F000001u && !adapters.empty()) chosen = adapters.front().address;
-+    }
++    chosen = ChooseAddress(ParseConfigured());
++    g_chosen.store(chosen);
 +    REXLOG_INFO("[lan] this copy's address is {}", FormatAddress(chosen));
 +  });
 +  return chosen;
++}
++
++uint32_t AddressInUse() {
++  if (uint32_t chosen = g_chosen.load()) return chosen;
++  // Networking has not started yet: what it would pick now, without fixing
++  // the choice (a VPN connected later can still win).
++  return ChooseAddress(ParseText(REXCVAR_GET(net_address)));
 +}
 +
 +bool LoopbackMode() {
@@ -6391,12 +6413,16 @@ index 0000000..7ee2ded
 +}
 +
 +}  // namespace rex::kernel::xam::lan
++
++namespace rex::kernel::xam {
++uint32_t GeLanAddressInUse() { return lan::AddressInUse(); }
++}  // namespace rex::kernel::xam
 diff --git a/src/kernel/xam/ge_lan.h b/src/kernel/xam/ge_lan.h
 new file mode 100644
-index 0000000..c803e9c
+index 0000000..1617616
 --- /dev/null
 +++ b/src/kernel/xam/ge_lan.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,49 @@
 +#pragma once
 +// LAN / virtual-LAN play without the online relay (System Link on the 360).
 +//
@@ -6416,6 +6442,10 @@ index 0000000..c803e9c
 +// active network adapter (a virtual-LAN adapter such as Radmin, ZeroTier or
 +// Hamachi counts), otherwise 127.0.0.1.
 +uint32_t LocalAddress();
++
++// LocalAddress() once networking has started; before that, what it would
++// pick now (without fixing the choice). For the Online Settings page.
++uint32_t AddressInUse();
 +
 +// net_address names a 127.x.y.z address: two or more copies on one PC.
 +bool LoopbackMode();
