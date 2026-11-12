@@ -5203,7 +5203,16 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // cursor is captured, so this is a no-op in menus / when unfocused.
   ge_start_mouse_once();
   ge_start_dam_spike_fix_once(base);
-  if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
+  if (REXCVAR_GET(ge_mouselook_enable)) {
+    ge_mouse_camera(base);
+  } else {
+    // #21: Mouse Look switched off mid-run. Forget where the mouse left the
+    // menu crosshair; otherwise ge_menu_cursor_restore_jump (run from the
+    // game's own crosshair clamp) kept pulling it back there, so the
+    // controller could not move it more than a few units and the menus were
+    // stuck until a restart.
+    g_menu_ptr.last = {-1, -1};
+  }
 
   ge_script_apply(base);
   ge_watch_mouse(base);
