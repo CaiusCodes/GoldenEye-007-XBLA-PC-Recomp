@@ -2,9 +2,9 @@
 //
 // Help & Options (menu 33) normally lists five rows from a table of text ids at
 // 0x8272C344. We give it ten:
-//   How to Play | Gamepad Settings | Gamepad Look | Keyboard & Mouse |
-//   Video Settings | Online Settings | Other Settings | Credits |
-//   Check for Updates | Done
+//   How to Play | Keyboard & Mouse | Gamepad Settings | Gamepad Look |
+//   Video Settings | Online Settings | Other Settings | Check for Updates |
+//   Credits | Done
 // The PC rows open the game's Other Settings page (menu 35) with a page
 // flag set; while the flag is set, the Other Settings draw and update
 // functions are skipped and our own rows are drawn with the game's own text,
@@ -1257,8 +1257,8 @@ bool ge_str_lookup(PPCRegister& r3) {
 }
 
 // --- Help & Options (menu 33) ---------------------------------------------
-// Rows: 0 How to Play, 1 Gamepad, 2 Gamepad Look, 3 Keyboard & Mouse, 4 Video,
-//       5 Online, 6 Other Settings, 7 Credits, 8 Check for Updates, 9 Done.
+// Rows: 0 How to Play, 1 Keyboard & Mouse, 2 Gamepad, 3 Gamepad Look, 4 Video,
+//       5 Online, 6 Other Settings, 7 Check for Updates, 8 Credits, 9 Done.
 namespace {
 constexpr int kHelpRows = 10;
 void PrepareHelpTable(uint8_t* base) {
@@ -1272,8 +1272,8 @@ void PrepareHelpTable(uint8_t* base) {
   SetCustomText(base, kTxtOnline, "Online Settings");
   SetCustomText(base, kTxtUpdates, "Check for Updates");
   SetCustomText(base, kTxtGamepadLook, "Gamepad Look");
-  const uint32_t ids[kHelpRows] = {0x9D55, kTxtGamepad, kTxtGamepadLook, kTxtKeyboard, kTxtVideo,
-                                   kTxtOnline, 0x9D54, 0x9D67, kTxtUpdates, 0x9D66};
+  const uint32_t ids[kHelpRows] = {0x9D55, kTxtKeyboard, kTxtGamepad, kTxtGamepadLook, kTxtVideo,
+                                   kTxtOnline, 0x9D54, kTxtUpdates, 0x9D67, 0x9D66};
   for (int i = 0; i < kHelpRows; ++i) ST32(base, g_help_table + i * 4, ids[i]);
   // Ten rows need a tighter column than the original five; Done ends up about
   // where it was with eight rows (118 + 7 * 24 = 286).
@@ -1305,18 +1305,18 @@ bool ge_help_row_loop(PPCRegister& r11) { return r11.s32 < kHelpRows; }
 void ge_help_route(PPCRegister& r9) {
   switch (r9.s32) {
     case 0: r9.u64 = 0; break;                                  // How to Play
-    case 1: r9.u64 = 1; break;                                  // Gamepad
-    case 2: g_page = Page::Gamepad; r9.u64 = 2; break;          // -> menu 35, ours
-    case 3: g_page = Page::Keyboard; r9.u64 = 2; break;
+    case 1: g_page = Page::Keyboard; r9.u64 = 2; break;         // -> menu 35, ours
+    case 2: r9.u64 = 1; break;                                  // Gamepad
+    case 3: g_page = Page::Gamepad; r9.u64 = 2; break;          // Gamepad Look
     case 4: g_page = Page::Video; r9.u64 = 2; break;
     case 5: g_page = Page::Online; r9.u64 = 2; break;
     case 6: g_page = Page::None; r9.u64 = 2; break;             // Other Settings
-    case 7: r9.u64 = 3; break;                                  // Credits
-    case 8:                                                     // Check for Updates
+    case 7:                                                     // Check for Updates
       g_page = Page::Update;
       StartUpdateCheck();
       r9.u64 = 2;
       break;
+    case 8: r9.u64 = 3; break;                                  // Credits
     default: r9.u64 = 4; break;                                 // Done
   }
   g_hover = -1;
