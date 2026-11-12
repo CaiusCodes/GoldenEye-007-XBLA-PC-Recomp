@@ -720,14 +720,12 @@ std::vector<Row> BuildPage(Page page) {
       AddAction(rows, "Done", [] { g_page = Page::Video; });
       break;
     case Page::Online: {
-      rows.push_back(Row{RowKind::Toggle, "Online Server Play:", "ge_online_enable"});
-      Row server{RowKind::Text, "Server Address:", "ge_online_server"};
-      server.max_len = 40;
-      rows.push_back(server);
-      Row port{RowKind::Text, "Server Port:", "ge_online_port"};
-      port.max_len = 5;
-      rows.push_back(port);
-      // Last before Done: lower down, the "<" ">" either side of the name are
+      // No Online Server Play / Server Address / Server Port rows (#22): they
+      // routed System Link through a relay server (GoldeneyeServer) that was
+      // never published, so turning them on only broke LAN play.
+      // ge_online_enable is forced off in ge_app.h OnPreSetup.
+      AddTextLines(rows, "LAN and virtual LAN matches need no address: see README.txt.");
+      // Below the text: lower down, the "<" ">" either side of the name are
       // clear of the crest picture at the page's top right.
       Row name{RowKind::Text, "Player Name:", "ge_username"};
       name.max_len = 15;

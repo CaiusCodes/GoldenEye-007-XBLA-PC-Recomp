@@ -162,6 +162,11 @@ class GeApp : public rex::ReXApp {
   // OnCreateDialogs hands it to the GPU plugin before the emulated GPU starts.
   void OnPreSetup(rex::RuntimeConfig& config) override {
     ge::InstallCrashLog();
+    // Online Server Play is gone (#22): its relay server was never published,
+    // and with it on LAN matches could not be found. Forced off here, after
+    // ge.toml is loaded, so a copy that had it on gets LAN back; off is the
+    // default, so the next save drops it from ge.toml.
+    rex::cvar::SetFlagByName("ge_online_enable", "false");
     // gpu_native (the default): run detached ("bring your own renderer") - no GPU
     // plugin, the native backend (src/ge_native_gpu.cpp) draws the guest; false
     // loads the classic Xenos plugin.

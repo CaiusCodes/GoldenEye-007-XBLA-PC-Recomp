@@ -101,9 +101,7 @@ Help & Options on the main menu holds the PC settings:
                      filtering, anti-aliasing (4x by default with the new
                      renderer), post-processing
                      (colour filter), FPS counter
-  Online Settings    player name and the online server options (leave
-                     Online Server Play OFF for LAN and virtual LAN play,
-                     see MULTIPLAYER)
+  Online Settings    player name
   Other Settings     the game's own options, Camera Bob (turn off the head
                      bob while walking) and Run Setup Again
   Check for Updates  asks GitHub for a newer version (see UPDATING)
@@ -121,11 +119,7 @@ Before you start (every player):
   2. For a virtual LAN: join the same virtual network, and check that you
      can ping each other's virtual address (Radmin VPN shows it, e.g.
      26.x.x.x).
-  3. Help & Options > Online Settings: leave "Online Server Play" OFF.
-     That option is only for a separate relay server, which is not part
-     of this download. While it is ON, LAN matches cannot be found, and
-     the Server Address there is not the host's address.
-  4. Windows Firewall: the first time you host or join, Windows asks
+  3. Windows Firewall: the first time you host or join, Windows asks
      whether GoldenEye 007 may use the network. Tick both Private and
      Public (virtual LANs such as Radmin VPN usually count as public). If
      you missed it: Windows Security > Firewall & network protection >
