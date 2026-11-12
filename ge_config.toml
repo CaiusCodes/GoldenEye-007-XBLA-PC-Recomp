@@ -836,3 +836,9 @@ registers = ["r1", "r18", "f0", "f11"]
 address = 0x820BB488
 name = "ge_pad_look_hold_pitch"
 registers = ["r11"]
+# Door windows and camera lenses take bullets the N64 way (issue #24): the hit
+# test passes the model node that was hit (see ge_obj_hit_part in ge_hit_fixes.cpp).
+[[midasm_hook]]
+address = 0x820DB2E0
+name = "ge_obj_hit_part"
+registers = ["r1", "r9", "r10", "r25"]

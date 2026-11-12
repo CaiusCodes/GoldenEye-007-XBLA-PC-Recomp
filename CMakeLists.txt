@@ -48,6 +48,7 @@ set(GE_SOURCES
     src/ge_native_probe.cpp
     src/ge_native_gpu.cpp
     src/ge_native_shaders.cpp
+    src/ge_hit_fixes.cpp
 )
 
 # The release version: VERSION is the single source of truth (Make-Release.ps1
