@@ -43,6 +43,7 @@ set(GE_SOURCES
     src/ge_ce_patches.cpp
     src/ge_native_menu.cpp
     src/ge_lan_adapters.cpp
+    src/ge_lan_diagnostics.cpp
     src/ge_portraits.cpp
     src/ge_gpu_detect.cpp
     src/ge_native_probe.cpp
@@ -114,6 +115,8 @@ if(WIN32)
     target_link_libraries(ge PRIVATE winhttp bcrypt)
     # Online Settings > LAN Address (src/ge_lan_adapters.cpp): the network names.
     target_link_libraries(ge PRIVATE iphlpapi ws2_32)
+    # [lan-check] log lines (src/ge_lan_diagnostics.cpp): firewall rules, network profiles.
+    target_link_libraries(ge PRIVATE oleaut32)
 endif()
 
 # ge_version_rc.h for GoldenEye.rc (see the VERSION block above).

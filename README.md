@@ -72,7 +72,7 @@ The native renderer PLUME significantly reduces CPU and GPU overhead compared wi
 ### Multiplayer
 
 - **LAN multiplayer** and online play through Virtual LAN services
-- Compatible with Radmin VPN, ZeroTier, Tailscale and Hamachi
+- Compatible with Radmin VPN, ZeroTier and Hamachi (Tailscale doesn't pass on the broadcasts the game uses to find matches)
 - Multiplayer music synchronised between players
 - Fixes for map boundaries, collision, weapons and character selection
 
@@ -80,11 +80,11 @@ The native renderer PLUME significantly reduces CPU and GPU overhead compared wi
 
 You don't enter any IP address or forward any ports: the game finds matches on the network by itself.
 
-1. Every player runs the same version, joins the same network (for a virtual LAN, the same Radmin VPN / ZeroTier / Tailscale / Hamachi network) and can ping the others.
+1. Every player runs the same version, joins the same network (for a virtual LAN, the same Radmin VPN / ZeroTier / Hamachi network) and can ping the others.
 2. When Windows Firewall asks, allow GoldenEye 007 on **both Private and Public** networks (virtual LANs usually count as public). If you missed it: *Windows Security > Firewall & network protection > Allow an app through firewall*, then tick both for every GoldenEye 007 entry.
 3. The host picks **Multiplayer > LAN or Virtual LAN > Create Match**. The others pick **Join Match** (the list keeps refreshing). In the lobby the host points the crosshair at **START** and presses A (E on the keyboard).
 
-Still nothing? The game uses UDP ports 1000 and 1001, so other firewall or antivirus software must allow them too. **Help & Options > Online Settings** shows **This PC's Address**. On Automatic the game picks a Radmin VPN or Hamachi network itself; for other virtual LANs, or if it shows the wrong network, set **LAN Address** to your virtual LAN (the game restarts when you leave the page). The `[lan]` lines in the newest log in `resources\runtime\logs` show which address the game used. Please attach that log from each PC when you report a problem.
+Still nothing? The game uses UDP ports 1000 and 1001, so other firewall or antivirus software must allow them too. **Help & Options > Online Settings** shows **This PC's Address**. On Automatic the game picks a Radmin VPN or Hamachi network itself; for other virtual LANs, or if it shows the wrong network, set **LAN Address** to your virtual LAN (the game restarts when you leave the page). Playing on a home network while Radmin VPN or Hamachi is connected? Disconnect it, or set **LAN Address** to the home network on that PC. In the newest log in `resources\runtime\logs`, the `[lan-check]` lines show the PC's networks and its Windows Firewall rules for the game, and the `[lan]` lines show which address the game used and whether anything arrived from the other PC. Please attach that log from each PC when you report a problem.
 
 ![GoldenEye 007 LAN Multiplayer](docs/screenshots/lan-match.jpg)
 

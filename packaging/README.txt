@@ -113,7 +113,8 @@ MULTIPLAYER OVER LAN OR A VIRTUAL LAN
 There is no IP address to type in and no port to forward. The game finds
 matches on its own network by itself, the same way System Link did on the
 Xbox. It works on a home network and over a virtual LAN (Radmin VPN,
-ZeroTier, Tailscale, Hamachi and the like).
+ZeroTier, Hamachi and the like). Tailscale does not pass on the broadcasts
+the game uses to find matches, so it does not work.
 
 Before you start (every player):
   1. Use the same version of this port (shown on the main menu).
@@ -139,11 +140,15 @@ Still no matches?
     Automatic the game picks a Radmin VPN or Hamachi network itself. For
     other virtual LANs, or if it shows the wrong network, set LAN Address
     to your virtual LAN (the game restarts when you leave the page).
+    Playing on a home network while Radmin VPN or Hamachi is connected?
+    Disconnect it, or set LAN Address to the home network on that PC.
   - The game talks over UDP ports 1000 and 1001. Other firewall or
     antivirus programs must allow those too.
-  - Each start writes a log in resources\runtime\logs. The lines with
-    [lan] show the address the game used and the networks it searched.
-    Attach the newest log from each PC when you report a problem.
+  - Each start writes a log in resources\runtime\logs. The [lan-check]
+    lines show this PC's networks and its Windows Firewall rules for the
+    game; the [lan] lines show the address the game used and whether
+    anything arrived from the other PC. Attach the newest log from each PC
+    when you report a problem.
 
 PORTABLE DATA
 -------------

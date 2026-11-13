@@ -22,6 +22,7 @@
 #include <functional>
 #include <string>
 
+#include "ge_lan_diagnostics.h"
 #include "ge_menu.h"
 #include "ge_postfx.h"
 #include "ge_native_shaders.h"
@@ -162,6 +163,7 @@ class GeApp : public rex::ReXApp {
   // OnCreateDialogs hands it to the GPU plugin before the emulated GPU starts.
   void OnPreSetup(rex::RuntimeConfig& config) override {
     ge::InstallCrashLog();
+    ge::StartLanDiagnostics();  // [lan-check] lines: networks + firewall rules
     // Online Server Play is gone (#22): its relay server was never published,
     // and with it on LAN matches could not be found. Forced off here, after
     // ge.toml is loaded, so a copy that had it on gets LAN back; off is the

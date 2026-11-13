@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9b3cdf5..44ee608 100644
+index 9b3cdf5..d84952c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -33,10 +33,14 @@ endif()
@@ -22,7 +22,7 @@ index 9b3cdf5..44ee608 100644
 @@ -249,6 +253,17 @@ add_compile_options(
      -Wextra
  )
-
+ 
 +# x86-64 SIMD baseline for all rexglue (non-thirdparty) targets. Core/audio/
 +# graphics use SSSE3 (_mm_shuffle_epi8). Declared here -- after thirdparty,
 +# before the src/* subdirs -- so the SDK builds correctly when consumed via
@@ -6151,17 +6151,19 @@ index 2b222da..a8ef2f3 100644
      }
 diff --git a/src/kernel/xam/ge_lan.cpp b/src/kernel/xam/ge_lan.cpp
 new file mode 100644
-index 0000000..6485d01
+index 0000000..6b9883f
 --- /dev/null
 +++ b/src/kernel/xam/ge_lan.cpp
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,362 @@
 +#if defined(_WIN32)
 +#include <winsock2.h>
 +#include <ws2tcpip.h>
++#include <iphlpapi.h>  // types only: iphlpapi.dll is loaded at run time
 +#endif
 +
 +#include "ge_lan.h"
 +
++#include <algorithm>
 +#include <atomic>
 +#include <cerrno>
 +#include <chrono>
@@ -6189,6 +6191,7 @@ index 0000000..6485d01
 +struct AdapterAddress {
 +  uint32_t address;    // host order
 +  uint32_t broadcast;  // host order, directed broadcast
++  uint32_t mask;       // host order
 +};
 +
 +std::vector<AdapterAddress> EnumerateAdapters() {
@@ -6207,7 +6210,7 @@ index 0000000..6485d01
 +      const uint32_t addr = ntohl(it.iiAddress.AddressIn.sin_addr.s_addr);
 +      const uint32_t mask = ntohl(it.iiNetmask.AddressIn.sin_addr.s_addr);
 +      if (addr == 0 || (addr >> 16) == 0xA9FE) continue;  // none / link-local 169.254
-+      out.push_back({addr, (addr & mask) | ~mask});
++      out.push_back({addr, (addr & mask) | ~mask, mask});
 +    }
 +  }
 +  closesocket(s);
@@ -6221,12 +6224,54 @@ index 0000000..6485d01
 +      const uint32_t mask =
 +          it->ifa_netmask ? ntohl(reinterpret_cast<sockaddr_in*>(it->ifa_netmask)->sin_addr.s_addr)
 +                          : 0xFFFFFF00u;
-+      out.push_back({addr, (addr & mask) | ~mask});
++      out.push_back({addr, (addr & mask) | ~mask, mask});
 +    }
 +    freeifaddrs(list);
 +  }
 +#endif
 +  return out;
++}
++
++// The IPv4 address of the adapter that carries internet traffic (the one with
++// the default route). Adapters with no way out -- Hyper-V / WSL "vEthernet",
++// VirtualBox and VMware host-only networks -- are often listed first and can
++// never be reached by another PC, so they must not be the address this copy
++// advertises. Asks Windows which interface it would use for a public address;
++// nothing is sent. 0 = unknown (no default route, or not Windows).
++uint32_t DefaultRouteAddress() {
++#if defined(_WIN32)
++  static HMODULE lib = LoadLibraryW(L"iphlpapi.dll");
++  if (!lib) return 0;
++  using BestInterfaceFn = DWORD(WINAPI*)(IPAddr, PDWORD);
++  using AdaptersFn = ULONG(WINAPI*)(ULONG, ULONG, PVOID, PIP_ADAPTER_ADDRESSES, PULONG);
++  auto best_interface = reinterpret_cast<BestInterfaceFn>(
++      reinterpret_cast<void*>(GetProcAddress(lib, "GetBestInterface")));
++  auto adapters_addresses = reinterpret_cast<AdaptersFn>(
++      reinterpret_cast<void*>(GetProcAddress(lib, "GetAdaptersAddresses")));
++  if (!best_interface || !adapters_addresses) return 0;
++  DWORD index = 0;
++  if (best_interface(htonl(0x08080808u), &index) != NO_ERROR) return 0;
++  ULONG size = 16 * 1024;
++  std::vector<unsigned char> buffer;
++  ULONG result = ERROR_BUFFER_OVERFLOW;
++  for (int tries = 0; tries < 3 && result == ERROR_BUFFER_OVERFLOW; ++tries) {
++    buffer.resize(size);
++    result = adapters_addresses(
++        AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
++        nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
++  }
++  if (result != NO_ERROR) return 0;
++  for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()); a; a = a->Next) {
++    if (a->IfIndex != index) continue;
++    for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
++      if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
++      const uint32_t addr =
++          ntohl(reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr)->sin_addr.s_addr);
++      if (addr != 0 && (addr >> 16) != 0xA9FE) return addr;
++    }
++  }
++#endif
++  return 0;
 +}
 +
 +uint32_t ParseText(const std::string& text) {
@@ -6246,17 +6291,30 @@ index 0000000..6485d01
 +  return value;
 +}
 +
++struct Choice {
++  uint32_t address;
++  const char* reason;
++};
++
 +// The address advertised to other players must be one they can reach.
 +// A virtual LAN adapter (Radmin VPN 26.x.x.x, Hamachi 25.x.x.x) is only
 +// there for playing with people on it, so it wins over the home network;
-+// otherwise the first adapter. net_address overrides this.
-+uint32_t ChooseAddress(uint32_t configured) {
-+  if (configured) return configured;
++// then the adapter with the internet route (the home network); otherwise the
++// first adapter. net_address overrides this.
++Choice ChooseAddress(uint32_t configured) {
++  if (configured) return {configured, "LAN Address setting"};
 +  const auto adapters = EnumerateAdapters();
 +  for (const auto& a : adapters) {
-+    if ((a.address >> 24) == 26 || (a.address >> 24) == 25) return a.address;
++    if ((a.address >> 24) == 26) return {a.address, "Radmin VPN network"};
++    if ((a.address >> 24) == 25) return {a.address, "Hamachi network"};
 +  }
-+  return adapters.empty() ? 0x7F000001u : adapters.front().address;
++  if (const uint32_t route = DefaultRouteAddress()) {
++    for (const auto& a : adapters) {
++      if (a.address == route) return {a.address, "network with the internet connection"};
++    }
++  }
++  if (adapters.empty()) return {0x7F000001u, "no network found"};
++  return {adapters.front().address, "first network (none has an internet connection)"};
 +}
 +
 +std::atomic<uint32_t> g_chosen{0};  // 0 until LocalAddress() decides
@@ -6272,9 +6330,16 @@ index 0000000..6485d01
 +  static std::once_flag once;
 +  static uint32_t chosen = 0x7F000001u;
 +  std::call_once(once, [] {
-+    chosen = ChooseAddress(ParseConfigured());
++    const Choice choice = ChooseAddress(ParseConfigured());
++    chosen = choice.address;
 +    g_chosen.store(chosen);
-+    REXLOG_INFO("[lan] this copy's address is {}", FormatAddress(chosen));
++    std::string all;
++    for (const auto& a : EnumerateAdapters()) {
++      if (!all.empty()) all += ", ";
++      all += FormatAddress(a.address);
++    }
++    REXLOG_INFO("[lan] this copy's address is {} ({}); this PC's addresses: {}",
++                FormatAddress(chosen), choice.reason, all.empty() ? "none" : all);
 +  });
 +  return chosen;
 +}
@@ -6283,11 +6348,35 @@ index 0000000..6485d01
 +  if (uint32_t chosen = g_chosen.load()) return chosen;
 +  // Networking has not started yet: what it would pick now, without fixing
 +  // the choice (a VPN connected later can still win).
-+  return ChooseAddress(ParseText(REXCVAR_GET(net_address)));
++  return ChooseAddress(ParseText(REXCVAR_GET(net_address))).address;
 +}
 +
 +bool LoopbackMode() {
 +  return (ParseConfigured() >> 24) == 127;
++}
++
++bool IsOwnAddress(uint32_t address) {
++  if (LoopbackMode()) return address == LocalAddress();
++  if ((address >> 24) == 127) return true;
++  static std::mutex mutex;
++  static std::vector<uint32_t> own;
++  static std::chrono::steady_clock::time_point refreshed{};
++  std::lock_guard<std::mutex> lock(mutex);
++  const auto now = std::chrono::steady_clock::now();
++  if (own.empty() || now - refreshed > std::chrono::seconds(30)) {
++    refreshed = now;
++    own.clear();
++    for (const auto& a : EnumerateAdapters()) own.push_back(a.address);
++  }
++  return std::find(own.begin(), own.end(), address) != own.end();
++}
++
++bool OnThisPcsNetworks(uint32_t address) {
++  if ((address >> 24) == 127) return LoopbackMode();
++  for (const auto& a : EnumerateAdapters()) {
++    if ((address & a.mask) == (a.address & a.mask)) return true;
++  }
++  return false;
 +}
 +
 +uint32_t BindAddress() {
@@ -6335,7 +6424,16 @@ index 0000000..6485d01
 +std::mutex g_adapter_mutex;
 +std::vector<AdapterSocket> g_adapter_sockets;
 +std::chrono::steady_clock::time_point g_adapter_refresh{};
++std::string g_adapter_list_logged;
 +int g_send_errors_logged = 0;
++
++int LastSocketError() {
++#if defined(_WIN32)
++  return WSAGetLastError();
++#else
++  return errno;
++#endif
++}
 +
 +void CloseAdapterSockets() {
 +  for (auto& s : g_adapter_sockets) {
@@ -6350,7 +6448,7 @@ index 0000000..6485d01
 +
 +// One UDP socket per adapter, bound to its address on a free port. Rebuilt
 +// every 30 s so an adapter that comes up later (VPN connected after the game
-+// started) is picked up.
++// started) is picked up. Logged when the set of adapters changes.
 +void RefreshAdapterSockets() {
 +  const auto now = std::chrono::steady_clock::now();
 +  if (!g_adapter_sockets.empty() && now - g_adapter_refresh < std::chrono::seconds(30)) return;
@@ -6371,6 +6469,8 @@ index 0000000..6485d01
 +    local.sin_addr.s_addr = htonl(adapter.address);
 +    local.sin_port = 0;
 +    if (bind(s.handle, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
++      REXLOG_WARN("[lan] could not open a broadcast socket on {} (error {})",
++                  FormatAddress(adapter.address), LastSocketError());
 +#if defined(_WIN32)
 +      closesocket(s.handle);
 +#else
@@ -6382,7 +6482,10 @@ index 0000000..6485d01
 +    list += FormatAddress(adapter.address) + " -> " + FormatAddress(adapter.broadcast);
 +    g_adapter_sockets.push_back(s);
 +  }
-+  REXLOG_INFO("[lan] broadcasting on {} adapter(s): {}", g_adapter_sockets.size(), list);
++  if (list != g_adapter_list_logged) {
++    g_adapter_list_logged = list;
++    REXLOG_INFO("[lan] broadcasting on {} adapter(s): {}", g_adapter_sockets.size(), list);
++  }
 +}
 +
 +}  // namespace
@@ -6401,13 +6504,9 @@ index 0000000..6485d01
 +                              reinterpret_cast<sockaddr*>(&to), sizeof(to));
 +      if (sent < 0 && g_send_errors_logged < 8) {
 +        ++g_send_errors_logged;
-+#if defined(_WIN32)
-+        const int err = WSAGetLastError();
-+#else
-+        const int err = errno;
-+#endif
-+        REXLOG_WARN("[lan] broadcast from {} to {}:{} failed ({})",
-+                    FormatAddress(s.adapter.address), FormatAddress(target), port, err);
++        REXLOG_WARN("[lan] broadcast from {} to {}:{} failed (error {})",
++                    FormatAddress(s.adapter.address), FormatAddress(target), port,
++                    LastSocketError());
 +      }
 +    }
 +  }
@@ -6420,10 +6519,10 @@ index 0000000..6485d01
 +}  // namespace rex::kernel::xam
 diff --git a/src/kernel/xam/ge_lan.h b/src/kernel/xam/ge_lan.h
 new file mode 100644
-index 0000000..1617616
+index 0000000..4859973
 --- /dev/null
 +++ b/src/kernel/xam/ge_lan.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,57 @@
 +#pragma once
 +// LAN / virtual-LAN play without the online relay (System Link on the 360).
 +//
@@ -6439,10 +6538,18 @@ index 0000000..1617616
 +
 +namespace rex::kernel::xam::lan {
 +
-+// This copy's address: net_address when set, otherwise the first IPv4 of an
-+// active network adapter (a virtual-LAN adapter such as Radmin, ZeroTier or
-+// Hamachi counts), otherwise 127.0.0.1.
++// This copy's address: net_address when set, otherwise a Radmin VPN (26.x) or
++// Hamachi (25.x) adapter, otherwise the adapter with the internet route, otherwise
++// the first IPv4 of an active adapter, otherwise 127.0.0.1. Logged once, with why.
 +uint32_t LocalAddress();
++
++// One of this PC's own addresses (or this copy's, in loopback mode): packets
++// from it are this copy's own broadcasts coming back, not another player.
++bool IsOwnAddress(uint32_t host_order);
++
++// The address is on the same network (subnet) as one of this PC's adapters,
++// so it can be reached directly, without a router.
++bool OnThisPcsNetworks(uint32_t host_order);
 +
 +// LocalAddress() once networking has started; before that, what it would
 +// pick now (without fixing the choice). For the Online Settings page.
@@ -7063,7 +7170,7 @@ index 1fb1e16..86c4353 100644
      // This may have just been a size query.
      if (buffer_ptr) {
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 58e36a4..81d93a4 100644
+index 58e36a4..2b34c3e 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
 @@ -12,13 +12,20 @@
@@ -7087,7 +7194,7 @@ index 58e36a4..81d93a4 100644
  #include <rex/kernel/xam/module.h>
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
-@@ -33,6 +40,34 @@
+@@ -33,6 +40,80 @@
  #include <rex/system/xthread.h>
  #include <rex/system/xtypes.h>
  
@@ -7113,16 +7220,62 @@ index 58e36a4..81d93a4 100644
 +  uint16_t port = 0;
 +  uint32_t flags = 0;
 +  std::chrono::steady_clock::time_point last{};
++  std::chrono::steady_clock::time_point started{};
 +  int repeats = 0;
++  bool warned = false;  // "nothing heard yet" logged for this search
 +} g_lan_search;
 +constexpr int kMaxSearchRepeats = 150;  // five minutes
++
++// Default troubleshooting log (no per-packet lines): the first packet heard
++// from and sent to each other PC, and when this copy's LAN broadcasts (a join
++// screen's search, or a hosted match answering one) start and stop. With these
++// a log shows whether the two PCs ever reached each other.
++struct LanPeers {
++  std::mutex mutex;
++  std::vector<uint32_t> heard;
++  std::vector<uint32_t> sent;
++} g_lan_peers;
++
++bool FirstContact(std::vector<uint32_t>& seen, uint32_t address) {
++  if (std::find(seen.begin(), seen.end(), address) != seen.end()) return false;
++  if (seen.size() < 64) seen.push_back(address);
++  return true;
++}
++
++// g_lan_search.mutex must be held.
++void EndLanSearchLocked(const std::string& why) {
++  if (!g_lan_search.active) return;
++  g_lan_search.active = false;
++  std::string heard;
++  {
++    std::lock_guard<std::mutex> lock(g_lan_peers.mutex);
++    for (uint32_t a : g_lan_peers.heard) {
++      if (!heard.empty()) heard += ", ";
++      heard += std::to_string(a >> 24) + "." + std::to_string((a >> 16) & 0xFF) + "." +
++               std::to_string((a >> 8) & 0xFF) + "." + std::to_string(a & 0xFF);
++    }
++  }
++  if (!heard.empty()) {
++    REXLOG_INFO("[lan] LAN broadcasts on port {} stopped ({}) after {}; other PCs heard: {}",
++                g_lan_search.port, why, g_lan_search.repeats + 1, heard);
++  } else {
++    REXLOG_WARN(
++        "[lan] LAN broadcasts on port {} stopped ({}) after {} and nothing ever came back from "
++        "another PC. Check that both PCs run the same version on the same network (or virtual "
++        "LAN) and that Windows Firewall allows GoldenEye 007 on Private and Public networks",
++        g_lan_search.port, why, g_lan_search.repeats + 1);
++  }
++}
++
++void NoteLanReceive(uint32_t socket, uint32_t from, uint16_t port, int bytes);
++void NoteLanSend(uint32_t to, uint16_t port);
 +}  // namespace
 +#include "ge_online.h"
 +
  #if REX_PLATFORM_WIN32
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
-@@ -295,22 +330,103 @@ u32 NetDll_WSAGetLastError_entry() {
+@@ -295,22 +376,122 @@ u32 NetDll_WSAGetLastError_entry() {
    return XThread::GetLastError();
  }
  
@@ -7188,6 +7341,7 @@ index 58e36a4..81d93a4 100644
 +                    ret > 0 ? dst[0] : 0, ret > 1 ? dst[1] : 0, ret > 2 ? dst[2] : 0,
 +                    ret > 3 ? dst[3] : 0);
 +      }
++      NoteLanReceive(socket, uint32_t(from.sin_addr), uint16_t(from.sin_port), ret);
 +      if (num_bytes_recv) *num_bytes_recv = ret;
 +      if (flags_ptr) *flags_ptr = 0;
 +      if (from_addr) {
@@ -7215,6 +7369,24 @@ index 58e36a4..81d93a4 100644
 +          repeat = g_lan_search.data;
 +          port = g_lan_search.port;
 +          flags = g_lan_search.flags;
++        } else if (g_lan_search.active && g_lan_search.socket == socket &&
++                   g_lan_search.repeats >= kMaxSearchRepeats) {
++          EndLanSearchLocked("five minutes without joining");
++        }
++        if (g_lan_search.active && g_lan_search.socket == socket && !g_lan_search.warned &&
++            now - g_lan_search.started >= std::chrono::seconds(30)) {
++          g_lan_search.warned = true;
++          bool heard_any = false;
++          {
++            std::lock_guard<std::mutex> peers_lock(g_lan_peers.mutex);
++            heard_any = !g_lan_peers.heard.empty();
++          }
++          if (!heard_any) {
++            REXLOG_WARN(
++                "[lan] 30 s of LAN broadcasts and nothing has come from another PC yet. Check "
++                "that both PCs run the same version on the same network (or virtual LAN) and "
++                "that Windows Firewall allows GoldenEye 007 on Private and Public networks");
++          }
 +        }
 +      }
 +      if (!repeat.empty()) {
@@ -7238,7 +7410,7 @@ index 58e36a4..81d93a4 100644
    return -1;
  }
  
-@@ -346,7 +462,60 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+@@ -346,7 +527,86 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
    }
  
    N_XSOCKADDR_IN native_to(to_ptr);
@@ -7272,6 +7444,18 @@ index 58e36a4..81d93a4 100644
 +  {
 +    std::lock_guard<std::mutex> lock(g_lan_search.mutex);
 +    if (uint32_t(native_to.sin_addr) == 0xFFFFFFFFu) {
++      if (!g_lan_search.active || g_lan_search.socket != socket_handle) {
++        std::string targets;
++        for (uint32_t target : lan::BroadcastTargets()) {
++          if (!targets.empty()) targets += ", ";
++          targets += lan::FormatAddress(target);
++        }
++        REXLOG_INFO("[lan] LAN broadcasts on port {} started (to {}; this copy is {})",
++                    uint16_t(native_to.sin_port), targets,
++                    lan::FormatAddress(lan::LocalAddress()));
++        g_lan_search.started = std::chrono::steady_clock::now();
++        g_lan_search.warned = false;
++      }
 +      g_lan_search.active = true;
 +      g_lan_search.socket = socket_handle;
 +      g_lan_search.data = combined_buffer_mem;
@@ -7280,7 +7464,8 @@ index 58e36a4..81d93a4 100644
 +      g_lan_search.last = std::chrono::steady_clock::now();
 +      g_lan_search.repeats = 0;
 +    } else if (g_lan_search.socket == socket_handle) {
-+      g_lan_search.active = false;  // talking to a host now: joining
++      // Talking to a host now: joining.
++      EndLanSearchLocked("joining " + lan::FormatAddress(native_to.sin_addr));
 +    }
 +  }
 +  if (uint32_t(native_to.sin_addr) == 0xFFFFFFFFu) {
@@ -7294,13 +7479,26 @@ index 58e36a4..81d93a4 100644
 +    lan::SendBroadcastPerAdapter(combined_buffer_mem.data(), combined_buffer_size,
 +                                 native_to.sin_port);
 +  } else {
-+    socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
++    NoteLanSend(uint32_t(native_to.sin_addr), uint16_t(native_to.sin_port));
++    if (socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to,
++                       to_len) < 0) {
++      static std::atomic<int> errors_logged{0};
++      if (errors_logged.fetch_add(1) < 8) {
++#if REX_PLATFORM_WIN32
++        const int err = WSAGetLastError();
++#else
++        const int err = errno;
++#endif
++        REXLOG_WARN("[lan] send to {}:{} failed (error {})",
++                    lan::FormatAddress(native_to.sin_addr), uint16_t(native_to.sin_port), err);
++      }
++    }
 +  }
 +  if (num_bytes_sent) *num_bytes_sent = combined_buffer_size;
  
    // TODO: Instantly complete overlapped
  
-@@ -377,7 +546,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+@@ -377,7 +637,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
  }
  
  u32 NetDll_WSACreateEvent_entry() {
@@ -7309,7 +7507,7 @@ index 58e36a4..81d93a4 100644
    ev->Initialize(true, false);
    return ev->handle();
  }
-@@ -436,9 +605,25 @@ struct XnAddrStatus {
+@@ -436,9 +696,25 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -7338,7 +7536,7 @@ index 58e36a4..81d93a4 100644
    addr_ptr->wPortOnline = 0;
  
    // TODO(gibbed): A proper mac address.
-@@ -453,6 +638,9 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+@@ -453,6 +729,9 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
    // "Mac address is a poor solution because you can't have multiple connections
    // from the same system"
    std::memset(addr_ptr->abEnet, 0xCC, 6);
@@ -7348,7 +7546,7 @@ index 58e36a4..81d93a4 100644
  
    std::memset(addr_ptr->abOnline, 0, 20);
  
-@@ -473,28 +661,55 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
+@@ -473,28 +752,55 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
  
  void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                       u32 string_size) {
@@ -7412,7 +7610,7 @@ index 58e36a4..81d93a4 100644
  
  // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
  struct XEthernetStatus {
-@@ -534,6 +749,8 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
+@@ -534,6 +840,8 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
  }
  
  u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
@@ -7421,7 +7619,7 @@ index 58e36a4..81d93a4 100644
    // Set pqos as some games will try accessing it despite non-successful result
    if (pqos) {
      auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
-@@ -559,7 +776,14 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+@@ -559,7 +867,14 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
  
  u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                 u32 flags) {
@@ -7437,7 +7635,7 @@ index 58e36a4..81d93a4 100644
  }
  
  u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
-@@ -579,13 +803,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,13 +894,13 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -7453,7 +7651,7 @@ index 58e36a4..81d93a4 100644
  
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
      XThread::SetLastError(error);
-@@ -603,6 +827,14 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+@@ -603,6 +918,14 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
      return -1;
    }
  
@@ -7462,13 +7660,13 @@ index 58e36a4..81d93a4 100644
 +  }
 +  {
 +    std::lock_guard<std::mutex> lock(g_lan_search.mutex);
-+    if (g_lan_search.socket == socket_handle) g_lan_search.active = false;
++    if (g_lan_search.socket == socket_handle) EndLanSearchLocked("screen closed");
 +  }
 +
    // TODO: Absolutely delete this object. It is no longer valid after calling
    // closesocket.
    socket->Close();
-@@ -670,12 +902,39 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+@@ -670,12 +993,51 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
    }
  
    N_XSOCKADDR_IN native_name(name);
@@ -7494,6 +7692,18 @@ index 58e36a4..81d93a4 100644
    X_STATUS status = socket->Bind(&native_name, namelen);
 -  if (XFAILED(status)) {
 +  if (XFAILED(status) && !OnlineClient::Enabled()) {
++#if REX_PLATFORM_WIN32
++    const int err = WSAGetLastError();
++#else
++    const int err = errno;
++#endif
++    REXLOG_WARN("[lan] could not open {}:{} (error {}){}", lan::FormatAddress(native_name.sin_addr),
++                uint16_t(native_name.sin_port), err,
++                err == 10048 ? ": the port is already in use - is another copy of the game, or "
++                               "another program, using it?"
++                : err == 10049 ? ": that address is not on this PC - check Online Settings > "
++                                 "LAN Address"
++                               : "");
      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
      return -1;
    }
@@ -7509,7 +7719,7 @@ index 58e36a4..81d93a4 100644
    return 0;
  }
  
-@@ -763,7 +1022,10 @@ struct host_set {
+@@ -763,7 +1125,10 @@ struct host_set {
        }
        // Convert from Xenia -> native
        auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
@@ -7521,7 +7731,18 @@ index 58e36a4..81d93a4 100644
        this->sockets[i] = socket;
      }
    }
-@@ -933,11 +1195,97 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
+@@ -881,6 +1246,10 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+   if (fromlen_ptr) {
+     *fromlen_ptr = native_fromlen;
+   }
++  if (ret >= 0 && !OnlineClient::Enabled()) {
++    NoteLanReceive(socket_handle, uint32_t(native_from.sin_addr), uint16_t(native_from.sin_port),
++                   ret);
++  }
+ 
+   if (ret == -1) {
+ // TODO: Better way of getting the error code
+@@ -933,11 +1302,97 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
    XThread::SetLastError(error_code);
  }
  
@@ -7619,7 +7840,7 @@ index 58e36a4..81d93a4 100644
  REX_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
  REX_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
  REX_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
-@@ -1030,25 +1378,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,25 +1485,20 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -7645,6 +7866,39 @@ index 58e36a4..81d93a4 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
+@@ -1100,3 +1550,32 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
+ REX_EXPORT_STUB(__imp__NetDll_getpeername);
+ REX_EXPORT_STUB(__imp__NetDll_getsockname);
+ REX_EXPORT_STUB(__imp__NetDll_getsockopt);
++
++namespace {
++namespace lan = rex::kernel::xam::lan;
++
++void NoteLanReceive(uint32_t /*socket*/, uint32_t from, uint16_t port, int bytes) {
++  if (lan::IsOwnAddress(from)) return;  // this copy's own broadcast coming back
++  std::lock_guard<std::mutex> lock(g_lan_peers.mutex);
++  if (FirstContact(g_lan_peers.heard, from)) {
++    REXLOG_INFO("[lan] first packet from another PC: {}:{} ({} bytes)", lan::FormatAddress(from),
++                port, bytes);
++  }
++}
++
++void NoteLanSend(uint32_t to, uint16_t port) {
++  if (to == 0xFFFFFFFFu || lan::IsOwnAddress(to)) return;
++  std::lock_guard<std::mutex> lock(g_lan_peers.mutex);
++  if (FirstContact(g_lan_peers.sent, to)) {
++    if (lan::OnThisPcsNetworks(to)) {
++      REXLOG_INFO("[lan] first packet to another PC: {}:{}", lan::FormatAddress(to), port);
++    } else {
++      REXLOG_WARN(
++          "[lan] first packet to another PC: {}:{}, which is not on any of this PC's networks. "
++          "That PC advertises an address this one can't reach directly: on that PC set Help & "
++          "Options > Online Settings > LAN Address to the network both PCs share",
++          lan::FormatAddress(to), port);
++    }
++  }
++}
++}  // namespace
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 index 3f1a852..fa79346 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
