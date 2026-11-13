@@ -342,18 +342,22 @@ void ge_model_draw_object(PPCRegister& r25) { g_drawing_model = r25.u32; }
 // floating hats). On the N64 a guard's head is one rigid model on the body's
 // head node, and the hat sits on that node with a per-head offset table (XBLA
 // keeps both for classic graphics). Rare's classic head files are skinned
-// instead, and 10 of them (Ken, Joe, Scott, Karl, Shaun, Martin, Joel, Lee,
-// Neil, Des) bind part of the head to the torso bone (BACK) as well as the
-// neck: their draw list's bone palette (op 0x12, before the first block) is
-// {BACK, NECK}. When the neck bends, as when a guard crouches or looks down,
-// that part lags behind while the hat follows the neck, so the hat slides
-// over the face. Pointing the palette's BACK entry at NECK draws those heads
-// rigid on the neck like the N64's. The other heads' palettes are {NECK}.
+// instead, and 17 of them bind part of the head to other bones as well as the
+// neck: their draw list's bone palette (op 0x12, before the first block;
+// entries {u16 bone, 0xFFFF, u32}) is {BACK, NECK} (Ken, Joe, Scott, Karl,
+// Shaun, Martin, Joel, Lee, Neil, Des, Bike, Brosnan, Spice Bond, Sally, Mandy,
+// Vivien), or for B six bones (four leg/arm bones, BACK and NECK). When
+// the neck bends, as when a guard crouches or looks down, that part lags
+// behind while the hat follows the neck, so the hat slides over the face or
+// sits behind the head. Pointing every palette entry of a head that has a
+// NECK entry at NECK draws it rigid on the neck like the N64's. The other
+// heads' palettes are {NECK} already.
 namespace {
-constexpr uint16_t kBoneBack = 2, kBoneNeck = 7;  // SKEL_ order in the head files
+constexpr uint16_t kBoneNeck = 7;  // SKEL_ order in the head files
 struct HeadPalette {
-  uint32_t list = 0;   // the draw list it was found in
-  uint32_t entry = 0;  // the BACK entry's bone id (u16), 0 if not such a head
+  uint32_t list = 0;     // the draw list it was found in
+  uint32_t entries = 0;  // the palette's first entry, 0 if not such a head
+  uint32_t count = 0;
 };
 std::unordered_map<uint32_t, HeadPalette> g_head_palettes;  // res -> palette
 
@@ -373,22 +377,30 @@ void ClassicHeadRigid(uint8_t* base, uint32_t res) {
       const uint32_t size = LD32(base, p) >> 16;
       const uint8_t op = base[p + 2];
       if (size < 4 || op == 0x16) break;  // the palette comes before the first block
-      if (op == 0x12 && size >= 0x1C) {
+      if (op == 0x12) {
         const uint32_t entries = LD32(base, p + 4);
-        if (LD32(base, p + 8) >> 16 == 2 && entries == p + 12 && LD16(base, entries) == kBoneBack &&
-            LD16(base, entries + 8) == kBoneNeck) {
-          h.entry = entries;
-          REXKRNL_INFO("GEHEADS {}: head drawn rigid on the neck (its torso bone entry now the neck)", path);
+        const uint32_t count = LD32(base, p + 8) >> 16;
+        if (count >= 2 && count <= 8 && entries == p + 12 && size == 12 + 8 * count) {
+          bool neck = false, other = false;
+          for (uint32_t i = 0; i < count; ++i) {
+            const uint16_t bone = LD16(base, entries + 8 * i);
+            if (bone == kBoneNeck) neck = true; else other = true;
+          }
+          if (neck && other) {
+            h.entries = entries;
+            h.count = count;
+            REXKRNL_INFO("GEHEADS {}: head drawn rigid on the neck ({} bones in its palette)", path, count);
+          }
         }
         break;
       }
       p += size;
     }
   }
-  if (h.entry && LD16(base, h.entry) == kBoneBack) {
-    const uint16_t neck = __builtin_bswap16(kBoneNeck);
-    std::memcpy(base + h.entry, &neck, 2);
-  }
+  if (!h.entries) return;
+  const uint16_t neck = __builtin_bswap16(kBoneNeck);
+  for (uint32_t i = 0; i < h.count; ++i)
+    if (LD16(base, h.entries + 8 * i) != kBoneNeck) std::memcpy(base + h.entries + 8 * i, &neck, 2);
 }
 }  // namespace
 
