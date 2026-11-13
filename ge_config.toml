@@ -837,8 +837,29 @@ address = 0x820BB488
 name = "ge_pad_look_hold_pitch"
 registers = ["r11"]
 # Door windows and camera lenses take bullets the N64 way (issue #24): the hit
-# test passes the model node that was hit (see ge_obj_hit_part in ge_hit_fixes.cpp).
+# test passes the model node that was hit, a broken window is not hit any more
+# (see ge_obj_hit_part in ge_hit_fixes.cpp); the third window hit breaks the
+# window (ge_door_window_shatter, in objHit after it counts the hit), and a
+# broken window's glass is left out of that door's draw (ge_model_draw_object
+# names the object being drawn, ge_door_draw_begin/_end wrap its draw list).
 [[midasm_hook]]
 address = 0x820DB2E0
 name = "ge_obj_hit_part"
-registers = ["r1", "r9", "r10", "r25"]
+registers = ["r1", "r9", "r10", "r25", "r29"]
+jump_address_on_true = 0x820DB2E4
+[[midasm_hook]]
+address = 0x820E82C8
+name = "ge_door_window_shatter"
+registers = ["r27", "r31"]
+[[midasm_hook]]
+address = 0x8209ABB8
+name = "ge_model_draw_object"
+registers = ["r25"]
+[[midasm_hook]]
+address = 0x8209D36C
+name = "ge_door_draw_begin"
+registers = ["r31"]
+[[midasm_hook]]
+address = 0x8209D370
+name = "ge_door_draw_end"
+registers = []
