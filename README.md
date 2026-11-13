@@ -36,7 +36,7 @@ The installation is portable, with imported game files, saves and settings store
 ### System Requirements
 
 - Windows 10 or 11 (64-bit)
-- CPUs released before 2014 may not be supported
+- Any 64-bit CPU that runs Windows 10 or 11
 - DirectX 12 or Vulkan-compatible graphics card
 - Integrated graphics supported, including Intel HD 620
 - Your own GoldenEye 007 XBLA package (Title ID `584108A9`, supported build only)

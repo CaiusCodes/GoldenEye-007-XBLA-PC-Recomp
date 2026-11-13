@@ -99,9 +99,13 @@ set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye 007")
 
 rexglue_setup_target(ge GPU_PLUGINS xenos)
 
-# Same CPU baseline as the PD/Hexic ports (AVX2 class). -ffp-contract=off keeps
+# x86-64-v2 (SSE4.2) so pre-2013 CPUs without AVX2 run it too (issue #22);
+# v3 was ~7-12% less CPU time. -ffp-contract=off keeps
 # float results identical to the guest (no fused multiply-add).
-target_compile_options(ge PRIVATE -march=x86-64-v3 -ffp-contract=off)
+if(NOT REX_X86_MARCH)  # set by the SDK's CMakeLists; an installed SDK doesn't
+  set(REX_X86_MARCH "x86-64-v2" CACHE STRING "x86-64 CPU level for the game code")
+endif()
+target_compile_options(ge PRIVATE -march=${REX_X86_MARCH} -ffp-contract=off)
 
 # Character pictures are read with WIC (ge_portraits.cpp).
 if(WIN32)

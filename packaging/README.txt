@@ -23,7 +23,6 @@ folder. After that the package is not needed any more.
 Requirements:
   Windows 10 or 11 (64-bit) and a graphics card with DirectX 12 or Vulkan
   (integrated laptop graphics such as Intel HD 620 or AMD Radeon work too).
-  CPUs released before 2014 may not be supported.
   Nothing else needs installing: the Microsoft Visual C++ runtime the game
   uses is included.
 
