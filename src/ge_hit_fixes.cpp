@@ -44,6 +44,8 @@
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <cstdio>
 
 #include "ge_init.h"  // PPCRegister/PPCContext + generated function decls
 #include <rex/cvar.h>
@@ -336,9 +338,67 @@ GlassBlock FindGlass(uint8_t* base, uint32_t start, uint32_t end) {
 
 void ge_model_draw_object(PPCRegister& r25) { g_drawing_model = r25.u32; }
 
+// Classic guard heads, rigid on the neck as on the N64 (issue #24 follow-up,
+// floating hats). On the N64 a guard's head is one rigid model on the body's
+// head node, and the hat sits on that node with a per-head offset table (XBLA
+// keeps both for classic graphics). Rare's classic head files are skinned
+// instead, and 10 of them (Ken, Joe, Scott, Karl, Shaun, Martin, Joel, Lee,
+// Neil, Des) bind part of the head to the torso bone (BACK) as well as the
+// neck: their draw list's bone palette (op 0x12, before the first block) is
+// {BACK, NECK}. When the neck bends, as when a guard crouches or looks down,
+// that part lags behind while the hat follows the neck, so the hat slides
+// over the face. Pointing the palette's BACK entry at NECK draws those heads
+// rigid on the neck like the N64's. The other heads' palettes are {NECK}.
+namespace {
+constexpr uint16_t kBoneBack = 2, kBoneNeck = 7;  // SKEL_ order in the head files
+struct HeadPalette {
+  uint32_t list = 0;   // the draw list it was found in
+  uint32_t entry = 0;  // the BACK entry's bone id (u16), 0 if not such a head
+};
+std::unordered_map<uint32_t, HeadPalette> g_head_palettes;  // res -> palette
+
+void ClassicHeadRigid(uint8_t* base, uint32_t res) {
+  const uint32_t rg = LD32(base, res + 8u);
+  const uint32_t hdr = rg ? LD32(base, rg + 0xECu) : 0;
+  const uint32_t start = hdr ? LD32(base, hdr) : 0;
+  if (!start) return;
+  HeadPalette& h = g_head_palettes[res];
+  if (h.list != start) {  // first draw of this file (or another file in a reused res)
+    h = HeadPalette{};
+    h.list = start;
+    const char* path = reinterpret_cast<const char*>(base + res + 16u);
+    if (!std::strstr(path, "\\original\\head\\")) return;
+    const uint32_t end = LD32(base, hdr + 4u);
+    for (uint32_t p = start; p + 4 <= end && end - start < 0x10000u;) {
+      const uint32_t size = LD32(base, p) >> 16;
+      const uint8_t op = base[p + 2];
+      if (size < 4 || op == 0x16) break;  // the palette comes before the first block
+      if (op == 0x12 && size >= 0x1C) {
+        const uint32_t entries = LD32(base, p + 4);
+        if (LD32(base, p + 8) >> 16 == 2 && entries == p + 12 && LD16(base, entries) == kBoneBack &&
+            LD16(base, entries + 8) == kBoneNeck) {
+          h.entry = entries;
+          REXKRNL_INFO("GEHEADS {}: head drawn rigid on the neck (its torso bone entry now the neck)", path);
+        }
+        break;
+      }
+      p += size;
+    }
+  }
+  if (h.entry && LD16(base, h.entry) == kBoneBack) {
+    const uint16_t neck = __builtin_bswap16(kBoneNeck);
+    std::memcpy(base + h.entry, &neck, 2);
+  }
+}
+}  // namespace
+
+REXCVAR_DEFINE_BOOL(ge_classic_heads_rigid, true, "Gameplay",
+                    "Classic graphics: guard heads move rigidly with the neck as on the N64, so hats stay on");
+
 void ge_door_draw_begin(PPCRegister& r31) {
-  if (g_broken_models.empty() || !g_drawing_model) return;
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  if (REXCVAR_GET(ge_classic_heads_rigid)) ClassicHeadRigid(base, r31.u32);
+  if (g_broken_models.empty() || !g_drawing_model) return;
   const auto it = g_broken_models.find(g_drawing_model);
   if (it == g_broken_models.end()) return;
   const uint32_t model = it->first, obj = it->second;
