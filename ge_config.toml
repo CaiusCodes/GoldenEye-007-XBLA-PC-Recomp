@@ -136,6 +136,29 @@ address = 0x82103448
 name = "ge_lan_default_layout"
 registers = ["r11"]
 after_instruction = false
+# Frame draw loops: mark the turns of a player with no view on this PC (another
+# PC's player in a LAN match) so the native renderer drops its draws
+# (ge_hooks.cpp ge_view_turn_begin)
+[[midasm_hook]]
+address = 0x8209EC94
+name = "ge_view_turn_begin"
+registers = []
+after_instruction = false
+[[midasm_hook]]
+address = 0x8209EDFC
+name = "ge_view_turn_end"
+registers = []
+after_instruction = false
+[[midasm_hook]]
+address = 0x8209EE7C
+name = "ge_view_turn_begin"
+registers = []
+after_instruction = false
+[[midasm_hook]]
+address = 0x8209EEDC
+name = "ge_view_turn_end"
+registers = []
+after_instruction = false
 
 # Watch Options tab: Show Crosshair added above Show Aim Crosshair (rows below
 # shifted), Screen Letterbox and Screen Ratio hidden (ge_native_menu.cpp)

@@ -5427,6 +5427,25 @@ void ge_lan_default_layout(PPCRegister& r11) {
   if (base[GE_NET_FLAG] != 0) r11.u64 = 3;
 }
 
+// The frame's draw loops (sub_8209EC28: scene pass, then HUD pass) run for
+// every player in the match, also another PC's player, who has no view here
+// (sub_820CAB70 sets player+8528 = -1 when the layout has fewer views than
+// players and the player is not local). The game places that view off screen
+// (sub_820B2EE8: y = 1000), where the 360 clips it; the native renderer draws
+// with a full-screen viewport, so the other player's picture covered this
+// PC's own every frame (issue #22: flicker, "the same spawn"). Each turn of
+// both loops is marked (0x8209EC94 / 0x8209EE7C, after sub_820C9B40 picks the
+// player) and unmarked at its end (0x8209EDFC / 0x8209EEDC); native_draw drops
+// draws while marked. Clears and game logic are untouched.
+namespace ge { bool g_hidden_view = false; }
+void ge_view_turn_begin() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  const uint32_t player = LD32(base, 0x82F1FAACu);  // current player
+  ge::g_hidden_view = base[GE_NET_FLAG] != 0 && player != 0 &&
+                      static_cast<int32_t>(LD32(base, player + 8528u)) == -1;
+}
+void ge_view_turn_end() { ge::g_hidden_view = false; }
+
 // disable_doors_autoclosing_on_mp @0x820E4F1C (after `lwz r11,0xE8(r30)` loads
 // the door open-tick): in a network session, force it to 0 so doors never
 // auto-close. Outside a session, keep the loaded value.

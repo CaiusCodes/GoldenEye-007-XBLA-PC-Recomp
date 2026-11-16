@@ -59,6 +59,10 @@ void PersistSettings();
 std::atomic<int> g_native_aniso{3};
 void SetNativeAnisotropy(int value) { g_native_aniso.store(value, std::memory_order_relaxed); }
 int NativeAnisotropy() { return g_native_aniso.load(std::memory_order_relaxed); }
+// True while the game draws a player who has no view on this PC (another PC's
+// player in a LAN match; ge_hooks.cpp ge_view_turn_begin). The game places that
+// view off screen, where the 360 clips it; here its draws are dropped.
+extern bool g_hidden_view;
 }  // namespace ge
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -3475,7 +3479,7 @@ RenderPipeline* pipeline_for(RenderShader* vs, RenderShader* ps, uint32_t decl,
 void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* indices,
                  int32_t base_vertex, uint32_t first, uint32_t up_data, uint32_t up_stride,
                  bool restart_16 = true, uint32_t idx_addr = 0, bool idx_wide = false) {
-  if (!ensure_device() || count == 0) return;
+  if (ge::g_hidden_view || !ensure_device() || count == 0) return;
   begin_frame();
   const double t_start = now_ms();
   struct Total {
