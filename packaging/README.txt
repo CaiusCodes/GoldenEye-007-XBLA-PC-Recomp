@@ -121,10 +121,12 @@ Before you start (every player):
   2. For a virtual LAN: join the same virtual network, and check that you
      can ping each other's virtual address (Radmin VPN shows it, e.g.
      26.x.x.x).
-  3. Windows Firewall: the first time you host or join, Windows asks
-     whether GoldenEye 007 may use the network. Tick both Private and
-     Public (virtual LANs such as Radmin VPN usually count as public). If
-     you missed it: Windows Security > Firewall & network protection >
+  3. Windows Firewall: tick "Allow LAN play through Windows Firewall" in
+     setup (hold Shift while starting the game to open it) and press Play;
+     Windows asks for permission once. Or, the first time you host or join,
+     Windows asks whether GoldenEye 007 may use the network: tick both
+     Private and Public (virtual LANs such as Radmin VPN usually count as
+     public). If you missed it: Windows Security > Firewall & network protection >
      Allow an app through firewall > Change settings, then tick Private
      and Public for every "GoldenEye 007" entry.
 

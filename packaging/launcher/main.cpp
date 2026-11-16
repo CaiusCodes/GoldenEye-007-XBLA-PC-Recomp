@@ -14,10 +14,14 @@
 // check at another releases URL (https, or http on 127.0.0.1).
 //
 // For automated tests (no window):
-//   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,complete]
+//   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,complete,lan]
 //           [--shortcut-folder <dir>] [--saves-folder <dir>]
 //   (--saves-folder: saves and settings in that folder instead of resources\userdata)
 //   Exit code 0 imported, 1 failed, 2 several packages found (pass --package), 3 none found.
+//   (lan: the Windows Firewall rule for LAN play; Windows asks for permission)
+//
+//   GoldenEye 007.exe --firewall on|off   (run elevated by setup's "Allow LAN play"):
+//                                     adds or removes this folder's firewall rule, no window
 //
 // Any other arguments are passed on to the game.
 //
@@ -69,6 +73,7 @@ int RunUnattended(Paths& p, const SetupOptions& options, const std::wstring& ext
   want.fullscreen = extras.find(L"fullscreen") != std::wstring::npos;
   want.shortcut = extras.find(L"shortcut") != std::wstring::npos;
   want.complete = extras.find(L"complete") != std::wstring::npos;
+  want.lan = extras.find(L"lan") != std::wstring::npos;
   // As on a first setup: unticked extras change nothing; never replace a shortcut that is not ours.
   const std::wstring note = ApplyExtras(p, want, Extras{}, options.shortcut_folder, nullptr);
   if (!note.empty()) Log(L"Unattended: " + note);
@@ -81,6 +86,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   bool setup = false, unattended = false, update = false;
+  int firewall = -1;  // --firewall on (1) / off (0)
   std::wstring extras;
   fs::path saves_folder;
   SetupOptions options;
@@ -90,6 +96,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       setup = true;
     } else if (arg == L"--update") {
       update = true;
+    } else if (arg == L"--firewall" && i + 1 < argc) {
+      firewall = std::wstring(argv[++i]) == L"on" ? 1 : 0;
     } else if (arg == L"--unattended") {
       unattended = true;
     } else if (arg == L"--package" && i + 1 < argc) {
@@ -112,6 +120,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
   Paths p = MakePaths();
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+  // The elevated helper for setup's "Allow LAN play": change the rule and go.
+  if (firewall >= 0) {
+    LogTo(p.logs);
+    const int code = RunFirewallHelper(p, firewall == 1);
+    CoUninitialize();
+    return code;
+  }
 
   // What an update cut off half-way (or the old launcher exe it could not
   // delete while running) left behind is put back or cleared first: a cheap

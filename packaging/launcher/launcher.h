@@ -133,7 +133,16 @@ struct Extras {
   bool fullscreen = false;
   bool shortcut = false;
   bool complete = false;  // 100% game completion
+  bool lan = false;       // Windows Firewall lets other PCs reach this copy (LAN play)
 };
+// LAN play through Windows Firewall (core.cpp): our inbound rule for the game exe
+// is there and no block rule beats it.
+bool FirewallAllowsLan(const Paths& p);
+// Runs this launcher elevated with --firewall on|off (Windows asks for permission)
+// and waits. Returns a note for the player when the firewall was not changed.
+std::wstring RequestFirewall(const Paths& p, bool allow);
+// The elevated side of RequestFirewall. 0 done, 1 failed.
+int RunFirewallHelper(const Paths& p, bool allow);
 Extras CurrentExtras(const Paths& p, const fs::path& shortcut_folder);
 // Applies only what differs from `was`. ask_replace is asked before an
 // existing desktop shortcut that is not ours is replaced (nullptr: never).

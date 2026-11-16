@@ -3,7 +3,7 @@
 // A classified dossier, after the game's own main menu: a manila folder on a
 // dark desk, a ruled sheet inside it, typewriter text in brown-black ink and red
 // rubber-stamp ink for what matters. One page: the package line (Browse Package
-// or drag and drop), the import progress, the three optional extras, the saves
+// or drag and drop), the import progress, the four optional extras, the saves
 // folder and Play.
 // Everything is painted with GDI+ in 96-DPI layout units and scaled for the
 // monitor's DPI, so the window stays sharp at any Windows scaling.
@@ -32,18 +32,18 @@ namespace {
 using namespace Gdiplus;
 
 // ------------------------------------------------------------- layout --
-constexpr float kW = 730, kH = 692;
+constexpr float kW = 730, kH = 734;
 constexpr float kUiScale = 1.18f;  // drawn 18% larger than the 96-DPI layout
-constexpr float kSheetX = 36, kSheetY = 54, kSheetW = 630, kSheetH = 608;
-constexpr float kFolderX = 22, kFolderY = 40, kFolderW = 658, kFolderH = 634;
+constexpr float kSheetX = 36, kSheetY = 54, kSheetW = 630, kSheetH = 650;
+constexpr float kFolderX = 22, kFolderY = 40, kFolderW = 658, kFolderH = 676;
 constexpr float kTabX = kFolderX + kFolderW, kTabTop = 72, kTabPitch = 140, kTabH = 130;
 constexpr float kRowsY = 242, kRowPitch = 30;   // candidate rows when several packages are found
 constexpr int kMaxRows = 4;
 constexpr float kExtrasY = 404, kExtraFirst = 432, kExtraPitch = 42;
-constexpr float kSavesY = kExtraFirst + 3 * kExtraPitch;  // the saves-folder row, after the three extras
-constexpr float kFootY = 626;                             // footer line and the two buttons
+constexpr float kSavesY = kExtraFirst + 4 * kExtraPitch;  // the saves-folder row, after the four extras
+constexpr float kFootY = 668;                             // footer line and the two buttons
 
-enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kSaves, kSavesBrowse, kRow0 };
+enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kSaves, kSavesBrowse, kRow0 };
 
 enum class Mode { Idle, Choosing, Importing, Ready };
 
@@ -79,10 +79,12 @@ struct ExtraDef {
   const wchar_t* title;
   const wchar_t* detail;
 };
-const ExtraDef kExtraDefs[3] = {
+const ExtraDef kExtraDefs[4] = {
     {L"START IN FULLSCREEN", L"You can switch at any time in Help & Options > Video Settings."},
     {L"CREATE DESKTOP SHORTCUT", L"Adds a GoldenEye 007 icon to your desktop that opens this folder's game."},
     {L"100% GAME COMPLETION", L"Unlocks every mission on every difficulty, 007 mode and all cheats."},
+    {L"ALLOW LAN PLAY THROUGH WINDOWS FIREWALL",
+     L"Lets other PCs on your network join your matches. Windows asks for permission once."},
 };
 
 class SetupWindow {
@@ -217,7 +219,8 @@ RectL SetupWindow::ControlRect(Control id) const {
     case kSavesBrowse: return {516, kSavesY + 1, 150, 32};
     case kExtra0:
     case kExtra1:
-    case kExtra2: return {54, kExtraFirst + (id - kExtra0) * kExtraPitch - 4, 612, kExtraPitch - 2};
+    case kExtra2:
+    case kExtra3: return {54, kExtraFirst + (id - kExtra0) * kExtraPitch - 4, 612, kExtraPitch - 2};
     default: {
       const int row = id - kRow0;
       return {54, kRowsY + row * kRowPitch, 448, kRowPitch - 2};
@@ -234,13 +237,14 @@ bool SetupWindow::Enabled(Control id) const {
     case kSavesBrowse: return mode_ != Mode::Importing;
     case kExtra0:
     case kExtra1:
-    case kExtra2: return true;
+    case kExtra2:
+    case kExtra3: return true;
     default: return mode_ == Mode::Choosing && id - kRow0 < static_cast<int>(candidates_.size());
   }
 }
 
 Control SetupWindow::HitTest(float x, float y) const {
-  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kSavesBrowse, kSaves};
+  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kSavesBrowse, kSaves};
   if (mode_ == Mode::Choosing) {
     for (int i = 0; i < static_cast<int>(candidates_.size()) && i < kMaxRows; ++i)
       ids.push_back(static_cast<Control>(kRow0 + i));
@@ -453,8 +457,8 @@ void SetupWindow::Paint(HDC dc) {
               RectF(56, kExtrasY, 610, 22));
     Pen divider(Color(120, 43, 36, 24), 1);
     g.DrawLine(&divider, 56.0f, kExtrasY + 22, 666.0f, kExtrasY + 22);
-    const bool on[3] = {want_.fullscreen, want_.shortcut, want_.complete};
-    for (int i = 0; i < 3; ++i) {
+    const bool on[4] = {want_.fullscreen, want_.shortcut, want_.complete, want_.lan};
+    for (int i = 0; i < 4; ++i) {
       const float y = kExtraFirst + i * kExtraPitch;
       if (hover_ == kExtra0 + i) {
         SolidBrush hover(Color(40, 107, 90, 56));
@@ -782,6 +786,7 @@ void SetupWindow::Click(Control id) {
     case kExtra0: want_.fullscreen = !want_.fullscreen; break;
     case kExtra1: want_.shortcut = !want_.shortcut; break;
     case kExtra2: want_.complete = !want_.complete; break;
+    case kExtra3: want_.lan = !want_.lan; break;
     case kSaves:
       // Unticked: choose a folder; ticked: back to this folder (resources\userdata).
       if (want_saves_.empty()) ChooseSavesFolder();

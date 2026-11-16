@@ -3,6 +3,8 @@
 #include "launcher.h"
 
 #include <bcrypt.h>
+#include <netfw.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
 
@@ -1051,6 +1053,7 @@ Extras CurrentExtras(const Paths& p, const fs::path& shortcut_folder) {
   e.fullscreen = FileExists(p.config) ? (!ReadConfig(p, "fullscreen", &value) || value == "true") : false;
   e.complete = ReadConfig(p, "ge_unlock_all", &value) && value == "true";
   e.shortcut = OurShortcut(p, ShortcutPath(shortcut_folder));
+  e.lan = FirewallAllowsLan(p);
   return e;
 }
 
@@ -1089,7 +1092,207 @@ std::wstring ApplyExtras(const Paths& p, const Extras& want, const Extras& was, 
       Log(L"Desktop shortcut removed.");
     }
   }
+  if (want.lan != was.lan) {
+    const std::wstring fw = RequestFirewall(p, want.lan);
+    if (!fw.empty()) note += (note.empty() ? L"" : L"\n\n") + fw;
+  }
   return note;
+}
+
+// ============================================================ firewall ==
+// "Allow LAN play": an inbound Windows Firewall rule for resources\runtime\GoldenEye 007.exe,
+// UDP ports 1000-1001 (System Link: game data and the match search), on Private and Public
+// networks. Changing firewall rules needs administrator rights, so the launcher runs
+// itself elevated with --firewall on|off (one Windows permission prompt) and waits.
+// Reading the rules needs no rights.
+namespace {
+
+const wchar_t* const kFwRulePrefix = L"GoldenEye 007 LAN play - ";
+const wchar_t* const kFwGroup = L"GoldenEye 007 XBLA PC Recomp";
+constexpr long kFwProfiles = NET_FW_PROFILE2_PRIVATE | NET_FW_PROFILE2_PUBLIC;
+
+// One rule per folder, named after its exe, so another copy's rule is never touched.
+std::wstring FwRuleName(const Paths& p) { return kFwRulePrefix + p.game_exe.wstring(); }
+
+struct FwRule {
+  std::wstring name, app;
+  bool inbound = false, allow = false, enabled = false;
+  long profiles = 0, protocol = 0;
+  std::wstring ports;
+};
+
+template <class T>
+void ReleaseCom(T*& ptr) {
+  if (ptr) ptr->Release();
+  ptr = nullptr;
+}
+
+std::wstring TakeBstr(BSTR b) {
+  std::wstring s = b ? std::wstring(b, SysStringLen(b)) : std::wstring();
+  if (b) SysFreeString(b);
+  return s;
+}
+
+INetFwPolicy2* FwPolicy() {
+  INetFwPolicy2* policy = nullptr;
+  if (FAILED(CoCreateInstance(__uuidof(NetFwPolicy2), nullptr, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2),
+                              reinterpret_cast<void**>(&policy))))
+    return nullptr;
+  return policy;
+}
+
+// Calls f(rule, info) for every rule; f may change the rule (it stays valid during the call).
+template <class F>
+bool ForEachFwRule(INetFwPolicy2* policy, F f) {
+  INetFwRules* rules = nullptr;
+  IUnknown* enum_unknown = nullptr;
+  IEnumVARIANT* it = nullptr;
+  bool ok = SUCCEEDED(policy->get_Rules(&rules)) && rules && SUCCEEDED(rules->get__NewEnum(&enum_unknown)) &&
+            enum_unknown && SUCCEEDED(enum_unknown->QueryInterface(IID_PPV_ARGS(&it)));
+  if (ok) {
+    VARIANT item;
+    VariantInit(&item);
+    ULONG fetched = 0;
+    while (it->Next(1, &item, &fetched) == S_OK && fetched == 1) {
+      INetFwRule* rule = nullptr;
+      if (item.vt == VT_DISPATCH && item.pdispVal &&
+          SUCCEEDED(item.pdispVal->QueryInterface(__uuidof(INetFwRule), reinterpret_cast<void**>(&rule)))) {
+        FwRule r;
+        BSTR b = nullptr;
+        if (SUCCEEDED(rule->get_Name(&b))) r.name = TakeBstr(b);
+        b = nullptr;
+        if (SUCCEEDED(rule->get_ApplicationName(&b))) r.app = TakeBstr(b);
+        b = nullptr;
+        if (SUCCEEDED(rule->get_LocalPorts(&b))) r.ports = TakeBstr(b);
+        NET_FW_RULE_DIRECTION direction = NET_FW_RULE_DIR_OUT;
+        NET_FW_ACTION action = NET_FW_ACTION_BLOCK;
+        VARIANT_BOOL on = VARIANT_FALSE;
+        rule->get_Direction(&direction);
+        rule->get_Action(&action);
+        rule->get_Enabled(&on);
+        rule->get_Profiles(&r.profiles);
+        rule->get_Protocol(&r.protocol);
+        r.inbound = direction == NET_FW_RULE_DIR_IN;
+        r.allow = action == NET_FW_ACTION_ALLOW;
+        r.enabled = on != VARIANT_FALSE;
+        f(rule, r);
+        rule->Release();
+      }
+      VariantClear(&item);
+    }
+  }
+  ReleaseCom(it);
+  ReleaseCom(enum_unknown);
+  ReleaseCom(rules);
+  return ok;
+}
+
+bool ForGameExe(const Paths& p, const FwRule& r) { return !r.app.empty() && SameFile(r.app, p.game_exe); }
+
+// A Windows-made block rule (the player said no, or closed, the first-time prompt) beats any allow rule.
+bool BlocksLan(const Paths& p, const FwRule& r) {
+  return r.inbound && !r.allow && r.enabled && (r.profiles & kFwProfiles) && ForGameExe(p, r) &&
+         (r.protocol == NET_FW_IP_PROTOCOL_UDP || r.protocol == NET_FW_IP_PROTOCOL_ANY);
+}
+
+}  // namespace
+
+bool FirewallAllowsLan(const Paths& p) {
+  INetFwPolicy2* policy = FwPolicy();
+  if (!policy) return false;
+  const std::wstring name = FwRuleName(p);
+  bool ours = false, blocked = false;
+  ForEachFwRule(policy, [&](INetFwRule*, const FwRule& r) {
+    if (BlocksLan(p, r)) blocked = true;
+    if (_wcsicmp(r.name.c_str(), name.c_str()) == 0 && r.inbound && r.allow && r.enabled &&
+        (r.profiles & kFwProfiles) == kFwProfiles && ForGameExe(p, r))
+      ours = true;
+  });
+  ReleaseCom(policy);
+  return ours && !blocked;
+}
+
+// The elevated half (--firewall on|off). 0 done, 1 failed.
+int RunFirewallHelper(const Paths& p, bool allow) {
+  Log(std::wstring(L"Firewall helper: ") + (allow ? L"allow" : L"remove") + L" LAN play for " + p.game_exe.wstring());
+  INetFwPolicy2* policy = FwPolicy();
+  if (!policy) {
+    Log(L"Firewall helper: Windows Firewall settings could not be opened.");
+    return 1;
+  }
+  const std::wstring name = FwRuleName(p);
+  std::vector<std::wstring> remove;  // ours for this folder, and ours for folders that are gone
+  int disabled = 0;
+  ForEachFwRule(policy, [&](INetFwRule* rule, const FwRule& r) {
+    if (r.name.rfind(kFwRulePrefix, 0) == 0 &&
+        (_wcsicmp(r.name.c_str(), name.c_str()) == 0 || (!r.app.empty() && !FileExists(r.app))))
+      remove.push_back(r.name);
+    if (allow && BlocksLan(p, r) && SUCCEEDED(rule->put_Enabled(VARIANT_FALSE))) {
+      ++disabled;
+      Log(L"Firewall helper: switched off the block rule '" + r.name + L"'");
+    }
+  });
+  INetFwRules* rules = nullptr;
+  bool ok = SUCCEEDED(policy->get_Rules(&rules)) && rules;
+  for (const std::wstring& n : remove) {
+    BSTR b = SysAllocString(n.c_str());
+    if (rules && SUCCEEDED(rules->Remove(b))) Log(L"Firewall helper: removed '" + n + L"'");
+    SysFreeString(b);
+  }
+  if (ok && allow) {
+    INetFwRule* rule = nullptr;
+    ok = SUCCEEDED(CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER, __uuidof(INetFwRule),
+                                    reinterpret_cast<void**>(&rule))) && rule;
+    if (ok) {
+      BSTR bname = SysAllocString(name.c_str());
+      BSTR desc = SysAllocString(L"Lets other PCs on your network join GoldenEye 007 System Link matches.");
+      BSTR app = SysAllocString(p.game_exe.c_str());
+      BSTR ports = SysAllocString(L"1000-1001");
+      BSTR group = SysAllocString(kFwGroup);
+      ok = SUCCEEDED(rule->put_Name(bname)) && SUCCEEDED(rule->put_Description(desc)) &&
+           SUCCEEDED(rule->put_ApplicationName(app)) && SUCCEEDED(rule->put_Protocol(NET_FW_IP_PROTOCOL_UDP)) &&
+           SUCCEEDED(rule->put_LocalPorts(ports)) && SUCCEEDED(rule->put_Direction(NET_FW_RULE_DIR_IN)) &&
+           SUCCEEDED(rule->put_Action(NET_FW_ACTION_ALLOW)) && SUCCEEDED(rule->put_Profiles(kFwProfiles)) &&
+           SUCCEEDED(rule->put_Grouping(group)) && SUCCEEDED(rule->put_Enabled(VARIANT_TRUE)) &&
+           SUCCEEDED(rules->Add(rule));
+      for (BSTR b : {bname, desc, app, ports, group}) SysFreeString(b);
+    }
+    ReleaseCom(rule);
+    Log(ok ? L"Firewall helper: added '" + name + L"' (inbound UDP 1000-1001, Private and Public)"
+           : std::wstring(L"Firewall helper: FAILED to add the rule"));
+  }
+  ReleaseCom(rules);
+  ReleaseCom(policy);
+  (void)disabled;
+  return ok ? 0 : 1;
+}
+
+std::wstring RequestFirewall(const Paths& p, bool allow) {
+  SHELLEXECUTEINFOW info{};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+  info.lpVerb = L"runas";
+  info.lpFile = p.launcher.c_str();
+  info.lpParameters = allow ? L"--firewall on" : L"--firewall off";
+  info.nShow = SW_HIDE;
+  DWORD code = 1;
+  if (!ShellExecuteExW(&info)) {
+    const DWORD error = GetLastError();
+    Log(L"Firewall: the elevated helper did not start (error " + std::to_wstring(error) + L")");
+    if (error == ERROR_CANCELLED)
+      return allow ? L"Windows Firewall was not changed, so other PCs may not be able to join your LAN matches. "
+                     L"Open setup again (hold Shift while starting the game) to try again."
+                   : L"Windows Firewall was not changed: the LAN play rule is still there.";
+  } else if (info.hProcess) {
+    WaitForSingleObject(info.hProcess, INFINITE);
+    GetExitCodeProcess(info.hProcess, &code);
+    CloseHandle(info.hProcess);
+  }
+  const bool now = FirewallAllowsLan(p);
+  Log(std::wstring(L"Firewall: LAN play is now ") + (now ? L"allowed" : L"not allowed") + L" (helper exit " +
+      std::to_wstring(code) + L")");
+  if (now != allow) return L"Windows Firewall could not be changed. See the setup log in resources\\runtime\\logs.";
+  return L"";
 }
 
 void RepairShortcut(const Paths& p, const fs::path& shortcut_folder) {
