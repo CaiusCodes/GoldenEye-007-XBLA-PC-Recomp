@@ -886,3 +886,39 @@ registers = ["r31"]
 address = 0x8209D370
 name = "ge_door_draw_end"
 registers = []
+
+# Additional Match Options (menu 43; ge_native_menu.cpp): Handicaps Allowed row
+# back (the release skipped row 4 in draw and update), No Radar always offered,
+# handicaps count as Health +0 unless allowed.
+[[midasm_hook]]
+address = 0x820F2F40
+name = "ge_match_option_rows_draw"
+registers = ["r3", "r4"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820F2FA0
+name = "ge_match_option_row4"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x820F2FA4
+[[midasm_hook]]
+address = 0x82105490
+name = "ge_match_option_row4"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x82105494
+[[midasm_hook]]
+address = 0x820EF0C0
+name = "ge_match_option_cheat"
+registers = ["r3", "r31"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820EF800
+name = "ge_match_option_cheat"
+registers = ["r3", "r31"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x820EBA88
+name = "ge_match_handicap_factor"
+registers = ["f1"]
+after_instruction = true

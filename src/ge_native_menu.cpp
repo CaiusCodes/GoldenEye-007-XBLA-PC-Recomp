@@ -2508,7 +2508,9 @@ void ToggleClientReady(PPCContext& ctx, uint8_t* base) {
 
 namespace ge {
 // Each controller poll: outside the lobby nothing is pending.
+void MatchOptionsTableTick(uint8_t* base);  // below
 void LobbyPollTick(uint8_t* base, uint32_t menu) {
+  MatchOptionsTableTick(base);
   if (menu == 31u || menu == 37u) return;
   g_client_ready = false;
   g_countdown_ms = 0;
@@ -2696,4 +2698,76 @@ bool ge_match_music(PPCRegister& r3, PPCRegister& r30, PPCRegister& r31) {
   r3.s64 = static_cast<int16_t>(LD16(base, r30.u32 + static_cast<uint32_t>(g_match_track) * 2u));
   REXKRNL_INFO("GELOBBY match music: track {} of {} (id {})", g_match_track, r31.u32, r3.s64);
   return true;
+}
+
+// ============================================ Additional Match Options (menu 43) ===
+// The host's page of match options (draw sub_820FAD98 -> rows sub_820F2F40,
+// update sub_82105308) lists the flags of the match settings byte 0x8272B3BD
+// (row i = bit i, texts from the u16 table at 0x8272BDF8), then the
+// multiplayer cheats the player has unlocked. The byte and the cheats are
+// sent to every machine every lobby frame (sub_820FFC30: the match object's
+// +820 = the byte, +876 = cheats 11/12/15/23/24 as bits), so whatever the host
+// picks here is what every machine plays with.
+//
+// Two of its options were out of reach:
+//   - Handicaps Allowed (bit 4, 0x10). The game still has it all: with the bit
+//     set each player card gets a Handicap row (Health -10 .. +10, the player's
+//     synced number player+2064, read into 0x8272B40C[slot] on every machine),
+//     match start turns it into each player's damage factor (sub_820EBA68,
+//     table 0x8272BD80), and Jaws, Oddjob and Mayday keep their own size
+//     (sub_8211E840 shrinks or grows them to the others' size when it is off).
+//     The release blanked the row's text id in the table and skips row 4 in the
+//     draw and the update; both are put back. Off unless the host turns it on.
+//   - No Radar (cheat 23) shows only for players who unlocked the cheat. It is
+//     always offered on this page now. Off unless the host turns it on.
+// A handicap left over from a match that allowed them counts as Health +0
+// while the host does not allow them.
+namespace {
+constexpr uint32_t kMatchFlags = 0x8272B3BDu;       // match settings byte
+constexpr uint8_t kHandicapsAllowed = 0x10u;
+constexpr uint32_t kOptionTextTable = 0x8272BDF8u;  // u16 text ids, row i = bit i
+constexpr uint16_t kTextHandicapsAllowed = 0x9D46u;
+constexpr uint32_t kCheatNoRadar = 23u;
+constexpr uint32_t kMenuMatchOptions = 43u;
+}  // namespace
+
+namespace ge {
+// Each controller poll: the Handicaps Allowed row's text is in the table.
+void MatchOptionsTableTick(uint8_t* base) {
+  const uint32_t at = kOptionTextTable + 4u * 2u;
+  if (LD16(base, at) != kTextHandicapsAllowed) ST16(base, at, kTextHandicapsAllowed);
+}
+}  // namespace ge
+
+// The rows' draw (sub_820F2F40 entry: r3 = highlighted row, r4 = the page can
+// change them). The lobby lists the options read-only and passes row 6 when
+// nothing on it is pointed at, which is the first cheat row: a No Radar (or any
+// cheat) the host picked showed highlighted there. Read-only rows are never
+// highlighted.
+void ge_match_option_rows_draw(PPCRegister& r3, PPCRegister& r4) {
+  if ((r4.u32 & 0xFFu) == 0) r3.s64 = -1;
+}
+
+// Draw (0x820F2FA0) and update (0x82105490): the `beq` after `cmpwi rN,4`
+// that skipped the Handicaps Allowed row; true steps over it.
+bool ge_match_option_row4() { return true; }
+
+// The page's cheat list (menu init sub_820EF058 / sub_820EF798, after
+// `bl 0x820ECD28` = cheat unlocked: r3, cheat r31): No Radar always counts as
+// unlocked for the multiplayer match options page.
+void ge_match_option_cheat(PPCRegister& r3, PPCRegister& r31) {
+  if (r31.u32 != kCheatNoRadar || r3.u32 != 0) return;
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  const uint32_t current = LD32(base, 0x8272B35Cu), requested = LD32(base, 0x8272B360u);
+  if (current != kMenuMatchOptions && requested != kMenuMatchOptions) return;
+  r3.u64 = 1;
+}
+
+// A player's damage factor at match start (sub_820EBA68, after its `lfsx f1`):
+// Health +0 unless the match allows handicaps.
+void ge_match_handicap_factor(PPCRegister& f1) {
+  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  const bool allowed = (base[kMatchFlags] & kHandicapsAllowed) != 0;
+  if (!allowed) f1.f64 = 1.0;
+  REXKRNL_INFO("GEMATCH player damage factor {:.3f} (handicaps {})", f1.f64, allowed ? "allowed" : "off");
 }
