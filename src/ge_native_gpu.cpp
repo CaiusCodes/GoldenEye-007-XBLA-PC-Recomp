@@ -3479,7 +3479,8 @@ RenderPipeline* pipeline_for(RenderShader* vs, RenderShader* ps, uint32_t decl,
 void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* indices,
                  int32_t base_vertex, uint32_t first, uint32_t up_data, uint32_t up_stride,
                  bool restart_16 = true, uint32_t idx_addr = 0, bool idx_wide = false) {
-  if (ge::g_hidden_view || !ensure_device() || count == 0) return;
+  if (ge::g_hidden_view) { NTRACE("hidden-view draw dropped (player {:08X})", g32(0x82F1FAACu)); return; }
+  if (!ensure_device() || count == 0) return;
   begin_frame();
   const double t_start = now_ms();
   struct Total {
@@ -3787,6 +3788,7 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
     float vp[6];
     for (int i = 0; i < 6; ++i) { const uint32_t u = g32(dev + kDevViewport + i * 4); std::memcpy(&vp[i], &u, 4); }
     const float* p0 = reinterpret_cast<const float*>(g.upload_ptr + voff);
+    NTRACE("  player {:08X}", g32(0x82F1FAACu));
     NTRACE("  vte {:X} viewport {} {} {} {} {} {} pos0 {} {} {} {} (el0 usage {} fmt {})", g32(dev + 10572), vp[0], vp[1],
            vp[2], vp[3], vp[4], vp[5], p0[0], p0[1], p0[2], p0[3], els[0].usage, els[0].type & 0x3F);
     float vps[2], gb[4];

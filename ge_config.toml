@@ -149,6 +149,30 @@ address = 0x8209EDFC
 name = "ge_view_turn_end"
 registers = []
 after_instruction = false
+# The frame's overlay loop after the HUD (sub_82188D50: screen tint, death
+# fade per player) and the full-screen pass after it: the same treatment
+[[midasm_hook]]
+address = 0x82189328
+name = "ge_view_turn_begin"
+registers = []
+after_instruction = false
+[[midasm_hook]]
+address = 0x8218937C
+name = "ge_view_turn_end"
+registers = []
+after_instruction = false
+[[midasm_hook]]
+address = 0x82189388
+name = "ge_lan_effects_player"
+registers = []
+after_instruction = false
+# Full-screen effects pass between the loops: this PC's own player in LAN
+# matches (ge_hooks.cpp ge_lan_effects_player)
+[[midasm_hook]]
+address = 0x8209EE08
+name = "ge_lan_effects_player"
+registers = []
+after_instruction = false
 [[midasm_hook]]
 address = 0x8209EE7C
 name = "ge_view_turn_begin"

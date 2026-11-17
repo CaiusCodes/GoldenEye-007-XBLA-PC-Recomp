@@ -3588,6 +3588,8 @@ REXCVAR_DEFINE_STRING(ge_debug_input_file, "", "Debug",
                       "Test-only: text file of pad presses to play back (empty = off)");
 
 int g_test_aim = 0;  // test pipe: "AIM=n" holds aim (left trigger) for n polls
+bool g_test_kill_other = false;
+bool g_test_die = false;  // test pipe: "DIE" kills this PC's player (ge_view_turn_begin)
 int g_test_fire = 0;  // test pipe: "FIRE=n" pulls the right trigger n times (12 polls each)
 
 struct GeScriptPress {
@@ -3652,6 +3654,14 @@ void ge_script_read_new_lines() {
         }
         if (word == "TRACE") {  // test: the native renderer logs the next frame's draws
           rex::cvar::SetFlagByName("gpu_native_trace_frame", "-1");
+          continue;
+        }
+        if (word == "DIE") {  // test: this PC's player dies at its next view turn
+          g_test_die = true;
+          continue;
+        }
+        if (word == "KILLOTHER") {  // test: the other PC's player dies here (as a kill would)
+          g_test_kill_other = true;
           continue;
         }
         if (word == "READY") {  // test: toggle ready in the LAN lobby
@@ -5436,15 +5446,57 @@ void ge_lan_default_layout(PPCRegister& r11) {
 // PC's own every frame (issue #22: flicker, "the same spawn"). Each turn of
 // both loops is marked (0x8209EC94 / 0x8209EE7C, after sub_820C9B40 picks the
 // player) and unmarked at its end (0x8209EDFC / 0x8209EEDC); native_draw drops
-// draws while marked. Clears and game logic are untouched.
+// draws while marked. The frame's later overlay loop in sub_82188D50 (screen
+// tint and death fade per player) is marked the same way (0x82189328 /
+// 0x8218937C). Clears and game logic are untouched.
 namespace ge { bool g_hidden_view = false; }
 void ge_view_turn_begin() {
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
   const uint32_t player = LD32(base, 0x82F1FAACu);  // current player
   ge::g_hidden_view = base[GE_NET_FLAG] != 0 && player != 0 &&
                       static_cast<int32_t>(LD32(base, player + 8528u)) == -1;
+  if (g_test_die && player != 0 && static_cast<int32_t>(LD32(base, player + 8528u)) == 0 &&
+      LD32(base, player + 480u) == 0) {  // test only: health 0, then the game's death routine
+    g_test_die = false;
+    STF32(base, player + 484u, 0.f);
+    STF32(base, player + 488u, 0.f);
+    const PPCContext saved = *ctx;
+    sub_820BEBD0(*ctx, base);
+    *ctx = saved;
+  }
+  if (g_test_kill_other && ge::g_hidden_view && LD32(base, player + 480u) == 0) {
+    g_test_kill_other = false;
+    STF32(base, player + 484u, 0.f);
+    STF32(base, player + 488u, 0.f);
+    const PPCContext saved = *ctx;
+    sub_820BEBD0(*ctx, base);
+    *ctx = saved;
+  }
 }
 void ge_view_turn_end() { ge::g_hidden_view = false; }
+
+// After the scene loop (0x8209EE08: sub_82099CD0 / sub_821974B8) and after the
+// overlay loop (0x82189388) the game runs a full-screen effects pass (screen
+// tint, death red, fade to black) for whichever player its loop handled last. In a LAN match that
+// is often the other PC's player; the 360 clips its tint to that player's
+// off-screen view, the native renderer draws it over this PC's whole screen
+// (issue #22: the killer saw the victim's death screen until they respawned).
+// In a network match the pass is given this PC's own player instead, as
+// sub_820C9B40 would select it. Local games are untouched.
+void ge_lan_effects_player() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  if (base[GE_NET_FLAG] == 0) return;
+  const uint32_t current = LD32(base, 0x82F1FAACu);
+  if (current == 0 || static_cast<int32_t>(LD32(base, current + 8528u)) != -1) return;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t p = LD32(base, 0x82F1FA98u + i * 4);
+    if (p == 0 || static_cast<int32_t>(LD32(base, p + 8528u)) == -1) continue;
+    ST32(base, 0x82F1FAACu, p);                  // current player
+    ST32(base, 0x82F1FC70u, i);                  // its index
+    ST32(base, 0x82F1FC74u, 0x82F1FAB0u + i * 112);  // its slot record
+    return;
+  }
+}
 
 // disable_doors_autoclosing_on_mp @0x820E4F1C (after `lwz r11,0xE8(r30)` loads
 // the door open-tick): in a network session, force it to 0 so doors never
